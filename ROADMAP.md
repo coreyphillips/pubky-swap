@@ -132,9 +132,10 @@ and pass: the HTLC engine (`regtest`), reorg detection (`reorg_regtest`), the BD
 (`wallet_regtest`), and **both end-to-end swaps** (`full_swap_regtest` reverse and
 `submarine_swap_regtest`). These remain before any signet/mainnet exposure:
 
-- Automating the **two-node LND swap tests** in CI (they pass manually but need a funded Lightning
-  channel, which the `docker-compose.regtest.yml` backplane doesn't yet set up; the bitcoind +
-  electrs tests already run via `.github/workflows/regtest.yml`).
+- A first green run of the now-fully-automated `regtest.yml` on a clean CI runner — its
+  `docker-compose.regtest.yml` backplane + `scripts/setup-regtest-lnd.sh` open a funded channel and
+  run every integration test (including both two-node LND swaps); validated locally against live
+  LND, pending a hosted-runner run.
 - **Signet soak testing** before any mainnet exposure.
 - A **third-party security review** of the atomic-swap paths.
 - **Marketplace hardening** (Phase 6): offer publishing/discovery on the Pubky profile, abuse/ban

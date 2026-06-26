@@ -58,16 +58,32 @@ When you add code behind a feature, build it explicitly (e.g.
     `wallet_regtest`): spin up the backplane with
     `docker compose -f docker-compose.regtest.yml up -d`, then run the test with
     `-- --ignored --nocapture`.
-  - **Two-node LND swap tests** (`full_swap_regtest`, `submarine_swap_regtest`): need a funded
-    Lightning channel between two LND nodes — easiest via [Polar](https://lightningpolar.com).
-    Provide the `LND_A_*` / `LND_B_*` and electrum env vars (see [`README.md`](README.md)).
+  - **Two-node LND swap tests** (`full_swap_regtest`, `submarine_swap_regtest`): the compose
+    backplane includes two LND nodes; `scripts/setup-regtest-lnd.sh` opens a funded, balanced
+    channel between them (so both swap directions have liquidity). Then export the creds and run:
+
+    ```bash
+    docker compose -f docker-compose.regtest.yml up -d
+    ./scripts/setup-regtest-lnd.sh
+    docker cp lnd-a:/home/lnd/.lnd/tls.cert ./lnd-a-tls.cert
+    docker cp lnd-a:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-a-admin.macaroon
+    docker cp lnd-b:/home/lnd/.lnd/tls.cert ./lnd-b-tls.cert
+    docker cp lnd-b:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-b-admin.macaroon
+    LND_A_URL=https://127.0.0.1:10011 LND_A_CERT=./lnd-a-tls.cert LND_A_MAC=./lnd-a-admin.macaroon \
+    LND_B_URL=https://127.0.0.1:10012 LND_B_CERT=./lnd-b-tls.cert LND_B_MAC=./lnd-b-admin.macaroon \
+    REGTEST_ELECTRUM_URL=tcp://127.0.0.1:60001 \
+      cargo test -p swap-provider --features full --test full_swap_regtest -- --ignored --nocapture
+    ```
+
+    [Polar](https://lightningpolar.com) works too if you prefer a GUI (point the env vars at its
+    nodes).
 
 ## CI
 
 `.github/workflows/ci.yml` runs fmt, clippy (all feature combos), the build matrix, and unit tests
-on every push/PR. `.github/workflows/regtest.yml` runs the bitcoind-backed integration tests
-against the `docker-compose.regtest.yml` backplane on a manual/weekly trigger (the LND two-node
-tests aren't automated — they need a funded channel).
+on every push/PR. `.github/workflows/regtest.yml` brings up the full `docker-compose.regtest.yml`
+backplane, opens a funded channel via `scripts/setup-regtest-lnd.sh`, and runs **all** the
+integration tests — including both two-node LND swaps — on a manual/weekly trigger.
 
 ## Safety invariants (do not break these)
 

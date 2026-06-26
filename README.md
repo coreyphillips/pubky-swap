@@ -136,15 +136,17 @@ Without the execution features a provider runs **negotiation-only** and rejects 
 
 ## Integration tests (regtest)
 
-All are `#[ignore]`d and need real services. The bitcoind+electrs tests have a one-command backplane:
+All are `#[ignore]`d and need real services. A one-command backplane (bitcoind + electrs + two LND
+nodes) plus a channel-setup script cover everything:
 
 ```bash
-docker compose -f docker-compose.regtest.yml up -d   # bitcoind + electrs (Polar-compatible defaults)
+docker compose -f docker-compose.regtest.yml up -d
+./scripts/setup-regtest-lnd.sh   # opens a funded, balanced channel between the two LND nodes
 ```
 
-CI runs fmt/clippy/build/unit tests on every push (`.github/workflows/ci.yml`) and the
-bitcoind-backed integration tests on a manual/weekly schedule (`.github/workflows/regtest.yml`). See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for the two-node LND setup.
+CI runs fmt/clippy/build/unit tests on every push (`.github/workflows/ci.yml`); `regtest.yml` brings
+up that backplane and runs **all** the integration tests — including both two-node LND swaps — on a
+manual/weekly schedule. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the env vars.
 
 ```bash
 # HTLC engine + Electrum watcher against bitcoind + electrs
