@@ -5,14 +5,24 @@
 #   - wait until the channel is active on both nodes
 #
 # Requires: docker + python3 on the host. Run after `docker compose -f docker-compose.regtest.yml up -d`.
+#
+# Container names / ports can be overridden (e.g. to run a parallel stack alongside another one):
+#   BTC_CONTAINER, BTC_RPCPORT, LND_A_CONTAINER, LND_B_CONTAINER, LND_B_HOST.
 set -eu
 
+BTC_CONTAINER="${BTC_CONTAINER:-bitcoin}"
+BTC_RPCPORT="${BTC_RPCPORT:-43782}"
+LND_A_CONTAINER="${LND_A_CONTAINER:-lnd-a}"
+LND_B_CONTAINER="${LND_B_CONTAINER:-lnd-b}"
+# In-Docker hostname lnd-a uses to reach lnd-b (the compose service alias).
+LND_B_HOST="${LND_B_HOST:-lnd-b}"
+
 btc() {
-  docker exec bitcoin bitcoin-cli -regtest -rpcport=43782 \
+  docker exec "$BTC_CONTAINER" bitcoin-cli -regtest -rpcport="$BTC_RPCPORT" \
     -rpcuser=polaruser -rpcpassword=polarpass "$@"
 }
-lncli_a() { docker exec lnd-a lncli -n regtest --lnddir=/home/lnd/.lnd "$@"; }
-lncli_b() { docker exec lnd-b lncli -n regtest --lnddir=/home/lnd/.lnd "$@"; }
+lncli_a() { docker exec "$LND_A_CONTAINER" lncli -n regtest --lnddir=/home/lnd/.lnd "$@"; }
+lncli_b() { docker exec "$LND_B_CONTAINER" lncli -n regtest --lnddir=/home/lnd/.lnd "$@"; }
 jget() { python3 -c "import sys,json; print(json.load(sys.stdin)['$1'])"; }
 
 echo "Waiting for bitcoind..."
@@ -59,7 +69,7 @@ until [ "$(lncli_a walletbalance | jget confirmed_balance)" -gt 0 ] 2>/dev/null;
 done
 
 echo "Connecting peers + opening a balanced channel (push half to lnd-b)..."
-lncli_a connect "$PUBKEY_B@lnd-b:9735" >/dev/null 2>&1 || true
+lncli_a connect "$PUBKEY_B@$LND_B_HOST:9735" >/dev/null 2>&1 || true
 lncli_a openchannel --node_key="$PUBKEY_B" --local_amt=1000000 --push_amt=500000 >/dev/null
 btc generatetoaddress 6 "$MINE_ADDR" >/dev/null
 
