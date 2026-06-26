@@ -30,16 +30,9 @@ use swap_common::SwapState;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-/// A provider-controlled on-chain wallet: funds HTLCs and receives refunds. A real
-/// implementation backed by BDK is a later milestone (see ROADMAP.md).
-pub trait OnchainWallet: Send + Sync {
-    /// Build, sign, and broadcast a transaction paying `amount_sat` to `htlc_spk`,
-    /// returning the funding outpoint. (Used by reverse swaps, where the provider funds.)
-    fn fund_htlc(&self, htlc_spk: &ScriptBuf, amount_sat: u64) -> Result<OutPoint>;
-    /// A provider-controlled scriptPubKey for swept funds — the destination of a reverse-swap
-    /// refund or a submarine-swap claim.
-    fn receive_destination(&self) -> ScriptBuf;
-}
+// The funding-wallet abstraction now lives in `swap-common` so the submarine-swap client can
+// reuse it; re-exported here for the provider's existing call sites.
+pub use swap_common::wallet::OnchainWallet;
 
 /// Hook for persisting a driver's progress so a restart can resume it. The provider supplies an
 /// implementation that updates and persists the swap's [`crate::store::SwapRecord`]; the unit
@@ -283,6 +276,14 @@ mod tests {
                 amount_msat,
             })
         }
+        async fn create_invoice(
+            &self,
+            _amount_msat: u64,
+            _expiry_secs: u64,
+            _memo: &str,
+        ) -> lightning_backend::Result<HoldInvoice> {
+            Err(LightningError::NotImplemented("mock".into()))
+        }
         async fn invoice_state(&self, _ph: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
             Ok(*self.state.lock().unwrap())
         }
@@ -342,7 +343,11 @@ mod tests {
         refund_spk: ScriptBuf,
     }
     impl OnchainWallet for MockWallet {
-        fn fund_htlc(&self, _htlc_spk: &ScriptBuf, _amount_sat: u64) -> Result<OutPoint> {
+        fn fund_htlc(
+            &self,
+            _htlc_spk: &ScriptBuf,
+            _amount_sat: u64,
+        ) -> swap_common::Result<OutPoint> {
             Ok(self.funding_outpoint)
         }
         fn receive_destination(&self) -> ScriptBuf {
@@ -513,7 +518,11 @@ mod tests {
         refund_spk: ScriptBuf,
     }
     impl OnchainWallet for PanicFundWallet {
-        fn fund_htlc(&self, _htlc_spk: &ScriptBuf, _amount_sat: u64) -> Result<OutPoint> {
+        fn fund_htlc(
+            &self,
+            _htlc_spk: &ScriptBuf,
+            _amount_sat: u64,
+        ) -> swap_common::Result<OutPoint> {
             panic!("resumed driver must not re-fund the HTLC");
         }
         fn receive_destination(&self) -> ScriptBuf {

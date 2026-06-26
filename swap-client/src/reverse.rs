@@ -156,6 +156,14 @@ mod tests {
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
+        async fn create_invoice(
+            &self,
+            _: u64,
+            _: u64,
+            _: &str,
+        ) -> lightning_backend::Result<HoldInvoice> {
+            Err(LightningError::NotImplemented("mock".into()))
+        }
         async fn invoice_state(&self, _: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
             Err(LightningError::NotImplemented("mock".into()))
         }

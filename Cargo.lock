@@ -2832,6 +2832,7 @@ dependencies = [
 name = "swap-common"
 version = "0.1.0"
 dependencies = [
+ "bdk",
  "bitcoin",
  "electrum-client",
  "hex",
@@ -2850,7 +2851,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "bdk",
  "bitcoin",
  "clap",
  "hex",

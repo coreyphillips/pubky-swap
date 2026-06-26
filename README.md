@@ -20,8 +20,8 @@ leg, and vice-versa.
   on-chain BTC in an HTLC; the client claims it with the preimage, which lets the provider settle
   the hold invoice. **Runnable end-to-end from the CLI.**
 - **Submarine** (on-chain → Lightning): the client locks on-chain BTC in an HTLC; the provider pays
-  the client's Lightning invoice and claims the HTLC with the preimage. The provider side is
-  implemented and tested; client-side execution is still on the roadmap.
+  the client's Lightning invoice and claims the HTLC with the preimage. **Runnable end-to-end from
+  the CLI** (the client issues the invoice, funds the HTLC, and refunds on timeout).
 
 ## Quickstart
 
@@ -149,6 +149,9 @@ LND_A_URL=https://127.0.0.1:10011 LND_A_CERT=.../A/tls.cert LND_A_MAC=.../A/admi
 LND_B_URL=https://127.0.0.1:10012 LND_B_CERT=.../B/tls.cert LND_B_MAC=.../B/admin.macaroon \
 REGTEST_ELECTRUM_URL=tcp://127.0.0.1:60001 \
   cargo test -p swap-provider --features full --test full_swap_regtest -- --ignored --nocapture
+
+# Full submarine swap across two LND nodes (same env; provider needs outbound liquidity)
+  cargo test -p swap-provider --features full --test submarine_swap_regtest -- --ignored --nocapture
 ```
 
 ## License

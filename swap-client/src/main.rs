@@ -44,6 +44,9 @@ struct Cli {
     /// Address that receives the swept on-chain funds (reverse-swap claim destination).
     #[arg(long, default_value = "")]
     claim_address: String,
+    /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
+    #[arg(long, default_value = "")]
+    wallet_mnemonic: String,
     /// Fee rate (sat/vB) for the claim transaction.
     #[arg(long, default_value_t = 2)]
     onchain_fee_rate: u64,
@@ -94,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         lnd_macaroon_path: cli.lnd_macaroon,
         electrum_url: cli.electrum_url,
         claim_address: cli.claim_address,
+        wallet_mnemonic: cli.wallet_mnemonic,
         onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
         max_routing_fee_msat: cli.max_routing_fee_msat,
     };

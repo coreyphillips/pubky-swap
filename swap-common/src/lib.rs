@@ -16,6 +16,7 @@ pub mod keys;
 pub mod messages;
 pub mod onchain;
 pub mod swap;
+pub mod wallet;
 
 pub use error::{Result, SwapError};
 pub use keys::{random_keypair, random_secret_key};

@@ -98,6 +98,33 @@ impl LightningBackend for LndBackend {
         })
     }
 
+    async fn create_invoice(
+        &self,
+        amount_msat: u64,
+        expiry_secs: u64,
+        memo: &str,
+    ) -> Result<HoldInvoice> {
+        let mut client = self.client.lock().await;
+        let resp = client
+            .lightning()
+            .add_invoice(fedimint_tonic_lnd::lnrpc::Invoice {
+                memo: memo.to_string(),
+                value_msat: amount_msat as i64,
+                expiry: expiry_secs as i64,
+                ..Default::default()
+            })
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?
+            .into_inner();
+        // LND returns the node-generated payment hash in `r_hash`.
+        let payment_hash = to_32(&resp.r_hash, "invoice r_hash")?;
+        Ok(HoldInvoice {
+            bolt11: resp.payment_request,
+            payment_hash,
+            amount_msat,
+        })
+    }
+
     async fn invoice_state(&self, payment_hash: [u8; 32]) -> Result<InvoiceState> {
         let mut client = self.client.lock().await;
         let resp = client

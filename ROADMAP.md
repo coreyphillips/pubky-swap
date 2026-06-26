@@ -45,9 +45,11 @@ preimage extraction (needs a second node paying the invoice — see Phase 4 rema
 
 **Done:** dynamic fee estimation — claim/refund/funding transactions use a live Electrum
 `estimatefee` result clamped to a configured floor (the floor is both the minimum and the
-fallback when estimation is unavailable, e.g. on regtest).
+fallback when estimation is unavailable, e.g. on regtest). **RBF fee-bumping** — claim/refund are
+built RBF-signalling and `swap-common::fee_bump::confirm_or_bump` re-broadcasts at an escalating
+(capped) fee until the spend confirms.
 
-**Remaining for this phase:** RBF/CPFP fee-bumping under congestion; reorg handling.
+**Remaining for this phase:** reorg handling.
 
 ### 🟡 Phase 4 — Reverse swaps (engine done; live wiring pending)
 `swap-provider::reverse` orchestrates the provider side end-to-end: `init_reverse_swap`
@@ -89,16 +91,19 @@ already-funded HTLC), and enforces **network-mismatch** and **mainnet-safety** g
 **Remaining for this phase:**
 - Run the drivers' blocking chain calls via `spawn_blocking` (inline today; fine on regtest).
 
-### 🟡 Phase 5 — Submarine swaps (engine done; live wiring pending)
+### ✅ Phase 5 — Submarine swaps (end-to-end)
 `swap-provider::submarine` orchestrates the provider side: `init_submarine_swap` (decode the
 client's invoice → build the HTLC the client funds, claim = provider) and
 `drive_submarine_swap` (wait for the client's on-chain funding → pay the invoice → claim the
 HTLC with the learned preimage; the invoice is only paid after the funding confirms, so a
-failed payment costs nothing on-chain). **Mock-tested**: happy path (pays + claims, claim
-carries the matching preimage), payment-failure (no claim), and expiry (no funding).
+failed payment costs nothing on-chain).
 
-**Remaining for this phase:** same live wiring as reverse (BDK wallet, provider-loop task
-spawning, client-side funding + refund execution) and a regtest integration test.
+**Client execution** (`swap-client::submarine::execute_submarine_swap`, wired into the CLI under
+`--features full`): the client issues the invoice (`LightningBackend::create_invoice`), verifies
+the provider's HTLC pays its hash/refund key, funds the HTLC on-chain, and refunds at the timeout
+if the provider never pays. The funding wallet (`swap-common::wallet::BdkWallet`) is now shared by
+both binaries. Mock-tested on both sides; a live two-node regtest test exists
+(`swap-provider/tests/submarine_swap_regtest.rs`, `#[ignore]`).
 
 ### Phase 6 — Marketplace layer
 Offer publishing to the Pubky profile + follow-graph discovery; quote/negotiation hardening;
@@ -117,12 +122,10 @@ optional Liquid chain swaps.
 
 The swap engine works on regtest, but these are required before any signet/mainnet exposure:
 
-- **Fee-bumping (RBF/CPFP)** so a claim/refund still confirms under mempool congestion before its
-  timeout — today fees are estimated and floored but not bumped after broadcast.
 - **Reorg handling** — re-validate funding/spend depth across chain reorganizations.
-- **Submarine client execution** (the client funding wallet + refund path) and a live submarine
-  integration test; the provider side is built and mock-tested.
+- **CPFP** as a fallback to RBF when a spend can't be replaced (RBF bumping is implemented).
 - **`spawn_blocking`** for the drivers' blocking chain calls under load.
+- Running the `#[ignore]`d live regtest tests (reverse + submarine) in CI against a real backplane.
 - **Marketplace hardening** (Phase 6): offer publishing/discovery on the Pubky profile, abuse/ban
   handling, requiring on-chain confirmation before a provider commits.
 - A **third-party security review** of the atomic-swap paths.

@@ -92,6 +92,17 @@ pub trait LightningBackend: Send + Sync {
         memo: &str,
     ) -> Result<HoldInvoice>;
 
+    /// Create a normal (auto-settling) invoice — the node generates the preimage and settles on
+    /// payment. Used by the submarine-swap client: the provider pays this invoice (learning the
+    /// preimage) and the client receives the Lightning funds. Returns the BOLT11 and its
+    /// node-generated payment hash.
+    async fn create_invoice(
+        &self,
+        amount_msat: u64,
+        expiry_secs: u64,
+        memo: &str,
+    ) -> Result<HoldInvoice>;
+
     /// Current state of an invoice identified by its payment hash.
     async fn invoice_state(&self, payment_hash: [u8; 32]) -> Result<InvoiceState>;
 
@@ -141,6 +152,14 @@ impl LightningBackend for StubBackend {
     async fn create_hold_invoice(
         &self,
         _payment_hash: [u8; 32],
+        _amount_msat: u64,
+        _expiry_secs: u64,
+        _memo: &str,
+    ) -> Result<HoldInvoice> {
+        Err(LightningError::NotImplemented(STUB.into()))
+    }
+    async fn create_invoice(
+        &self,
         _amount_msat: u64,
         _expiry_secs: u64,
         _memo: &str,

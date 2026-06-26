@@ -21,6 +21,8 @@ tokio = { version = "1", features = ["time"] }
 # Electrum-backed chain watcher (feature `electrum`). Kept optional so the default build
 # pulls no networking stack.
 electrum-client = { version = "0.18", optional = true }
+# BDK funding wallet (feature `bdk-wallet`). Optional so the default build stays light.
+bdk = { version = "0.30", features = ["all-keys", "keys-bip39"], optional = true }
 
 [dev-dependencies]
 # Enables Transaction::verify (libbitcoinconsensus) so tests validate the claim/refund
@@ -32,3 +34,4 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 [features]
 default = []
 electrum = ["dep:electrum-client"]
+bdk-wallet = ["dep:bdk"]

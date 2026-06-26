@@ -6,6 +6,7 @@
 //! with the preimage) lives in [`reverse`].
 
 pub mod reverse;
+pub mod submarine;
 
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::Secp256k1;
@@ -17,12 +18,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
+use swap_common::wallet::OnchainWallet;
 use swap_common::{messages::*, SwapDirection};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::reverse::{execute_reverse_swap, ReverseClaim};
+use crate::submarine::{execute_submarine_swap, SubmarineFunding};
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -41,6 +44,8 @@ pub struct ClientConfig {
     pub electrum_url: String,
     /// Address that receives the swept on-chain funds (reverse-swap claim destination).
     pub claim_address: String,
+    /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
+    pub wallet_mnemonic: String,
     /// Fee rate (sat/vB) for the claim transaction.
     pub onchain_fee_rate_sat_vb: u64,
     /// Routing-fee cap (msat) when paying the hold invoice.
@@ -106,8 +111,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     );
 
     if config.direction == SwapDirection::Submarine {
-        warn!("Submarine client execution needs your own LN node to issue an invoice — TODO (LND/client-node milestone). Negotiation stops here for the scaffold.");
-        return Ok(());
+        return run_submarine(&config, &transport, network, &quote, &client_pkarr).await;
     }
 
     // 3) Commit to the swap (reverse).
@@ -199,9 +203,130 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     Ok(())
 }
 
+/// Execute a submarine swap (on-chain → Lightning): issue an invoice the provider pays, fund the
+/// HTLC the provider claims, and refund on-chain if the provider never pays.
+async fn run_submarine(
+    config: &ClientConfig,
+    transport: &Transport,
+    network: Network,
+    quote: &Quote,
+    client_pkarr: &str,
+) -> Result<()> {
+    // Execution needs our own LN node (to issue + watch the invoice), Electrum, and a funding
+    // wallet. Without them we can't even produce the invoice the SwapRequest carries.
+    if config.electrum_url.is_empty() || config.wallet_mnemonic.is_empty() {
+        warn!(
+            "Submarine swap quoted, but execution config is missing. To run it, rebuild with \
+             --features full and pass --lnd-address/--lnd-cert/--lnd-macaroon, --electrum-url, \
+             and --wallet-mnemonic."
+        );
+        return Ok(());
+    }
+
+    let ln = make_backend(config).await?;
+    // Issue the invoice the provider will pay — the amount we want to receive over Lightning.
+    let invoice = ln
+        .create_invoice(
+            quote.amount_sat.saturating_mul(1000),
+            3600,
+            "pubky-swap submarine",
+        )
+        .await
+        .map_err(|e| anyhow!("create invoice: {e}"))?;
+    let ph = invoice.payment_hash;
+
+    // Our HTLC refund key (refund branch of the HTLC the provider claims).
+    let secp = Secp256k1::new();
+    let (refund_sk, refund_pk) = swap_common::random_keypair(&secp);
+
+    // 3) Commit to the swap, carrying our invoice + refund pubkey.
+    let sreq = SwapRequest {
+        quote_id: quote.quote_id,
+        client_pkarr: client_pkarr.to_string(),
+        direction: SwapDirection::Submarine,
+        payment_hash_hex: hex::encode(ph),
+        client_claim_pubkey_hex: None,
+        client_refund_pubkey_hex: Some(hex::encode(refund_pk.to_bytes())),
+        invoice: Some(invoice.bolt11.clone()),
+    };
+    transport
+        .send(&config.provider_pkarr, &SwapMessage::SwapRequest(sreq))
+        .await?;
+    info!("Sent submarine swap request for quote {}", quote.quote_id);
+
+    // 4) Await the provider's HTLC details.
+    let accept = await_message(transport, &config.provider_pkarr, 30, |m| match m {
+        SwapMessage::SwapAccept(a) => Some(a),
+        _ => None,
+    })
+    .await?;
+
+    // 5) Verify the HTLC pays the provider's claim key under OUR payment hash and is refundable by
+    //    OUR key, before funding anything.
+    let provider_claim_pk = parse_pubkey(&accept.provider_pubkey_hex)?;
+    let expected_script = build_htlc_script(
+        &ph,
+        &provider_claim_pk,
+        &refund_pk,
+        accept.timeout_block_height,
+    );
+    if hex::encode(expected_script.as_bytes()) != accept.htlc_script_hex {
+        return Err(anyhow!(
+            "provider HTLC script does not match the expected submarine-swap script; aborting"
+        ));
+    }
+    let htlc_address = htlc_p2wsh_address(&expected_script, network);
+    if htlc_address.to_string() != accept.htlc_address {
+        return Err(anyhow!(
+            "provider HTLC address {} does not match the verified script; aborting",
+            accept.htlc_address
+        ));
+    }
+    info!(
+        "Verified submarine HTLC; funding {} sat on-chain",
+        accept.onchain_amount_sat
+    );
+
+    // 6) Fund the HTLC and wait for settlement (or refund at timeout).
+    let chain = build_chain(config)?;
+    let wallet = build_wallet(config, network)?;
+    let funding = SubmarineFunding {
+        htlc_script: expected_script,
+        htlc_spk: htlc_address.script_pubkey(),
+        onchain_amount_sat: accept.onchain_amount_sat,
+        payment_hash: ph,
+        refund_key: refund_sk,
+        timeout_height: accept.timeout_block_height,
+        fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
+    };
+    let state = execute_submarine_swap(ln, chain, wallet, funding, Duration::from_secs(2)).await?;
+    info!("Submarine swap finished: {state:?}");
+    Ok(())
+}
+
 fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {
     let bytes = hex::decode(hex_str).map_err(|e| anyhow!("decode pubkey hex: {e}"))?;
     PublicKey::from_slice(&bytes).map_err(|e| anyhow!("parse public key: {e}"))
+}
+
+/// Build the on-chain funding wallet (submarine swaps). Requires the `bdk-wallet` feature.
+#[cfg(feature = "bdk-wallet")]
+fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn OnchainWallet>> {
+    let wallet = swap_common::wallet::BdkWallet::from_mnemonic(
+        &config.wallet_mnemonic,
+        network,
+        &config.electrum_url,
+        config.onchain_fee_rate_sat_vb as f32,
+    )
+    .map_err(|e| anyhow!("funding wallet: {e}"))?;
+    Ok(Arc::new(wallet))
+}
+
+#[cfg(not(feature = "bdk-wallet"))]
+fn build_wallet(_config: &ClientConfig, _network: Network) -> Result<Arc<dyn OnchainWallet>> {
+    Err(anyhow!(
+        "client built without the `bdk-wallet` feature; rebuild with --features full to fund submarine swaps"
+    ))
 }
 
 fn parse_address_spk(addr: &str, network: Network) -> Result<ScriptBuf> {

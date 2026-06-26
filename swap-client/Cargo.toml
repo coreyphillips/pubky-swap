@@ -8,12 +8,14 @@ description = "pubky-swap client: discover providers, request quotes, and drive 
 
 [features]
 default = []
-# Enable the real LND gRPC backend (to pay the hold invoice). Requires protoc at build time.
+# Enable the real LND gRPC backend (pay/issue invoices). Requires protoc at build time.
 lnd = ["lightning-backend/lnd"]
-# Enable the Electrum chain watcher (to watch/claim the HTLC on-chain).
+# Enable the Electrum chain watcher (to watch/claim/refund the HTLC on-chain).
 chain = ["swap-common/electrum"]
-# Everything needed to execute a reverse swap end-to-end from the CLI.
-full = ["lnd", "chain"]
+# Enable the BDK funding wallet (to fund the HTLC in a submarine swap).
+bdk-wallet = ["swap-common/bdk-wallet"]
+# Everything needed to execute a swap end-to-end from the CLI.
+full = ["lnd", "chain", "bdk-wallet"]
 
 [dependencies]
 pubky-transport.workspace = true

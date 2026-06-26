@@ -233,6 +233,14 @@ mod tests {
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
+        async fn create_invoice(
+            &self,
+            _amt: u64,
+            _e: u64,
+            _m: &str,
+        ) -> lightning_backend::Result<HoldInvoice> {
+            Err(LightningError::NotImplemented("mock".into()))
+        }
         async fn invoice_state(&self, _ph: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
             Err(LightningError::NotImplemented("mock".into()))
         }
@@ -296,8 +304,10 @@ mod tests {
         spk: ScriptBuf,
     }
     impl OnchainWallet for MockWallet {
-        fn fund_htlc(&self, _spk: &ScriptBuf, _amount_sat: u64) -> Result<OutPoint> {
-            Err(anyhow!("provider does not fund in a submarine swap"))
+        fn fund_htlc(&self, _spk: &ScriptBuf, _amount_sat: u64) -> swap_common::Result<OutPoint> {
+            Err(swap_common::SwapError::Other(
+                "provider does not fund in a submarine swap".into(),
+            ))
         }
         fn receive_destination(&self) -> ScriptBuf {
             self.spk.clone()
