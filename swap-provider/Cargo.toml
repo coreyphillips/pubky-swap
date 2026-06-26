@@ -1,0 +1,45 @@
+[package]
+name = "swap-provider"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pubky-swap provider daemon: advertises offers and facilitates swaps with a local LND node"
+
+[features]
+default = []
+# Enable the real LND gRPC backend (requires protoc at build time).
+lnd = ["lightning-backend/lnd"]
+# Enable the BDK-backed on-chain funding wallet.
+bdk-wallet = ["dep:bdk"]
+# Enable the Electrum chain watcher.
+chain = ["swap-common/electrum"]
+# Everything needed to actually execute swaps end-to-end.
+full = ["lnd", "bdk-wallet", "chain"]
+
+[dependencies]
+pubky-transport.workspace = true
+swap-common.workspace = true
+lightning-backend.workspace = true
+bitcoin.workspace = true
+bdk = { version = "0.30", features = ["all-keys", "keys-bip39"], optional = true }
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+# Needed to implement the async LightningBackend trait for test mocks.
+async-trait.workspace = true
+# Needed by integration tests to name these crates directly.
+bitcoin.workspace = true
+swap-common.workspace = true
+lightning-backend.workspace = true
+swap-client.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true

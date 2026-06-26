@@ -1,0 +1,29 @@
+[package]
+name = "swap-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared types for the pubky-swap marketplace: wire messages, swap state machine, and HTLC scripts"
+
+[dependencies]
+bitcoin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+hex.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+# Electrum-backed chain watcher (feature `electrum`). Kept optional so the default build
+# pulls no networking stack.
+electrum-client = { version = "0.18", optional = true }
+
+[dev-dependencies]
+# Enables Transaction::verify (libbitcoinconsensus) so tests validate the claim/refund
+# witnesses against real Bitcoin script consensus rules. Test builds only.
+bitcoin = { version = "0.30", features = ["bitcoinconsensus"] }
+
+[features]
+default = []
+electrum = ["dep:electrum-client"]
