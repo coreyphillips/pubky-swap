@@ -1,9 +1,9 @@
 //! Chain observation needed to drive a swap: find the funding UTXO, count confirmations,
 //! learn the tip height (for timeouts), and broadcast claim/refund transactions.
 //!
-//! The trait is synchronous because the Electrum client is blocking; an async runtime
-//! should call these via `spawn_blocking`. An [`ElectrumWatcher`] implementation is provided
-//! behind the `electrum` feature.
+//! The trait is synchronous because the Electrum client is blocking; async callers wrap these in
+//! [`run_blocking`] so they don't stall the runtime. An [`ElectrumWatcher`] implementation is
+//! provided behind the `electrum` feature.
 
 use crate::error::Result;
 use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
@@ -12,6 +12,21 @@ use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
 /// `tx_confirmations`): large enough that any finality-depth check treats the tx as final, so test
 /// mocks don't spin in fee-bump/finality loops.
 pub const ASSUMED_FINAL_CONFIRMATIONS: u32 = 1_000_000;
+
+/// Run a blocking [`ChainWatcher`] call without stalling the async runtime.
+///
+/// The watcher methods are synchronous (the Electrum client blocks), so calling them directly in an
+/// async driver would block a runtime worker. On a multi-threaded runtime this uses
+/// `block_in_place`, which signals the runtime to keep other tasks progressing on sibling workers;
+/// on a current-thread runtime (e.g. `#[tokio::test]`, or no runtime at all) it just runs inline,
+/// since `block_in_place` would panic there. Borrowed data is fine — nothing needs to be `'static`.
+pub fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
 
 /// A confirmed-or-mempool funding output of an HTLC.
 #[derive(Debug, Clone)]

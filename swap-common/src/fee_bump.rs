@@ -7,7 +7,7 @@
 //! higher fee; if it is dropped or **reorged out** after confirming it re-broadcasts at the current
 //! fee; and it only returns once the spend is buried `min_confirmations` deep (reorg-safe).
 
-use crate::chain::ChainWatcher;
+use crate::chain::{run_blocking, ChainWatcher};
 use crate::error::Result;
 use crate::onchain::{bumped_fee_rate, resolve_fee_rate};
 use bitcoin::{Script, Transaction, Txid};
@@ -36,14 +36,15 @@ pub async fn confirm_or_bump(
     min_confirmations: u32,
     mut build: impl FnMut(u64) -> Result<Transaction>,
 ) -> Result<Txid> {
-    let est = chain.estimate_fee_rate(fee_target_blocks).unwrap_or(None);
+    let est = run_blocking(|| chain.estimate_fee_rate(fee_target_blocks)).unwrap_or(None);
     let mut rate = resolve_fee_rate(est, floor_rate_sat_vb);
-    let mut txid = chain.broadcast(&build(rate)?)?;
+    let initial = build(rate)?;
+    let mut txid = run_blocking(|| chain.broadcast(&initial))?;
     let mut bumps = 0u32;
     let mut had_confirmation = false;
 
     loop {
-        match chain.tx_confirmations(htlc_spk, &txid)? {
+        match run_blocking(|| chain.tx_confirmations(htlc_spk, &txid))? {
             // Buried deep enough — final.
             Some(c) if c >= min_confirmations => return Ok(txid),
             // Dropped from mempool and chain. If it had confirmed, a reorg orphaned it; either
@@ -54,20 +55,22 @@ pub async fn confirm_or_bump(
                 } else {
                     debug!("spend {txid} dropped from mempool; re-broadcasting");
                 }
-                if let Ok(id) = chain.broadcast(&build(rate)?) {
+                let tx = build(rate)?;
+                if let Ok(id) = run_blocking(|| chain.broadcast(&tx)) {
                     txid = id;
                 }
             }
             // In the mempool (not yet mined): consider an RBF fee bump.
             Some(0) => {
                 if bumps < max_bumps {
-                    let est = chain.estimate_fee_rate(fee_target_blocks).unwrap_or(None);
+                    let est =
+                        run_blocking(|| chain.estimate_fee_rate(fee_target_blocks)).unwrap_or(None);
                     let next_rate = bumped_fee_rate(rate, est);
                     // `build` errors only if the higher fee would dust the output — then we can't
                     // raise it any further, so let the current tx ride.
                     if next_rate > rate {
                         if let Ok(replacement) = build(next_rate) {
-                            if let Ok(id) = chain.broadcast(&replacement) {
+                            if let Ok(id) = run_blocking(|| chain.broadcast(&replacement)) {
                                 debug!("fee-bumped spend -> {id} at {next_rate} sat/vB");
                                 txid = id;
                                 rate = next_rate;

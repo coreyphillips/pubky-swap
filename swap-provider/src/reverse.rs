@@ -20,7 +20,7 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf};
 use lightning_backend::{InvoiceState, LightningBackend};
 use std::time::Duration;
-use swap_common::chain::ChainWatcher;
+use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
 use swap_common::onchain::{
@@ -110,8 +110,8 @@ pub async fn init_reverse_swap(
 /// Drive a reverse swap to a terminal [`SwapState`] (`Claimed`, `Refunded`, `Expired`, or
 /// `Failed`).
 ///
-/// NOTE: [`ChainWatcher`] calls are blocking; a production caller should run this on a
-/// blocking-friendly task. `poll` is injected for testability.
+/// [`ChainWatcher`] calls are blocking, so they are wrapped in [`run_blocking`] to avoid stalling
+/// the async runtime. `poll` is injected for testability.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_reverse_swap(
     ln: &dyn LightningBackend,
@@ -138,7 +138,7 @@ pub async fn drive_reverse_swap(
                 return Ok(SwapState::Failed("hold invoice cancelled".into()))
             }
             InvoiceState::Open => {
-                if chain.tip_height()? >= swap.timeout_height {
+                if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
                     if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
                         warn!("Reverse swap: failed to cancel hold invoice on expiry: {e}");
                     }
@@ -154,14 +154,16 @@ pub async fn drive_reverse_swap(
     let funding_outpoint = match resume_funding {
         // Resumed with a known outpoint: we already funded before the restart.
         Some(op) => op,
-        None => match chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
+        None => match run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))?
+        {
             // Already funded (and still unspent) — adopt the existing output.
             Some(u) => {
                 progress.funded(u.outpoint);
                 u.outpoint
             }
             None => {
-                let op = wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat)?;
+                let op =
+                    run_blocking(|| wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat))?;
                 progress.funded(op);
                 op
             }
@@ -178,7 +180,7 @@ pub async fn drive_reverse_swap(
 
     // 3. Wait for the client to claim (revealing the preimage), else refund at timeout.
     loop {
-        if let Some(spend) = chain.find_spend(&swap.htlc_spk, &funding_outpoint)? {
+        if let Some(spend) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))? {
             if let Some(preimage) = extract_preimage(&spend, &funding_outpoint, &swap.payment_hash)
             {
                 ln.settle_hold_invoice(preimage)
@@ -188,7 +190,7 @@ pub async fn drive_reverse_swap(
                 return Ok(SwapState::Claimed);
             }
         }
-        if chain.tip_height()? >= swap.timeout_height {
+        if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
             warn!("Reverse swap: timeout reached without claim; refunding HTLC");
             // Broadcast the refund and keep it confirming under fee pressure (RBF): the initial
             // fee uses a live estimate clamped to the floor, and is bumped if it doesn't confirm.

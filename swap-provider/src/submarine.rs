@@ -20,7 +20,7 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf};
 use lightning_backend::LightningBackend;
 use std::time::Duration;
-use swap_common::chain::ChainWatcher;
+use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, PaymentHash};
 use swap_common::onchain::{
@@ -96,8 +96,8 @@ pub async fn init_submarine_swap(
 
 /// Drive a submarine swap to a terminal [`SwapState`].
 ///
-/// NOTE: [`ChainWatcher`] calls are blocking; a production caller should run this on a
-/// blocking-friendly task. `poll` is injected for testability.
+/// [`ChainWatcher`] calls are blocking, so they are wrapped in [`run_blocking`] to avoid stalling
+/// the async runtime. `poll` is injected for testability.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_submarine_swap(
     ln: &dyn LightningBackend,
@@ -116,7 +116,7 @@ pub async fn drive_submarine_swap(
     //    we already claimed before the crash, finish immediately.
     let funding_outpoint = match resume_funding {
         Some(op) => {
-            if let Some(spend) = chain.find_spend(&swap.htlc_spk, &op)? {
+            if let Some(spend) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &op))? {
                 if extract_preimage(&spend, &op, &swap.payment_hash).is_some() {
                     info!("Submarine swap: already claimed before restart");
                     return Ok(SwapState::Claimed);
@@ -125,13 +125,15 @@ pub async fn drive_submarine_swap(
             op
         }
         None => loop {
-            if let Some(utxo) = chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
+            if let Some(utxo) =
+                run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))?
+            {
                 if utxo.confirmations >= required_confirmations {
                     progress.funded(utxo.outpoint);
                     break utxo.outpoint;
                 }
             }
-            if chain.tip_height()? >= swap.timeout_height {
+            if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
                 return Ok(SwapState::Expired);
             }
             sleep(poll).await;
@@ -143,13 +145,10 @@ pub async fn drive_submarine_swap(
     // to the required depth right before paying. A reorg that dropped it below that depth (or
     // orphaned it entirely) means we must not pay — otherwise we'd pay Lightning for an HTLC that
     // no longer exists. (If it was instead spent by our own earlier claim on resume, finish.)
-    match chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
+    match run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))? {
         Some(utxo) if utxo.confirmations >= required_confirmations => {}
         _ => {
-            if chain
-                .find_spend(&swap.htlc_spk, &funding_outpoint)?
-                .is_some()
-            {
+            if run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))?.is_some() {
                 info!("Submarine swap: funding already spent (prior claim); done");
                 return Ok(SwapState::Claimed);
             }

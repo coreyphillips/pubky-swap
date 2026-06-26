@@ -12,7 +12,7 @@ use bitcoin::{ScriptBuf, Txid};
 use lightning_backend::LightningBackend;
 use std::sync::Arc;
 use std::time::Duration;
-use swap_common::chain::ChainWatcher;
+use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::Preimage;
 use swap_common::onchain::{build_claim_tx, estimate_spend_fee, CLAIM_FEE_TARGET_BLOCKS};
@@ -43,8 +43,8 @@ pub struct ReverseClaim {
 
 /// Execute the client side of a reverse swap, returning the claim txid on success.
 ///
-/// NOTE: [`ChainWatcher`] calls are blocking; a production caller should run this on a
-/// blocking-friendly task. `poll` is injected for testability.
+/// [`ChainWatcher`] calls are blocking, so they are wrapped in [`run_blocking`] to avoid stalling
+/// the async runtime. `poll` is injected for testability.
 pub async fn execute_reverse_swap(
     ln: Arc<dyn LightningBackend>,
     chain: Arc<dyn ChainWatcher>,
@@ -62,8 +62,7 @@ pub async fn execute_reverse_swap(
 
     // 2. Wait for the provider to fund + confirm the on-chain HTLC.
     let funding = loop {
-        let found = chain
-            .find_funding(&claim.htlc_spk, claim.onchain_amount_sat)
+        let found = run_blocking(|| chain.find_funding(&claim.htlc_spk, claim.onchain_amount_sat))
             .map_err(|e| anyhow!("find_funding: {e}"))?;
         if let Some(u) = found {
             if u.confirmations >= required_confirmations {

@@ -12,7 +12,7 @@ use bitcoin::ScriptBuf;
 use lightning_backend::{InvoiceState, LightningBackend};
 use std::sync::Arc;
 use std::time::Duration;
-use swap_common::chain::ChainWatcher;
+use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::PaymentHash;
 use swap_common::onchain::{build_refund_tx, estimate_spend_fee, REFUND_FEE_TARGET_BLOCKS};
@@ -51,8 +51,7 @@ pub async fn execute_submarine_swap(
     poll: Duration,
 ) -> Result<SwapState> {
     // 1. Fund the HTLC on-chain.
-    let outpoint = wallet
-        .fund_htlc(&funding.htlc_spk, funding.onchain_amount_sat)
+    let outpoint = run_blocking(|| wallet.fund_htlc(&funding.htlc_spk, funding.onchain_amount_sat))
         .map_err(|e| anyhow!("fund HTLC: {e}"))?;
     info!("Submarine client: HTLC funded at {outpoint}; awaiting Lightning settlement");
 
@@ -68,11 +67,12 @@ pub async fn execute_submarine_swap(
             return Ok(SwapState::Claimed);
         }
 
-        if chain.tip_height().map_err(|e| anyhow!("tip height: {e}"))? >= funding.timeout_height {
+        if run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip height: {e}"))?
+            >= funding.timeout_height
+        {
             // If the provider already claimed the HTLC, the preimage is public and our invoice
             // will settle — don't refund (the refund would just lose to their claim).
-            if chain
-                .find_spend(&funding.htlc_spk, &outpoint)
+            if run_blocking(|| chain.find_spend(&funding.htlc_spk, &outpoint))
                 .map_err(|e| anyhow!("find spend: {e}"))?
                 .is_some()
             {

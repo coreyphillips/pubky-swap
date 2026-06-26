@@ -23,7 +23,7 @@ use lightning_backend::{LightningBackend, LndConfig, StubBackend};
 use pubky_transport::Transport;
 use std::collections::HashMap;
 use std::sync::Arc;
-use swap_common::chain::ChainWatcher;
+use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
 use swap_common::{messages::*, NetworkSpec, SwapDirection, SwapState};
 use tokio::sync::Mutex;
@@ -577,7 +577,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
 
     let secp = Secp256k1::new();
     let (refund_sk, refund_pk) = swap_common::random_keypair(&secp);
-    let tip = chain.tip_height().map_err(|e| anyhow!("tip height: {e}"))?;
+    let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip height: {e}"))?;
     let timeout_height = tip + ctx.htlc_timeout_blocks;
 
     let swap = init_reverse_swap(
@@ -703,7 +703,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
 
     let secp = Secp256k1::new();
     let (claim_sk, claim_pk) = swap_common::random_keypair(&secp);
-    let tip = chain.tip_height().map_err(|e| anyhow!("tip height: {e}"))?;
+    let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip height: {e}"))?;
     let timeout_height = tip + ctx.htlc_timeout_blocks;
 
     let swap = init_submarine_swap(
@@ -846,7 +846,7 @@ fn spawn_reorg_monitor(ctx: &ExecCtx) {
     tokio::spawn(async move {
         let mut monitor = swap_common::reorg::ReorgMonitor::new(100);
         loop {
-            match monitor.observe(chain.as_ref()) {
+            match run_blocking(|| monitor.observe(chain.as_ref())) {
                 Ok(Some(fork)) => {
                     warn!("chain reorg detected at height {fork}; re-validating in-flight swaps");
                     if let Ok(records) = store.load_active() {
@@ -856,7 +856,7 @@ fn spawn_reorg_monitor(ctx: &ExecCtx) {
                                 continue;
                             };
                             let still_funded = matches!(
-                                chain.find_funding(&spk, rec.onchain_amount_sat),
+                                run_blocking(|| chain.find_funding(&spk, rec.onchain_amount_sat)),
                                 Ok(Some(ref u)) if u.outpoint == op
                             );
                             if !still_funded {

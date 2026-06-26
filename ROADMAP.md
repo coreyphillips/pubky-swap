@@ -92,8 +92,9 @@ swaps** (`--data-dir`) and **resumes** them on restart (idempotently — it neve
 already-funded HTLC), and enforces **network-mismatch** and **mainnet-safety** guards plus
 **single-use, expiring quotes**.
 
-**Remaining for this phase:**
-- Run the drivers' blocking chain calls via `spawn_blocking` (inline today; fine on regtest).
+**Phase 4 complete.** The drivers' blocking chain/wallet calls now run via
+`swap-common::chain::run_blocking` (`block_in_place` on a multi-threaded runtime, inline on a
+current-thread one), so they no longer stall the async runtime.
 
 ### ✅ Phase 5 — Submarine swaps (end-to-end)
 `swap-provider::submarine` orchestrates the provider side: `init_submarine_swap` (decode the
@@ -126,7 +127,6 @@ optional Liquid chain swaps.
 
 The swap engine works on regtest, but these remain before any signet/mainnet exposure:
 
-- **`spawn_blocking`** for the drivers' blocking chain calls under load.
 - **CPFP** as a fallback to RBF when a spend can't be replaced (RBF bumping + reorg re-broadcast
   are implemented).
 - Validating reorg handling against a **reorg-capable regtest harness** (the logic is unit-tested
