@@ -17,6 +17,11 @@ use tracing::{debug, warn};
 /// Default cap on the number of RBF fee bumps for a single claim/refund spend.
 pub const MAX_FEE_BUMPS: u32 = 10;
 
+/// Child-pays-for-parent fallback callback: given the stuck parent spend's txid and a target fee
+/// rate (sat/vB), build and broadcast a high-fee child, returning the child txid (or `None`). Used
+/// only when an RBF replacement can't be broadcast.
+pub type CpfpBump<'a> = dyn Fn(Txid, u64) -> Option<Txid> + Send + Sync + 'a;
+
 /// Broadcast a spend and keep it confirming under fee pressure and across reorgs.
 ///
 /// - `build(rate)` produces the signed spend for a fee rate (sat/vB); it returns an error when the
@@ -34,6 +39,7 @@ pub async fn confirm_or_bump(
     poll: Duration,
     max_bumps: u32,
     min_confirmations: u32,
+    cpfp: Option<&CpfpBump<'_>>,
     mut build: impl FnMut(u64) -> Result<Transaction>,
 ) -> Result<Txid> {
     let est = run_blocking(|| chain.estimate_fee_rate(fee_target_blocks)).unwrap_or(None);
@@ -70,11 +76,22 @@ pub async fn confirm_or_bump(
                     // raise it any further, so let the current tx ride.
                     if next_rate > rate {
                         if let Ok(replacement) = build(next_rate) {
-                            if let Ok(id) = run_blocking(|| chain.broadcast(&replacement)) {
-                                debug!("fee-bumped spend -> {id} at {next_rate} sat/vB");
-                                txid = id;
-                                rate = next_rate;
-                                bumps += 1;
+                            match run_blocking(|| chain.broadcast(&replacement)) {
+                                Ok(id) => {
+                                    debug!("fee-bumped spend -> {id} at {next_rate} sat/vB");
+                                    txid = id;
+                                    rate = next_rate;
+                                    bumps += 1;
+                                }
+                                // RBF replacement rejected — fall back to CPFP on the stuck tx
+                                // (its swept output pays a wallet that can build a high-fee child).
+                                Err(e) => {
+                                    debug!("RBF replacement rejected ({e}); trying CPFP");
+                                    if let Some(child) = cpfp.and_then(|f| f(txid, next_rate)) {
+                                        debug!("CPFP child {child} for stuck spend {txid}");
+                                        bumps += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -170,6 +187,7 @@ mod tests {
             Duration::from_millis(0),
             10,
             2,
+            None,
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await
@@ -190,6 +208,7 @@ mod tests {
             Duration::from_millis(0),
             10,
             2,
+            None,
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await
@@ -198,6 +217,79 @@ mod tests {
         assert!(
             chain.broadcasts.lock().unwrap().len() >= 2,
             "must re-broadcast after a reorg drops the confirmed spend"
+        );
+    }
+
+    /// A chain that accepts the first broadcast (the initial spend) but rejects every later one
+    /// (RBF replacements), staying in the mempool until it finally confirms.
+    struct RbfRejectChain {
+        confs: Vec<Option<u32>>,
+        idx: Mutex<usize>,
+        broadcasts: Mutex<u32>,
+    }
+    impl ChainWatcher for RbfRejectChain {
+        fn tip_height(&self) -> Result<u32> {
+            Ok(100)
+        }
+        fn find_funding(&self, _: &Script, _: u64) -> Result<Option<FundingUtxo>> {
+            Ok(None)
+        }
+        fn find_spend(&self, _: &Script, _: &OutPoint) -> Result<Option<Transaction>> {
+            Ok(None)
+        }
+        fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
+            let mut n = self.broadcasts.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Ok(tx.txid())
+            } else {
+                Err(crate::error::SwapError::Other(
+                    "rbf replacement rejected".into(),
+                ))
+            }
+        }
+        fn estimate_fee_rate(&self, _t: u16) -> Result<Option<u64>> {
+            Ok(Some(50)) // a high estimate so an RBF bump is attempted
+        }
+        fn tx_confirmations(&self, _: &Script, _: &Txid) -> Result<Option<u32>> {
+            let mut i = self.idx.lock().unwrap();
+            let v = *self.confs.get(*i).unwrap_or(self.confs.last().unwrap());
+            *i += 1;
+            Ok(v)
+        }
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_cpfp_when_rbf_rejected() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Stuck in the mempool (0), then confirms (2). The RBF replacement broadcast is rejected,
+        // so CPFP must be tried.
+        let chain = RbfRejectChain {
+            confs: vec![Some(0), Some(2)],
+            idx: Mutex::new(0),
+            broadcasts: Mutex::new(0),
+        };
+        let cpfp_called = AtomicBool::new(false);
+        let cpfp = |_parent: Txid, _rate: u64| -> Option<Txid> {
+            cpfp_called.store(true, Ordering::SeqCst);
+            Some(tx_paying(1).txid())
+        };
+        confirm_or_bump(
+            &chain,
+            spk().as_script(),
+            3,
+            5,
+            Duration::from_millis(0),
+            10,
+            2,
+            Some(&cpfp),
+            |rate| Ok(tx_paying(100_000 - rate)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            cpfp_called.load(Ordering::SeqCst),
+            "CPFP must be tried when the RBF replacement is rejected"
         );
     }
 
@@ -212,6 +304,7 @@ mod tests {
             Duration::from_millis(0),
             10,
             2,
+            None,
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await

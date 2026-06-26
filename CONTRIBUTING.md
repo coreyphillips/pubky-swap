@@ -49,14 +49,25 @@ When you add code behind a feature, build it explicitly (e.g.
 - **Unit tests** run with `cargo test --all` and use trait mocks (no Bitcoin/Lightning needed).
   The on-chain HTLC spends are additionally validated against real Bitcoin script consensus via
   `libbitcoinconsensus`.
-- **Integration tests** are marked `#[ignore]` and need a regtest backplane. The easiest setup is
-  [Polar](https://lightningpolar.com), which gives you bitcoind + electrs + LND nodes. Defaults the
-  tests assume: bitcoind RPC `polaruser`/`polarpass` on port `43782`, Electrum at
-  `tcp://127.0.0.1:60001` (override with `REGTEST_ELECTRUM_URL`), bitcoind container name `bitcoin`
-  (override with `REGTEST_BTC_CONTAINER`).
+- **Integration tests** are marked `#[ignore]` and need a regtest backplane. Defaults the tests
+  assume: bitcoind RPC `polaruser`/`polarpass` on port `43782`, Electrum at `tcp://127.0.0.1:60001`
+  (override with `REGTEST_ELECTRUM_URL`), bitcoind container name `bitcoin` (override with
+  `REGTEST_BTC_CONTAINER`).
 
-  See the command list at the bottom of [`README.md`](README.md). Run them with
-  `-- --ignored --nocapture`.
+  - **bitcoind + electrs tests** (`swap-common` `regtest`/`reorg_regtest`, `swap-provider`
+    `wallet_regtest`): spin up the backplane with
+    `docker compose -f docker-compose.regtest.yml up -d`, then run the test with
+    `-- --ignored --nocapture`.
+  - **Two-node LND swap tests** (`full_swap_regtest`, `submarine_swap_regtest`): need a funded
+    Lightning channel between two LND nodes — easiest via [Polar](https://lightningpolar.com).
+    Provide the `LND_A_*` / `LND_B_*` and electrum env vars (see [`README.md`](README.md)).
+
+## CI
+
+`.github/workflows/ci.yml` runs fmt, clippy (all feature combos), the build matrix, and unit tests
+on every push/PR. `.github/workflows/regtest.yml` runs the bitcoind-backed integration tests
+against the `docker-compose.regtest.yml` backplane on a manual/weekly trigger (the LND two-node
+tests aren't automated — they need a funded channel).
 
 ## Safety invariants (do not break these)
 

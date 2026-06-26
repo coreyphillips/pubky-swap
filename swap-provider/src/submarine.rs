@@ -17,7 +17,7 @@
 use crate::reverse::{OnchainWallet, ProgressSink};
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf};
+use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
 use lightning_backend::LightningBackend;
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
@@ -194,6 +194,20 @@ pub async fn drive_submarine_swap(
             &swap.claim_key,
         )
     };
+    // The claim sweeps to our wallet, so CPFP can bump it if an RBF replacement is rejected.
+    let cpfp = |parent: Txid, rate: u64| {
+        run_blocking(|| {
+            wallet.cpfp_bump(
+                OutPoint {
+                    txid: parent,
+                    vout: 0,
+                },
+                rate,
+            )
+        })
+        .ok()
+        .flatten()
+    };
     confirm_or_bump(
         chain,
         &swap.htlc_spk,
@@ -202,6 +216,7 @@ pub async fn drive_submarine_swap(
         poll,
         MAX_FEE_BUMPS,
         FINALITY_DEPTH,
+        Some(&cpfp),
         build,
     )
     .await

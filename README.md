@@ -1,5 +1,7 @@
 # pubky-swap
 
+[![CI](https://github.com/coreyphillips/pubky-swap/actions/workflows/ci.yml/badge.svg)](https://github.com/coreyphillips/pubky-swap/actions/workflows/ci.yml)
+
 A **self-hosted, decentralized Lightning swap marketplace.** Any node operator can advertise
 swaps at their own rates and facilitate them with their own LND node; clients discover providers
 and negotiate over the [Pubky](https://pubky.org) network (an encrypted-DM + follow-graph
@@ -134,11 +136,22 @@ Without the execution features a provider runs **negotiation-only** and rejects 
 
 ## Integration tests (regtest)
 
-All are `#[ignore]`d and need real services. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup.
+All are `#[ignore]`d and need real services. The bitcoind+electrs tests have a one-command backplane:
+
+```bash
+docker compose -f docker-compose.regtest.yml up -d   # bitcoind + electrs (Polar-compatible defaults)
+```
+
+CI runs fmt/clippy/build/unit tests on every push (`.github/workflows/ci.yml`) and the
+bitcoind-backed integration tests on a manual/weekly schedule (`.github/workflows/regtest.yml`). See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the two-node LND setup.
 
 ```bash
 # HTLC engine + Electrum watcher against bitcoind + electrs
 cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
+
+# Reorg detection (forces a reorg via bitcoin-cli invalidateblock)
+cargo test -p swap-common --features electrum --test reorg_regtest -- --ignored --nocapture
 
 # BDK funding wallet against bitcoind + electrs
 cargo test -p swap-provider --features full --test wallet_regtest -- --ignored --nocapture

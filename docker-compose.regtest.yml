@@ -1,0 +1,49 @@
+# Regtest backplane (bitcoind + electrs) matching the integration tests' defaults:
+#   - bitcoind RPC on :43782 (polaruser / polarpass), container named "bitcoin"
+#   - electrs Electrum RPC on :60001
+#
+# Bring it up:   docker compose -f docker-compose.regtest.yml up -d
+# Then run the bitcoind-backed integration tests, e.g.:
+#   cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
+#   cargo test -p swap-common --features electrum --test reorg_regtest -- --ignored --nocapture
+#   cargo test -p swap-provider --features full --test wallet_regtest -- --ignored --nocapture
+# Tear down:     docker compose -f docker-compose.regtest.yml down -v
+#
+# NOTE: the two-node LND swap tests (full_swap_regtest, submarine_swap_regtest) need a funded
+# Lightning channel between two LND nodes — easiest via Polar (https://lightningpolar.com). They are
+# not part of this backplane. Image versions below may need adjusting for your environment.
+
+services:
+  bitcoin:
+    image: polarlightning/bitcoind:27.0
+    container_name: bitcoin
+    command:
+      - -regtest
+      - -server
+      - -txindex
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=43782
+      - -rpcuser=polaruser
+      - -rpcpassword=polarpass
+      - -fallbackfee=0.0002
+      - -zmqpubrawblock=tcp://0.0.0.0:28334
+      - -zmqpubrawtx=tcp://0.0.0.0:28335
+    ports:
+      - "43782:43782"
+
+  electrs:
+    image: ghcr.io/vulpemventures/electrs:latest
+    container_name: electrs
+    depends_on:
+      - bitcoin
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=bitcoin:43782
+      - --cookie=polaruser:polarpass
+      - --electrum-rpc-addr=0.0.0.0:60001
+      - --http-addr=0.0.0.0:3002
+      - --jsonrpc-import
+      - -vvv
+    ports:
+      - "60001:60001"

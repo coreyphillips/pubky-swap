@@ -47,11 +47,13 @@ preimage extraction (needs a second node paying the invoice — see Phase 4 rema
 `estimatefee` result clamped to a configured floor (the floor is both the minimum and the
 fallback when estimation is unavailable, e.g. on regtest). **RBF fee-bumping** — claim/refund are
 built RBF-signalling and `swap-common::fee_bump::confirm_or_bump` re-broadcasts at an escalating
-(capped) fee until the spend confirms. **Reorg handling** — spends are treated as final only at
-`reorg::FINALITY_DEPTH`; `confirm_or_bump` re-broadcasts a claim/refund that is reorged out; the
-submarine provider re-confirms the funding depth right before paying the (irreversible) invoice;
-and a background `reorg::ReorgMonitor` (block-hash continuity) flags reorgs affecting in-flight
-swaps.
+(capped) fee until the spend confirms, with a **CPFP fallback** (`OnchainWallet::cpfp_bump`) when an
+RBF replacement is rejected and the swept output is wallet-controlled. **Reorg handling** — spends
+are treated as final only at `reorg::FINALITY_DEPTH`; `confirm_or_bump` re-broadcasts a claim/refund
+that is reorged out; the submarine provider re-confirms the funding depth right before paying the
+(irreversible) invoice; and a background `reorg::ReorgMonitor` (block-hash continuity) flags reorgs
+affecting in-flight swaps. Reorg detection is validated live against bitcoind via
+`swap-common/tests/reorg_regtest.rs` (`invalidateblock`).
 
 **Phase 3 complete.**
 
@@ -127,12 +129,11 @@ optional Liquid chain swaps.
 
 The swap engine works on regtest, but these remain before any signet/mainnet exposure:
 
-- **CPFP** as a fallback to RBF when a spend can't be replaced (RBF bumping + reorg re-broadcast
-  are implemented).
-- Validating reorg handling against a **reorg-capable regtest harness** (the logic is unit-tested
-  with reorg-simulating mocks; a live deep-reorg test is not yet automated).
-- Running the `#[ignore]`d live regtest tests (reverse + submarine) in CI against a real backplane.
-- A third-party security review of the atomic-swap paths.
+- Automating the **two-node LND swap tests** in CI (they need a funded Lightning channel; the
+  bitcoind + electrs tests — HTLC engine, reorg detection, BDK wallet — already run via
+  `.github/workflows/regtest.yml` against the `docker-compose.regtest.yml` backplane).
+- **Signet soak testing** before any mainnet exposure.
+- A **third-party security review** of the atomic-swap paths.
 - **Marketplace hardening** (Phase 6): offer publishing/discovery on the Pubky profile, abuse/ban
   handling, requiring on-chain confirmation before a provider commits.
 - A **third-party security review** of the atomic-swap paths.

@@ -93,6 +93,8 @@ pub async fn execute_reverse_swap(
             &claim.claim_key,
         )
     };
+    // The claim sweeps to the client's chosen address (not necessarily a wallet we can spend from
+    // here), so RBF is the only bump mechanism — no CPFP fallback.
     let txid = confirm_or_bump(
         chain.as_ref(),
         &claim.htlc_spk,
@@ -101,6 +103,7 @@ pub async fn execute_reverse_swap(
         poll,
         MAX_FEE_BUMPS,
         FINALITY_DEPTH,
+        None,
         build,
     )
     .await

@@ -1,0 +1,58 @@
+name: Regtest integration
+
+# Runs the bitcoind-backed #[ignore]d integration tests against a real bitcoind + electrs backplane.
+# Manual (workflow_dispatch) and weekly, so it never blocks PRs. The two-node LND swap tests need a
+# funded Lightning channel and are not run here — see docker-compose.regtest.yml / CONTRIBUTING.md.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  regtest:
+    name: bitcoind + electrs integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start regtest backplane
+        run: |
+          docker compose -f docker-compose.regtest.yml up -d
+          echo "Waiting for bitcoind RPC..."
+          for i in $(seq 1 60); do
+            if docker exec bitcoin bitcoin-cli -regtest -rpcport=43782 \
+                 -rpcuser=polaruser -rpcpassword=polarpass getblockchaininfo >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          # Mature some coinbase so the BDK wallet test has spendable coins.
+          ADDR=$(docker exec bitcoin bitcoin-cli -regtest -rpcport=43782 \
+                   -rpcuser=polaruser -rpcpassword=polarpass getnewaddress)
+          docker exec bitcoin bitcoin-cli -regtest -rpcport=43782 \
+            -rpcuser=polaruser -rpcpassword=polarpass generatetoaddress 101 "$ADDR"
+          echo "Waiting for electrs to index..."
+          sleep 20
+
+      - name: HTLC engine + Electrum watcher
+        run: cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
+
+      - name: Reorg detection
+        run: cargo test -p swap-common --features electrum --test reorg_regtest -- --ignored --nocapture
+
+      - name: BDK funding wallet
+        run: cargo test -p swap-provider --features full --test wallet_regtest -- --ignored --nocapture
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.regtest.yml down -v

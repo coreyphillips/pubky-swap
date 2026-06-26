@@ -8,7 +8,7 @@
 
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
-use bitcoin::ScriptBuf;
+use bitcoin::{OutPoint, ScriptBuf, Txid};
 use lightning_backend::{InvoiceState, LightningBackend};
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +93,20 @@ pub async fn execute_submarine_swap(
                     &funding.refund_key,
                 )
             };
+            // The refund sweeps to our wallet, so CPFP can bump it if RBF is rejected.
+            let cpfp = |parent: Txid, rate: u64| {
+                run_blocking(|| {
+                    wallet.cpfp_bump(
+                        OutPoint {
+                            txid: parent,
+                            vout: 0,
+                        },
+                        rate,
+                    )
+                })
+                .ok()
+                .flatten()
+            };
             confirm_or_bump(
                 chain.as_ref(),
                 &funding.htlc_spk,
@@ -101,6 +115,7 @@ pub async fn execute_submarine_swap(
                 poll,
                 MAX_FEE_BUMPS,
                 FINALITY_DEPTH,
+                Some(&cpfp),
                 build,
             )
             .await

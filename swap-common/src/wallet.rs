@@ -4,7 +4,7 @@
 //! available; a BDK-backed implementation is provided behind the `bdk-wallet` feature.
 
 use crate::error::Result;
-use bitcoin::{OutPoint, ScriptBuf};
+use bitcoin::{OutPoint, ScriptBuf, Txid};
 
 /// A wallet that can fund HTLCs and supply a sweep destination.
 pub trait OnchainWallet: Send + Sync {
@@ -14,6 +14,14 @@ pub trait OnchainWallet: Send + Sync {
     /// A wallet-controlled scriptPubKey for swept funds (a reverse-swap refund or submarine-swap
     /// claim destination).
     fn receive_destination(&self) -> ScriptBuf;
+    /// Best-effort **child-pays-for-parent**: spend `parent` (a stuck claim/refund output that
+    /// pays this wallet) with a high-fee child at `fee_rate_sat_vb`, pulling the parent in. Used as
+    /// a fallback when an RBF replacement can't be broadcast. Returns the child txid, or `Ok(None)`
+    /// if unsupported (the default) — e.g. when the swept output isn't wallet-controlled.
+    fn cpfp_bump(&self, parent: OutPoint, fee_rate_sat_vb: u64) -> Result<Option<Txid>> {
+        let _ = (parent, fee_rate_sat_vb);
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "bdk-wallet")]
@@ -28,7 +36,7 @@ mod bdk_impl {
     use bdk::template::Bip84;
     use bdk::wallet::AddressIndex;
     use bdk::{FeeRate, KeychainKind, SignOptions, SyncOptions, Wallet};
-    use bitcoin::{Address, Network, OutPoint, ScriptBuf};
+    use bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid};
     use std::sync::{Mutex, MutexGuard};
 
     /// Fee-estimation confirmation target (blocks) for the HTLC funding transaction.
@@ -167,6 +175,38 @@ mod bdk_impl {
 
         fn receive_destination(&self) -> ScriptBuf {
             self.receive_spk.clone()
+        }
+
+        fn cpfp_bump(&self, parent: OutPoint, fee_rate_sat_vb: u64) -> Result<Option<Txid>> {
+            let w = self.locked()?;
+            w.sync(&self.blockchain, SyncOptions::default())
+                .map_err(|e| SwapError::Other(format!("sync: {e}")))?;
+
+            // Build a child that spends ONLY the parent's swept output (which pays this wallet),
+            // draining it back to a wallet address at a high fee — pulling the parent in.
+            let mut builder = w.build_tx();
+            builder
+                .manually_selected_only()
+                .add_utxo(parent)
+                .map_err(|e| SwapError::Other(format!("cpfp add_utxo: {e}")))?
+                .drain_to(self.receive_spk.clone())
+                .enable_rbf()
+                .fee_rate(FeeRate::from_sat_per_vb(fee_rate_sat_vb as f32));
+            let (mut psbt, _details) = builder
+                .finish()
+                .map_err(|e| SwapError::Other(format!("cpfp build_tx: {e}")))?;
+
+            let finalized = w
+                .sign(&mut psbt, SignOptions::default())
+                .map_err(|e| SwapError::Other(format!("cpfp sign: {e}")))?;
+            if !finalized {
+                return Ok(None);
+            }
+            let tx = psbt.extract_tx();
+            self.blockchain
+                .broadcast(&tx)
+                .map_err(|e| SwapError::Other(format!("cpfp broadcast: {e}")))?;
+            Ok(Some(tx.txid()))
         }
     }
 }
