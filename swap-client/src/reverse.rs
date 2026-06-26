@@ -13,8 +13,9 @@ use lightning_backend::LightningBackend;
 use std::sync::Arc;
 use std::time::Duration;
 use swap_common::chain::ChainWatcher;
+use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::Preimage;
-use swap_common::onchain::{build_claim_tx, estimate_spend_fee};
+use swap_common::onchain::{build_claim_tx, estimate_spend_fee, CLAIM_FEE_TARGET_BLOCKS};
 use tokio::time::sleep;
 use tracing::info;
 
@@ -79,21 +80,30 @@ pub async fn execute_reverse_swap(
     };
     info!("Client: provider HTLC funded; claiming with the preimage");
 
-    // 3. Claim the HTLC, revealing the preimage on-chain.
-    let fee = estimate_spend_fee(claim.fee_rate_sat_vb, true);
-    let claim_tx = build_claim_tx(
-        funding.outpoint,
-        claim.onchain_amount_sat,
-        &claim.htlc_script,
-        claim.dest_spk.clone(),
-        fee,
-        claim.preimage,
-        &claim.claim_key,
+    // 3. Claim the HTLC, revealing the preimage on-chain — and keep it confirming under fee
+    //    pressure (RBF), since it must land before the provider's refund timeout.
+    let build = |rate: u64| {
+        build_claim_tx(
+            funding.outpoint,
+            claim.onchain_amount_sat,
+            &claim.htlc_script,
+            claim.dest_spk.clone(),
+            estimate_spend_fee(rate, true),
+            claim.preimage,
+            &claim.claim_key,
+        )
+    };
+    let txid = confirm_or_bump(
+        chain.as_ref(),
+        &claim.htlc_spk,
+        CLAIM_FEE_TARGET_BLOCKS,
+        claim.fee_rate_sat_vb,
+        poll,
+        MAX_FEE_BUMPS,
+        build,
     )
-    .map_err(|e| anyhow!("build claim: {e}"))?;
-    let txid = chain
-        .broadcast(&claim_tx)
-        .map_err(|e| anyhow!("broadcast claim: {e}"))?;
+    .await
+    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?;
     info!("Client: claim broadcast {txid}; awaiting hold-invoice settlement");
 
     // 4. The provider sees our claim, recovers the preimage, and settles the invoice — which

@@ -43,6 +43,16 @@ pub trait ChainWatcher: Send + Sync {
         let _ = target_blocks;
         Ok(None)
     }
+
+    /// Confirmations of transaction `txid` (which we expect spends one of our outputs, hence the
+    /// `spk` to scan its history): `Some(0)` if still in the mempool, `Some(n)` if mined `n` deep,
+    /// `None` if not found (e.g. dropped/replaced). Used by fee-bump loops to stop once a
+    /// claim/refund confirms. The default returns `Some(1)` so watchers (and test mocks) that
+    /// don't track confirmations treat a broadcast as immediately final and don't spin.
+    fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {
+        let _ = (spk, txid);
+        Ok(Some(1))
+    }
 }
 
 #[cfg(feature = "electrum")]

@@ -10,8 +10,9 @@
 //!
 //! Signing uses the BIP143 segwit-v0 sighash over the HTLC witness script.
 //!
-//! Fee handling here is a simple absolute-fee deduction with a coarse size estimate;
-//! RBF/CPFP fee-bumping under congestion is a later hardening step (see ROADMAP.md).
+//! Fees are an absolute deduction from a coarse size estimate. Both branches are built
+//! RBF-signalling (BIP125), and [`crate::fee_bump`] re-broadcasts at a higher fee if a spend
+//! doesn't confirm in time.
 
 use crate::error::{Result, SwapError};
 use crate::htlc::{PaymentHash, Preimage};
@@ -71,6 +72,20 @@ pub fn resolve_fee_rate(estimate: Option<u64>, floor_sat_vb: u64) -> u64 {
     estimate.unwrap_or(floor_sat_vb).max(floor_sat_vb)
 }
 
+/// Hard cap on the fee rate (sat/vB) a bump loop will escalate to, so a runaway estimate can't
+/// burn an HTLC output down to dust.
+pub const MAX_FEE_RATE_SAT_VB: u64 = 1_000;
+
+/// The next fee rate (sat/vB) for an RBF bump: at least ~25% above the previous rate (BIP125
+/// requires a strictly higher fee), or a higher live `estimate` if one is available. Capped at
+/// [`MAX_FEE_RATE_SAT_VB`].
+pub fn bumped_fee_rate(previous_sat_vb: u64, estimate: Option<u64>) -> u64 {
+    let plus_25 = previous_sat_vb
+        .saturating_add(previous_sat_vb / 4)
+        .saturating_add(1);
+    estimate.unwrap_or(0).max(plus_25).min(MAX_FEE_RATE_SAT_VB)
+}
+
 /// Build and sign a transaction spending an HTLC P2WSH output.
 ///
 /// - `htlc_outpoint` / `htlc_value_sat`: the funding output being spent.
@@ -112,11 +127,11 @@ pub fn build_htlc_spend(
     } else {
         LockTime::from_height(timeout).map_err(|e| SwapError::Other(format!("locktime: {e}")))?
     };
-    let sequence = if is_claim {
-        Sequence::MAX
-    } else {
-        Sequence::ENABLE_LOCKTIME_NO_RBF // 0xFFFFFFFE: non-final, so CLTV is enforced
-    };
+    // Both branches opt into BIP125 replace-by-fee (sequence 0xFFFFFFFD) so a stuck claim/refund
+    // can be re-broadcast at a higher fee. 0xFFFFFFFD is also non-final, so the refund's absolute
+    // timelock (OP_CHECKLOCKTIMEVERIFY) is still enforced; the claim's nLockTime is 0, which is
+    // trivially satisfied regardless of sequence.
+    let sequence = Sequence::ENABLE_RBF_NO_LOCKTIME; // 0xFFFFFFFD
 
     let mut tx = Transaction {
         version: 2,
@@ -435,6 +450,48 @@ mod tests {
         assert_eq!(resolve_fee_rate(Some(3), 5), 5);
         // An estimate above the floor is used.
         assert_eq!(resolve_fee_rate(Some(50), 5), 50);
+    }
+
+    #[test]
+    fn bumped_fee_rate_escalates_and_caps() {
+        // No estimate → at least +25% (and always strictly higher).
+        assert_eq!(bumped_fee_rate(5, None), 7);
+        assert_eq!(bumped_fee_rate(1, None), 2);
+        // An estimate below the +25% bump still bumps by the minimum.
+        assert_eq!(bumped_fee_rate(5, Some(3)), 7);
+        // A higher estimate is taken directly.
+        assert_eq!(bumped_fee_rate(5, Some(50)), 50);
+        // Capped so a runaway estimate can't burn the output.
+        assert_eq!(bumped_fee_rate(5, Some(10_000)), MAX_FEE_RATE_SAT_VB);
+        assert_eq!(bumped_fee_rate(2_000, None), MAX_FEE_RATE_SAT_VB);
+    }
+
+    #[test]
+    fn claim_and_refund_signal_rbf() {
+        let s = setup();
+        let claim = build_claim_tx(
+            s.outpoint,
+            VALUE,
+            &s.redeem,
+            dest(),
+            1000,
+            s.preimage,
+            &s.claim_sk,
+        )
+        .unwrap();
+        let refund = build_refund_tx(
+            s.outpoint,
+            VALUE,
+            &s.redeem,
+            dest(),
+            1000,
+            TIMEOUT,
+            &s.refund_sk,
+        )
+        .unwrap();
+        // BIP125 opt-in: sequence must be <= 0xFFFFFFFD on both branches.
+        assert!(claim.input[0].sequence.is_rbf());
+        assert!(refund.input[0].sequence.is_rbf());
     }
 
     #[test]

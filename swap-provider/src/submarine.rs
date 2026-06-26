@@ -21,9 +21,10 @@ use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf};
 use lightning_backend::LightningBackend;
 use std::time::Duration;
 use swap_common::chain::ChainWatcher;
+use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, PaymentHash};
 use swap_common::onchain::{
-    build_claim_tx, estimate_spend_fee, extract_preimage, resolve_fee_rate, CLAIM_FEE_TARGET_BLOCKS,
+    build_claim_tx, estimate_spend_fee, extract_preimage, CLAIM_FEE_TARGET_BLOCKS,
 };
 use swap_common::SwapState;
 use tokio::time::sleep;
@@ -157,23 +158,32 @@ pub async fn drive_submarine_swap(
         ));
     }
 
-    // 3. Claim the on-chain HTLC with the preimage. Prefer a live fee estimate (the claim
-    //    races the client's refund timeout); never go below the configured floor.
-    let est = chain
-        .estimate_fee_rate(CLAIM_FEE_TARGET_BLOCKS)
-        .unwrap_or(None);
-    let fee = estimate_spend_fee(resolve_fee_rate(est, swap.fee_rate_sat_vb), true);
-    let claim_tx = build_claim_tx(
-        funding_outpoint,
-        swap.onchain_amount_sat,
-        &swap.htlc_script,
-        wallet.receive_destination(),
-        fee,
-        payment.preimage,
-        &swap.claim_key,
+    // 3. Claim the on-chain HTLC with the preimage, keeping it confirming under fee pressure
+    //    (RBF) — the claim races the client's refund timeout, so a stuck claim is bumped.
+    let dest = wallet.receive_destination();
+    let preimage = payment.preimage;
+    let build = |rate: u64| {
+        build_claim_tx(
+            funding_outpoint,
+            swap.onchain_amount_sat,
+            &swap.htlc_script,
+            dest.clone(),
+            estimate_spend_fee(rate, true),
+            preimage,
+            &swap.claim_key,
+        )
+    };
+    confirm_or_bump(
+        chain,
+        &swap.htlc_spk,
+        CLAIM_FEE_TARGET_BLOCKS,
+        swap.fee_rate_sat_vb,
+        poll,
+        MAX_FEE_BUMPS,
+        build,
     )
-    .map_err(|e| anyhow!("build claim: {e}"))?;
-    chain.broadcast(&claim_tx)?;
+    .await
+    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?;
     info!("Submarine swap: invoice paid and on-chain HTLC claimed");
     Ok(SwapState::Claimed)
 }

@@ -21,10 +21,10 @@ use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf};
 use lightning_backend::{InvoiceState, LightningBackend};
 use std::time::Duration;
 use swap_common::chain::ChainWatcher;
+use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
 use swap_common::onchain::{
-    build_refund_tx, estimate_spend_fee, extract_preimage, resolve_fee_rate,
-    REFUND_FEE_TARGET_BLOCKS,
+    build_refund_tx, estimate_spend_fee, extract_preimage, REFUND_FEE_TARGET_BLOCKS,
 };
 use swap_common::SwapState;
 use tokio::time::sleep;
@@ -196,23 +196,31 @@ pub async fn drive_reverse_swap(
         }
         if chain.tip_height()? >= swap.timeout_height {
             warn!("Reverse swap: timeout reached without claim; refunding HTLC");
-            // Prefer a live fee estimate (a transient estimatefee error degrades to the
-            // configured floor, so a refund is never blocked); never go below the floor.
-            let est = chain
-                .estimate_fee_rate(REFUND_FEE_TARGET_BLOCKS)
-                .unwrap_or(None);
-            let fee = estimate_spend_fee(resolve_fee_rate(est, swap.fee_rate_sat_vb), false);
-            let refund_tx = build_refund_tx(
-                funding_outpoint,
-                swap.onchain_amount_sat,
-                &swap.htlc_script,
-                wallet.receive_destination(),
-                fee,
-                swap.timeout_height,
-                &swap.refund_key,
+            // Broadcast the refund and keep it confirming under fee pressure (RBF): the initial
+            // fee uses a live estimate clamped to the floor, and is bumped if it doesn't confirm.
+            let dest = wallet.receive_destination();
+            let build = |rate: u64| {
+                build_refund_tx(
+                    funding_outpoint,
+                    swap.onchain_amount_sat,
+                    &swap.htlc_script,
+                    dest.clone(),
+                    estimate_spend_fee(rate, false),
+                    swap.timeout_height,
+                    &swap.refund_key,
+                )
+            };
+            confirm_or_bump(
+                chain,
+                &swap.htlc_spk,
+                REFUND_FEE_TARGET_BLOCKS,
+                swap.fee_rate_sat_vb,
+                poll,
+                MAX_FEE_BUMPS,
+                build,
             )
-            .map_err(|e| anyhow!("build refund: {e}"))?;
-            chain.broadcast(&refund_tx)?;
+            .await
+            .map_err(|e| anyhow!("refund broadcast/bump: {e}"))?;
             if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
                 warn!("Reverse swap: failed to cancel hold invoice after refund: {e}");
             }

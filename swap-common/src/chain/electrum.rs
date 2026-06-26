@@ -85,4 +85,24 @@ impl ChainWatcher for ElectrumWatcher {
             .map_err(|e| SwapError::Other(format!("electrum estimatefee: {e}")))?;
         Ok(crate::onchain::btc_per_kvb_to_sat_per_vb(btc_per_kvb))
     }
+
+    fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {
+        let history = self
+            .client
+            .script_get_history(spk)
+            .map_err(|e| SwapError::Other(format!("electrum history: {e}")))?;
+        let tip = self.tip_height()?;
+        for entry in history {
+            if entry.tx_hash == *txid {
+                // Electrum reports height 0 for mempool, <=0 for unconfirmed-with-unconfirmed-parent.
+                let confirmations = if entry.height <= 0 {
+                    0
+                } else {
+                    tip.saturating_sub(entry.height as u32).saturating_add(1)
+                };
+                return Ok(Some(confirmations));
+            }
+        }
+        Ok(None)
+    }
 }

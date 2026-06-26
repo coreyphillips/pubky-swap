@@ -4,11 +4,13 @@
 //! - [`swap`] — direction, network, and the lifecycle [`swap::SwapState`] machine.
 //! - [`htlc`] — P2WSH HTLC script construction and preimage helpers.
 //! - [`onchain`] — build & sign HTLC claim/refund transactions.
+//! - [`fee_bump`] — replace-by-fee bumping for claim/refund spends.
 //! - [`chain`] — chain observation (`ChainWatcher`; Electrum impl behind feature `electrum`).
 //! - [`keys`] — key helpers.
 
 pub mod chain;
 pub mod error;
+pub mod fee_bump;
 pub mod htlc;
 pub mod keys;
 pub mod messages;
