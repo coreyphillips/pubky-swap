@@ -44,9 +44,8 @@ impl NetworkSpec {
     }
 }
 
-/// Lifecycle state of a single swap. Mirrors the meaningful transitions in the Boltz
-/// lifecycle (created → lockup → invoice → claim/refund) without being tied to Boltz's
-/// exact status strings.
+/// Lifecycle state of a single swap, covering the meaningful transitions a swap moves
+/// through: created → lockup → invoice → claim/refund.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "detail", rename_all = "snake_case")]
 pub enum SwapState {

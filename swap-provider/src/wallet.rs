@@ -15,7 +15,10 @@ use bdk::template::Bip84;
 use bdk::wallet::AddressIndex;
 use bdk::{FeeRate, KeychainKind, SignOptions, SyncOptions, Wallet};
 use bitcoin::{Address, Network, OutPoint, ScriptBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+
+/// Fee-estimation confirmation target (blocks) for the HTLC funding transaction.
+const FUNDING_FEE_TARGET_BLOCKS: usize = 3;
 
 /// A BIP84 wallet that funds HTLCs over Electrum.
 pub struct BdkWallet {
@@ -68,9 +71,27 @@ impl BdkWallet {
         })
     }
 
+    /// Lock the inner wallet, turning a poisoned lock into a clean error instead of a panic.
+    fn locked(&self) -> Result<MutexGuard<'_, Wallet<MemoryDatabase>>> {
+        self.wallet
+            .lock()
+            .map_err(|_| anyhow!("wallet lock poisoned"))
+    }
+
+    /// Resolve the funding fee rate: prefer a live Electrum estimate, but never drop below the
+    /// configured floor. bdk's `ElectrumBlockchain::estimate_fee` does not guard the `-1` regtest
+    /// sentinel (it yields a negative `FeeRate`), so only accept an estimate above the floor.
+    fn resolved_fee_rate(&self) -> FeeRate {
+        let floor = FeeRate::from_sat_per_vb(self.fee_rate_sat_vb);
+        match self.blockchain.estimate_fee(FUNDING_FEE_TARGET_BLOCKS) {
+            Ok(est) if est.as_sat_per_vb() > self.fee_rate_sat_vb => est,
+            _ => floor,
+        }
+    }
+
     /// Sync and return the total balance in sats.
     pub fn balance(&self) -> Result<u64> {
-        let w = self.wallet.lock().unwrap();
+        let w = self.locked()?;
         w.sync(&self.blockchain, SyncOptions::default())
             .map_err(|e| anyhow!("sync: {e}"))?;
         let b = w.get_balance().map_err(|e| anyhow!("balance: {e}"))?;
@@ -79,7 +100,7 @@ impl BdkWallet {
 
     /// A fresh deposit address (for funding the wallet).
     pub fn deposit_address(&self) -> Result<Address> {
-        let w = self.wallet.lock().unwrap();
+        let w = self.locked()?;
         Ok(w.get_address(AddressIndex::New)
             .map_err(|e| anyhow!("deposit address: {e}"))?
             .address)
@@ -88,7 +109,7 @@ impl BdkWallet {
 
 impl OnchainWallet for BdkWallet {
     fn fund_htlc(&self, htlc_spk: &ScriptBuf, amount_sat: u64) -> Result<OutPoint> {
-        let w = self.wallet.lock().unwrap();
+        let w = self.locked()?;
         w.sync(&self.blockchain, SyncOptions::default())
             .map_err(|e| anyhow!("sync: {e}"))?;
 
@@ -96,7 +117,7 @@ impl OnchainWallet for BdkWallet {
         builder
             .add_recipient(htlc_spk.clone(), amount_sat)
             .enable_rbf()
-            .fee_rate(FeeRate::from_sat_per_vb(self.fee_rate_sat_vb));
+            .fee_rate(self.resolved_fee_rate());
         let (mut psbt, _details) = builder.finish().map_err(|e| anyhow!("build_tx: {e}"))?;
 
         let finalized = w

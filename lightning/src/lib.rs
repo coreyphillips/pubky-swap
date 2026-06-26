@@ -7,9 +7,10 @@
 //!   preimage, which we then use to claim the client's on-chain HTLC.
 //! - **Invoice state lookup**: drive the swap state machine off LN events.
 //!
-//! [`LndBackend`] is a stub today; the real implementation (tonic gRPC to LND's
-//! `invoicesrpc` + `routerrpc`) is the roadmap's "LND backend" milestone. Core Lightning
-//! can be added later as another [`LightningBackend`] impl without touching swap logic.
+//! [`LndBackend`] (behind the `lnd` feature) implements this over tonic gRPC to LND's
+//! `invoicesrpc` + `routerrpc`. A no-op [`StubBackend`] is used when no node is configured.
+//! Core Lightning can be added later as another [`LightningBackend`] impl without touching
+//! swap logic.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -34,6 +35,10 @@ pub struct NodeInfo {
     pub pubkey: String,
     pub alias: String,
     pub synced_to_chain: bool,
+    /// The chain network the node reports it is on (`"mainnet"`/`"testnet"`/`"signet"`/
+    /// `"regtest"`), used to guard against a network mismatch. `None` if the backend doesn't
+    /// report one.
+    pub chain_network: Option<String>,
 }
 
 /// A created hold invoice (reverse swaps).

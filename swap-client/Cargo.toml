@@ -6,6 +6,15 @@ authors.workspace = true
 license.workspace = true
 description = "pubky-swap client: discover providers, request quotes, and drive a swap"
 
+[features]
+default = []
+# Enable the real LND gRPC backend (to pay the hold invoice). Requires protoc at build time.
+lnd = ["lightning-backend/lnd"]
+# Enable the Electrum chain watcher (to watch/claim the HTLC on-chain).
+chain = ["swap-common/electrum"]
+# Everything needed to execute a reverse swap end-to-end from the CLI.
+full = ["lnd", "chain"]
+
 [dependencies]
 pubky-transport.workspace = true
 swap-common.workspace = true

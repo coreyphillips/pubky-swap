@@ -47,6 +47,30 @@ pub fn estimate_spend_fee(fee_rate_sat_vb: u64, is_claim: bool) -> u64 {
     estimate_spend_vsize(is_claim) * fee_rate_sat_vb
 }
 
+/// Fee-estimation confirmation target (blocks) for a provider's submarine **claim**. The claim
+/// races the client's refund timeout, so it targets fewer blocks (more aggressive) than a refund.
+pub const CLAIM_FEE_TARGET_BLOCKS: u16 = 3;
+/// Fee-estimation confirmation target (blocks) for a **refund**.
+pub const REFUND_FEE_TARGET_BLOCKS: u16 = 6;
+
+/// Convert Electrum `blockchain.estimatefee` output (BTC per kB) to sat/vB, rounding up.
+/// Returns `None` when the server reports no estimate (`<= 0` or non-finite — e.g. the `-1.0`
+/// sentinel on regtest). Never returns below 1 sat/vB.
+pub fn btc_per_kvb_to_sat_per_vb(btc_per_kvb: f64) -> Option<u64> {
+    if !btc_per_kvb.is_finite() || btc_per_kvb <= 0.0 {
+        return None;
+    }
+    // 1e8 sat/BTC / 1000 vB/kB = 1e5 sat·kB per BTC·vB.
+    Some(((btc_per_kvb * 100_000.0).ceil() as u64).max(1))
+}
+
+/// Resolve the sat/vB fee rate to use for an HTLC spend. The configured `floor_sat_vb` is both a
+/// fallback (when `estimate` is `None`) and a minimum: a live estimate can raise the rate but
+/// never lower it below the operator's configured floor.
+pub fn resolve_fee_rate(estimate: Option<u64>, floor_sat_vb: u64) -> u64 {
+    estimate.unwrap_or(floor_sat_vb).max(floor_sat_vb)
+}
+
 /// Build and sign a transaction spending an HTLC P2WSH output.
 ///
 /// - `htlc_outpoint` / `htlc_value_sat`: the funding output being spent.
@@ -387,6 +411,30 @@ mod tests {
             extract_preimage(&refund, &s.outpoint, &payment_hash(&s.preimage)),
             None
         );
+    }
+
+    #[test]
+    fn btc_per_kvb_conversion() {
+        // 0.0001 BTC/kB = 10 sat/vB.
+        assert_eq!(btc_per_kvb_to_sat_per_vb(0.0001), Some(10));
+        // 0.00001 BTC/kB = 1 sat/vB.
+        assert_eq!(btc_per_kvb_to_sat_per_vb(0.00001), Some(1));
+        // A tiny positive rate still rounds up to the 1 sat/vB floor.
+        assert_eq!(btc_per_kvb_to_sat_per_vb(1e-12), Some(1));
+        // The regtest "no estimate" sentinel and non-positive/NaN values yield None.
+        assert_eq!(btc_per_kvb_to_sat_per_vb(-1.0), None);
+        assert_eq!(btc_per_kvb_to_sat_per_vb(0.0), None);
+        assert_eq!(btc_per_kvb_to_sat_per_vb(f64::NAN), None);
+    }
+
+    #[test]
+    fn resolve_fee_rate_uses_floor_as_fallback_and_minimum() {
+        // No estimate → the configured floor.
+        assert_eq!(resolve_fee_rate(None, 5), 5);
+        // An estimate below the floor is clamped up to the floor.
+        assert_eq!(resolve_fee_rate(Some(3), 5), 5);
+        // An estimate above the floor is used.
+        assert_eq!(resolve_fee_rate(Some(50), 5), 50);
     }
 
     #[test]

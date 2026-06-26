@@ -75,4 +75,14 @@ impl ChainWatcher for ElectrumWatcher {
             .transaction_broadcast(tx)
             .map_err(|e| SwapError::Other(format!("electrum broadcast: {e}")))
     }
+
+    fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
+        // Electrum's `blockchain.estimatefee` returns BTC/kB (and `-1` when it has no estimate,
+        // e.g. on regtest). Convert to sat/vB, yielding `None` for the unavailable sentinel.
+        let btc_per_kvb = self
+            .client
+            .estimate_fee(target_blocks as usize)
+            .map_err(|e| SwapError::Other(format!("electrum estimatefee: {e}")))?;
+        Ok(crate::onchain::btc_per_kvb_to_sat_per_vb(btc_per_kvb))
+    }
 }

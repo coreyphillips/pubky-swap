@@ -22,7 +22,10 @@ use lightning_backend::{InvoiceState, LightningBackend};
 use std::time::Duration;
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
-use swap_common::onchain::{build_refund_tx, estimate_spend_fee, extract_preimage};
+use swap_common::onchain::{
+    build_refund_tx, estimate_spend_fee, extract_preimage, resolve_fee_rate,
+    REFUND_FEE_TARGET_BLOCKS,
+};
 use swap_common::SwapState;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -37,6 +40,16 @@ pub trait OnchainWallet: Send + Sync {
     /// refund or a submarine-swap claim.
     fn receive_destination(&self) -> ScriptBuf;
 }
+
+/// Hook for persisting a driver's progress so a restart can resume it. The provider supplies an
+/// implementation that updates and persists the swap's [`crate::store::SwapRecord`]; the unit
+/// `()` is a no-op used by tests.
+pub trait ProgressSink: Send + Sync {
+    /// The HTLC funding outpoint is now known (funded by us, or observed on-chain).
+    fn funded(&self, _outpoint: OutPoint) {}
+}
+
+impl ProgressSink for () {}
 
 /// State describing one provider-side reverse swap.
 pub struct ReverseSwap {
@@ -105,6 +118,7 @@ pub async fn init_reverse_swap(
 ///
 /// NOTE: [`ChainWatcher`] calls are blocking; a production caller should run this on a
 /// blocking-friendly task. `poll` is injected for testability.
+#[allow(clippy::too_many_arguments)]
 pub async fn drive_reverse_swap(
     ln: &dyn LightningBackend,
     chain: &dyn ChainWatcher,
@@ -112,6 +126,10 @@ pub async fn drive_reverse_swap(
     swap: &ReverseSwap,
     required_confirmations: u32,
     poll: Duration,
+    // If resuming after a restart and the HTLC was already funded, its outpoint — so we never
+    // re-fund. `None` on a fresh start.
+    resume_funding: Option<OutPoint>,
+    progress: &dyn ProgressSink,
 ) -> Result<SwapState> {
     // 1. Wait for the client to pay the hold invoice (give up at timeout — nothing locked yet).
     loop {
@@ -127,7 +145,9 @@ pub async fn drive_reverse_swap(
             }
             InvoiceState::Open => {
                 if chain.tip_height()? >= swap.timeout_height {
-                    let _ = ln.cancel_hold_invoice(swap.payment_hash).await;
+                    if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
+                        warn!("Reverse swap: failed to cancel hold invoice on expiry: {e}");
+                    }
                     return Ok(SwapState::Expired);
                 }
             }
@@ -136,8 +156,23 @@ pub async fn drive_reverse_swap(
     }
     info!("Reverse swap: hold invoice accepted; funding on-chain HTLC");
 
-    // 2. Fund the on-chain HTLC.
-    let funding_outpoint = wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat)?;
+    // 2. Fund the on-chain HTLC — idempotently, so a resumed driver never double-funds.
+    let funding_outpoint = match resume_funding {
+        // Resumed with a known outpoint: we already funded before the restart.
+        Some(op) => op,
+        None => match chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
+            // Already funded (and still unspent) — adopt the existing output.
+            Some(u) => {
+                progress.funded(u.outpoint);
+                u.outpoint
+            }
+            None => {
+                let op = wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat)?;
+                progress.funded(op);
+                op
+            }
+        },
+    };
     info!("Reverse swap: HTLC funded; awaiting client claim");
 
     // We funded the output ourselves, so we already know its outpoint. We do NOT separately
@@ -161,7 +196,12 @@ pub async fn drive_reverse_swap(
         }
         if chain.tip_height()? >= swap.timeout_height {
             warn!("Reverse swap: timeout reached without claim; refunding HTLC");
-            let fee = estimate_spend_fee(swap.fee_rate_sat_vb, false);
+            // Prefer a live fee estimate (a transient estimatefee error degrades to the
+            // configured floor, so a refund is never blocked); never go below the floor.
+            let est = chain
+                .estimate_fee_rate(REFUND_FEE_TARGET_BLOCKS)
+                .unwrap_or(None);
+            let fee = estimate_spend_fee(resolve_fee_rate(est, swap.fee_rate_sat_vb), false);
             let refund_tx = build_refund_tx(
                 funding_outpoint,
                 swap.onchain_amount_sat,
@@ -173,7 +213,9 @@ pub async fn drive_reverse_swap(
             )
             .map_err(|e| anyhow!("build refund: {e}"))?;
             chain.broadcast(&refund_tx)?;
-            let _ = ln.cancel_hold_invoice(swap.payment_hash).await;
+            if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
+                warn!("Reverse swap: failed to cancel hold invoice after refund: {e}");
+            }
             return Ok(SwapState::Refunded);
         }
         sleep(poll).await;
@@ -217,6 +259,7 @@ mod tests {
                 pubkey: "mock".into(),
                 alias: "mock".into(),
                 synced_to_chain: true,
+                chain_network: None,
             })
         }
         async fn create_hold_invoice(
@@ -367,10 +410,18 @@ mod tests {
             refund_spk: dest(),
         };
 
-        let final_state =
-            drive_reverse_swap(&ln, &chain, &wallet, &swap, 2, Duration::from_millis(0))
-                .await
-                .unwrap();
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(final_state, SwapState::Claimed);
         assert_eq!(
@@ -422,10 +473,18 @@ mod tests {
             refund_spk: dest(),
         };
 
-        let final_state =
-            drive_reverse_swap(&ln, &chain, &wallet, &swap, 2, Duration::from_millis(0))
-                .await
-                .unwrap();
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(final_state, SwapState::Refunded);
         assert_eq!(
@@ -438,5 +497,86 @@ mod tests {
             "the hold invoice must be cancelled on refund"
         );
         assert!(ln.settled_preimage.lock().unwrap().is_none());
+    }
+
+    /// A wallet that must never be asked to fund — used to prove a resumed driver does not
+    /// re-fund an already-funded HTLC.
+    struct PanicFundWallet {
+        refund_spk: ScriptBuf,
+    }
+    impl OnchainWallet for PanicFundWallet {
+        fn fund_htlc(&self, _htlc_spk: &ScriptBuf, _amount_sat: u64) -> Result<OutPoint> {
+            panic!("resumed driver must not re-fund the HTLC");
+        }
+        fn receive_destination(&self) -> ScriptBuf {
+            self.refund_spk.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_with_known_funding_does_not_refund_or_double_fund() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let swap = init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+        )
+        .await
+        .unwrap();
+
+        let outpoint = funding_outpoint();
+        let claim_tx = build_claim_tx(
+            outpoint,
+            AMOUNT,
+            &swap.htlc_script,
+            dest(),
+            1000,
+            preimage,
+            &claim_sk,
+        )
+        .unwrap();
+
+        // The funding UTXO is gone (already spent by the client's claim), so a fresh driver
+        // would try to fund again — but on resume with a known outpoint it must not.
+        let chain = MockChain {
+            tip: 700_000,
+            funding: None,
+            spend: Some(claim_tx),
+            broadcasts: Mutex::new(Vec::new()),
+        };
+        let wallet = PanicFundWallet { refund_spk: dest() };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            Some(outpoint), // resumed: funding already known
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Claimed);
+        assert!(
+            chain.broadcasts.lock().unwrap().is_empty(),
+            "resumed claim path broadcasts nothing (no refund)"
+        );
     }
 }

@@ -199,6 +199,8 @@ async fn full_reverse_swap_two_nodes() {
                 &swap,
                 1,
                 Duration::from_secs(1),
+                None,
+                &(),
             )
             .await
         })

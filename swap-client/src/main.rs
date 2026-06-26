@@ -29,6 +29,27 @@ struct Cli {
     /// Amount in satoshis.
     #[arg(long)]
     amount: u64,
+
+    /// LND gRPC endpoint used to pay the hold invoice (reverse-swap execution).
+    #[arg(long, default_value = "https://127.0.0.1:10009")]
+    lnd_address: String,
+    #[arg(long, default_value = "")]
+    lnd_cert: String,
+    #[arg(long, default_value = "")]
+    lnd_macaroon: String,
+
+    /// Electrum server URL for watching/claiming the on-chain HTLC.
+    #[arg(long, default_value = "")]
+    electrum_url: String,
+    /// Address that receives the swept on-chain funds (reverse-swap claim destination).
+    #[arg(long, default_value = "")]
+    claim_address: String,
+    /// Fee rate (sat/vB) for the claim transaction.
+    #[arg(long, default_value_t = 2)]
+    onchain_fee_rate: u64,
+    /// Routing-fee cap (msat) when paying the hold invoice.
+    #[arg(long, default_value_t = 10_000)]
+    max_routing_fee_msat: u64,
 }
 
 fn parse_direction(s: &str) -> anyhow::Result<SwapDirection> {
@@ -68,6 +89,13 @@ async fn main() -> anyhow::Result<()> {
         provider_pkarr: cli.provider,
         direction: parse_direction(&cli.direction)?,
         amount_sat: cli.amount,
+        lnd_address: cli.lnd_address,
+        lnd_cert_path: cli.lnd_cert,
+        lnd_macaroon_path: cli.lnd_macaroon,
+        electrum_url: cli.electrum_url,
+        claim_address: cli.claim_address,
+        onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
+        max_routing_fee_msat: cli.max_routing_fee_msat,
     };
 
     run(config).await

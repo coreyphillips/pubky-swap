@@ -100,6 +100,13 @@ pub struct Quote {
     pub valid_until_unix: u64,
 }
 
+impl Quote {
+    /// Whether the quote has expired at `now_unix`. A `valid_until_unix` of 0 means "no expiry".
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        self.valid_until_unix != 0 && now_unix >= self.valid_until_unix
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapRequest {
     pub quote_id: Uuid,
@@ -188,6 +195,27 @@ mod tests {
         assert!(offer.supports(SwapDirection::Reverse));
         assert!(offer.accepts_amount(10_000));
         assert!(!offer.accepts_amount(9_999));
+    }
+
+    #[test]
+    fn quote_expiry() {
+        let mut q = Quote {
+            quote_id: Uuid::nil(),
+            offer_id: Uuid::nil(),
+            direction: SwapDirection::Reverse,
+            amount_sat: 50_000,
+            fee_sat: 500,
+            total_sat: 50_500,
+            htlc_timeout_blocks: 144,
+            required_confirmations: 1,
+            valid_until_unix: 1_000,
+        };
+        assert!(!q.is_expired(999));
+        assert!(q.is_expired(1_000));
+        assert!(q.is_expired(1_001));
+        // 0 means no expiry.
+        q.valid_until_unix = 0;
+        assert!(!q.is_expired(u64::MAX));
     }
 
     #[test]

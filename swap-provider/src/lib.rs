@@ -9,13 +9,14 @@
 //! negotiation-only and rejects `SwapRequest`s.
 
 pub mod reverse;
+pub mod store;
 pub mod submarine;
 #[cfg(feature = "bdk-wallet")]
 pub mod wallet;
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Network, PublicKey};
+use bitcoin::{Network, OutPoint, PublicKey};
 #[cfg(feature = "lnd")]
 use lightning_backend::LndBackend;
 use lightning_backend::{LightningBackend, LndConfig, StubBackend};
@@ -30,8 +31,11 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::reverse::{drive_reverse_swap, init_reverse_swap, OnchainWallet};
-use crate::submarine::{drive_submarine_swap, init_submarine_swap};
+use crate::reverse::{
+    drive_reverse_swap, init_reverse_swap, OnchainWallet, ProgressSink, ReverseSwap,
+};
+use crate::store::{JsonFileSwapStore, SwapRecord, SwapStore};
+use crate::submarine::{drive_submarine_swap, init_submarine_swap, SubmarineSwap};
 
 /// Provider configuration (typically populated from the CLI).
 #[derive(Debug, Clone)]
@@ -63,6 +67,13 @@ pub struct ProviderConfig {
     pub invoice_expiry_secs: u64,
     /// Routing-fee cap (msat) when paying invoices (submarine swaps).
     pub max_routing_fee_msat: u64,
+    /// Explicitly permit unsafe mainnet parameters (low confirmations / fee floor). Off by
+    /// default so a misconfigured mainnet provider refuses to start.
+    pub allow_unsafe: bool,
+    /// How long an issued quote stays valid, in seconds. After this it is rejected and pruned.
+    pub quote_ttl_secs: u64,
+    /// Directory for persisted in-flight swap state (so a restart can resume them).
+    pub data_dir: String,
 }
 
 impl Default for ProviderConfig {
@@ -88,8 +99,86 @@ impl Default for ProviderConfig {
             onchain_fee_rate_sat_vb: 2,
             invoice_expiry_secs: 3600,
             max_routing_fee_msat: 10_000,
+            allow_unsafe: false,
+            quote_ttl_secs: 300,
+            data_dir: "./pubky-swap-data".to_string(),
         }
     }
+}
+
+/// Current Unix time in seconds (saturating at 0 if the clock is before the epoch).
+fn now_unix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Upper bound on retained quotes, so a flood of `QuoteRequest`s cannot grow the map without
+/// limit even before they expire.
+const MAX_TRACKED_QUOTES: usize = 10_000;
+
+/// Drop expired quotes from the map.
+fn prune_quotes(quotes: &mut HashMap<Uuid, IssuedQuote>, now: u64) {
+    quotes.retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
+}
+
+/// Remove and return a still-valid quote (single-use, so a quote can't be replayed). Also prunes
+/// any other expired quotes while the map is locked.
+async fn take_valid_quote(ctx: &ExecCtx, quote_id: Uuid) -> Result<IssuedQuote> {
+    let now = now_unix();
+    let mut quotes = ctx.quotes.lock().await;
+    prune_quotes(&mut quotes, now);
+    let q = quotes
+        .remove(&quote_id)
+        .ok_or_else(|| anyhow!("unknown or expired quote"))?;
+    if q.expires_at_unix != 0 && now >= q.expires_at_unix {
+        return Err(anyhow!("quote expired"));
+    }
+    Ok(q)
+}
+
+/// Minimum HTLC funding confirmations the provider will accept on mainnet without `allow_unsafe`.
+const MIN_MAINNET_CONFIRMATIONS: u32 = 2;
+/// Minimum on-chain fee floor (sat/vB) the provider will accept on mainnet without `allow_unsafe`.
+/// The dynamic estimator (see `onchain::resolve_fee_rate`) can raise the effective rate above
+/// this; the floor only guards the fallback used when estimation is unavailable.
+const MIN_MAINNET_FEE_FLOOR_SAT_VB: u64 = 5;
+
+/// Reject obviously-unsafe parameters on mainnet unless the operator opts in via `allow_unsafe`.
+/// A no-op on non-mainnet networks.
+fn validate_mainnet_safety(c: &ProviderConfig, network: Network) -> Result<()> {
+    if network != Network::Bitcoin || c.allow_unsafe {
+        return Ok(());
+    }
+    if c.required_confirmations < MIN_MAINNET_CONFIRMATIONS {
+        return Err(anyhow!(
+            "unsafe mainnet config: required_confirmations={} (< {}); raise it or pass --allow-unsafe",
+            c.required_confirmations,
+            MIN_MAINNET_CONFIRMATIONS
+        ));
+    }
+    if c.onchain_fee_rate_sat_vb < MIN_MAINNET_FEE_FLOOR_SAT_VB {
+        return Err(anyhow!(
+            "unsafe mainnet config: onchain_fee_rate_sat_vb={} (< {} sat/vB floor); raise it or pass --allow-unsafe",
+            c.onchain_fee_rate_sat_vb,
+            MIN_MAINNET_FEE_FLOOR_SAT_VB
+        ));
+    }
+    Ok(())
+}
+
+/// Map LND's reported chain network string to a [`Network`]. Returns `None` for networks with no
+/// `bitcoin::Network` equivalent (e.g. `"simnet"`).
+fn lnd_network_to_bitcoin(s: &str) -> Option<Network> {
+    Some(match s {
+        "mainnet" => Network::Bitcoin,
+        "testnet" => Network::Testnet,
+        "signet" => Network::Signet,
+        "regtest" => Network::Regtest,
+        _ => return None,
+    })
 }
 
 pub fn parse_network(s: &str) -> Result<Network> {
@@ -119,6 +208,8 @@ struct IssuedQuote {
     direction: SwapDirection,
     amount_sat: u64,
     fee_sat: u64,
+    /// Unix seconds after which this quote is no longer honoured (0 = never).
+    expires_at_unix: u64,
 }
 
 /// Shared execution context handed to message handlers and spawned driver tasks.
@@ -134,14 +225,40 @@ struct ExecCtx {
     onchain_fee_rate_sat_vb: u64,
     invoice_expiry_secs: u64,
     max_routing_fee_msat: u64,
+    quote_ttl_secs: u64,
     quotes: Arc<Mutex<HashMap<Uuid, IssuedQuote>>>,
+    store: Arc<dyn SwapStore>,
     /// True when the provider can execute swaps (real LN + chain + wallet present).
     capable: bool,
+}
+
+/// A [`ProgressSink`] that records driver progress into the persistent [`SwapStore`], so a
+/// restart can resume the swap.
+struct StoreProgress {
+    store: Arc<dyn SwapStore>,
+    record: std::sync::Mutex<SwapRecord>,
+}
+
+impl ProgressSink for StoreProgress {
+    fn funded(&self, outpoint: OutPoint) {
+        let mut rec = match self.record.lock() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        rec.funding_txid_hex = Some(outpoint.txid.to_string());
+        rec.funding_vout = Some(outpoint.vout);
+        rec.state = SwapState::LockupConfirmed;
+        if let Err(e) = self.store.put(&rec) {
+            warn!("failed to persist funding for swap {}: {e}", rec.swap_id);
+        }
+    }
 }
 
 /// Run the provider daemon.
 pub async fn run(config: ProviderConfig) -> Result<()> {
     let network = parse_network(&config.network)?;
+    // Refuse to start with unsafe mainnet parameters (guards programmatic callers too).
+    validate_mainnet_safety(&config, network)?;
 
     let transport = match config.recovery_method.as_str() {
         "file" => Transport::from_recovery_file(&config.recovery_value, &config.passphrase).await?,
@@ -162,6 +279,22 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
                 "Connected to LND node {} (alias {})",
                 info.pubkey, info.alias
             );
+            // Guard against a network mismatch (e.g. a regtest config pointed at mainnet LND).
+            match info.chain_network.as_deref() {
+                Some(reported) => match lnd_network_to_bitcoin(reported) {
+                    Some(lnd_net) if lnd_net != network => {
+                        return Err(anyhow!(
+                            "network mismatch: provider configured for {network:?} but LND is on \
+                             {lnd_net:?} ({reported}); aborting"
+                        ));
+                    }
+                    Some(_) => {}
+                    None => warn!(
+                        "LND reported unrecognized network '{reported}'; skipping network guard"
+                    ),
+                },
+                None => warn!("LND did not report a chain network; skipping network guard"),
+            }
             true
         }
         Err(e) => {
@@ -186,6 +319,10 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         );
     }
 
+    let store: Arc<dyn SwapStore> = Arc::new(
+        JsonFileSwapStore::new(format!("{}/swaps", config.data_dir)).context("open swap store")?,
+    );
+
     let transport = Arc::new(transport);
     let ctx = ExecCtx {
         transport: transport.clone(),
@@ -198,9 +335,14 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         onchain_fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
         invoice_expiry_secs: config.invoice_expiry_secs,
         max_routing_fee_msat: config.max_routing_fee_msat,
+        quote_ttl_secs: config.quote_ttl_secs,
         quotes: Arc::new(Mutex::new(HashMap::new())),
+        store,
         capable,
     };
+
+    // Resume any swaps that were in flight when we last shut down / crashed.
+    resume_swaps(&ctx);
 
     let offer = build_offer(&config, &provider_pkarr, network);
     info!(
@@ -314,7 +456,9 @@ fn build_offer(config: &ProviderConfig, provider_pkarr: &str, network: Network) 
         required_confirmations: config.required_confirmations,
         htlc_timeout_blocks: config.htlc_timeout_blocks,
         lightning_node_id: None,
-        valid_until_unix: 0,
+        // Advisory: clients should always request a fresh Quote (which carries the firm,
+        // enforced expiry) before committing.
+        valid_until_unix: now_unix().saturating_add(config.quote_ttl_secs),
     }
 }
 
@@ -336,6 +480,8 @@ async fn handle_message(
                 return reject(&ctx.transport, sender, None, None, "amount out of range").await;
             }
             let fee = offer.quote_fee(req.amount_sat);
+            let now = now_unix();
+            let expires_at_unix = now.saturating_add(ctx.quote_ttl_secs);
             let quote = Quote {
                 quote_id: Uuid::new_v4(),
                 offer_id: offer.offer_id,
@@ -345,16 +491,28 @@ async fn handle_message(
                 total_sat: req.amount_sat.saturating_add(fee),
                 htlc_timeout_blocks: offer.htlc_timeout_blocks,
                 required_confirmations: offer.required_confirmations,
-                valid_until_unix: 0,
+                valid_until_unix: expires_at_unix,
             };
-            ctx.quotes.lock().await.insert(
-                quote.quote_id,
-                IssuedQuote {
-                    direction: req.direction,
-                    amount_sat: req.amount_sat,
-                    fee_sat: fee,
-                },
-            );
+            {
+                let mut quotes = ctx.quotes.lock().await;
+                prune_quotes(&mut quotes, now);
+                // Bound memory under a quote flood: drop the request if we're already at capacity.
+                if quotes.len() >= MAX_TRACKED_QUOTES {
+                    warn!(
+                        "quote cache full ({MAX_TRACKED_QUOTES}); dropping request from {sender}"
+                    );
+                    return reject(&ctx.transport, sender, None, None, "provider busy").await;
+                }
+                quotes.insert(
+                    quote.quote_id,
+                    IssuedQuote {
+                        direction: req.direction,
+                        amount_sat: req.amount_sat,
+                        fee_sat: fee,
+                        expires_at_unix,
+                    },
+                );
+            }
             info!("Sending quote {} to {sender}", quote.quote_id);
             ctx.transport
                 .send(sender, &SwapMessage::Quote(quote))
@@ -403,13 +561,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         .chain
         .clone()
         .ok_or_else(|| anyhow!("no chain watcher"))?;
-    let quote = ctx
-        .quotes
-        .lock()
-        .await
-        .get(&req.quote_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("unknown or expired quote"))?;
+    let quote = take_valid_quote(ctx, req.quote_id).await?;
     if quote.direction != SwapDirection::Reverse {
         return Err(anyhow!("quote {} is not for a reverse swap", req.quote_id));
     }
@@ -458,26 +610,68 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         .await?;
     info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
 
+    let record = SwapRecord {
+        swap_id,
+        direction: SwapDirection::Reverse,
+        peer: sender.to_string(),
+        network: NetworkSpec::from_bitcoin_network(ctx.network),
+        payment_hash_hex: hex::encode(swap.payment_hash),
+        onchain_amount_sat: swap.onchain_amount_sat,
+        fee_rate_sat_vb: swap.fee_rate_sat_vb,
+        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+        timeout_height: swap.timeout_height,
+        secret_key_hex: hex::encode(swap.refund_key.secret_bytes()),
+        invoice: swap.invoice.clone(),
+        max_routing_fee_msat: 0,
+        required_confirmations: ctx.required_confirmations,
+        funding_txid_hex: None,
+        funding_vout: None,
+        state: SwapState::Created,
+    };
+    if let Err(e) = ctx.store.put(&record) {
+        warn!("failed to persist reverse swap {swap_id}: {e}");
+    }
+    spawn_reverse_driver(ctx, swap, record);
+    Ok(())
+}
+
+/// Spawn the per-swap reverse driver task (shared by fresh starts and restart-resume), persisting
+/// progress and cleaning up the store + sending a final status on completion.
+fn spawn_reverse_driver(ctx: &ExecCtx, swap: ReverseSwap, record: SwapRecord) {
+    let chain = match ctx.chain.clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let wallet = match ctx.wallet.clone() {
+        Some(w) => w,
+        None => return,
+    };
+    let resume_funding = record.funding_outpoint();
+    let peer = record.peer.clone();
+    let swap_id = record.swap_id;
+    let required_confirmations = record.required_confirmations;
+    let progress = Arc::new(StoreProgress {
+        store: ctx.store.clone(),
+        record: std::sync::Mutex::new(record),
+    });
     let ctx2 = ctx.clone();
-    let sender = sender.to_string();
     tokio::spawn(async move {
-        let ln = ctx2.ln.clone();
-        let wallet = match ctx2.wallet.clone() {
-            Some(w) => w,
-            None => return,
-        };
         let result = drive_reverse_swap(
-            ln.as_ref(),
+            ctx2.ln.as_ref(),
             chain.as_ref(),
             wallet.as_ref(),
             &swap,
-            ctx2.required_confirmations,
+            required_confirmations,
             Duration::from_secs(2),
+            resume_funding,
+            progress.as_ref(),
         )
         .await;
-        send_final_status(&ctx2.transport, &sender, swap_id, result).await;
+        if let Err(e) = ctx2.store.remove(swap_id) {
+            warn!("failed to remove swap {swap_id} from store: {e}");
+        }
+        send_final_status(&ctx2.transport, &peer, swap_id, result).await;
     });
-    Ok(())
 }
 
 /// Start a submarine swap: build the HTLC the client funds, reply with `SwapAccept`, and
@@ -487,13 +681,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         .chain
         .clone()
         .ok_or_else(|| anyhow!("no chain watcher"))?;
-    let quote = ctx
-        .quotes
-        .lock()
-        .await
-        .get(&req.quote_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("unknown or expired quote"))?;
+    let quote = take_valid_quote(ctx, req.quote_id).await?;
     if quote.direction != SwapDirection::Submarine {
         return Err(anyhow!(
             "quote {} is not for a submarine swap",
@@ -550,26 +738,132 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         swap.onchain_amount_sat
     );
 
+    let record = SwapRecord {
+        swap_id,
+        direction: SwapDirection::Submarine,
+        peer: sender.to_string(),
+        network: NetworkSpec::from_bitcoin_network(ctx.network),
+        payment_hash_hex: hex::encode(swap.payment_hash),
+        onchain_amount_sat: swap.onchain_amount_sat,
+        fee_rate_sat_vb: swap.fee_rate_sat_vb,
+        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+        timeout_height: swap.timeout_height,
+        secret_key_hex: hex::encode(swap.claim_key.secret_bytes()),
+        invoice: swap.invoice.clone(),
+        max_routing_fee_msat: swap.max_routing_fee_msat,
+        required_confirmations: ctx.required_confirmations,
+        funding_txid_hex: None,
+        funding_vout: None,
+        state: SwapState::Created,
+    };
+    if let Err(e) = ctx.store.put(&record) {
+        warn!("failed to persist submarine swap {swap_id}: {e}");
+    }
+    spawn_submarine_driver(ctx, swap, record);
+    Ok(())
+}
+
+/// Spawn the per-swap submarine driver task (shared by fresh starts and restart-resume).
+fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord) {
+    let chain = match ctx.chain.clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let wallet = match ctx.wallet.clone() {
+        Some(w) => w,
+        None => return,
+    };
+    let resume_funding = record.funding_outpoint();
+    let peer = record.peer.clone();
+    let swap_id = record.swap_id;
+    let required_confirmations = record.required_confirmations;
+    let progress = Arc::new(StoreProgress {
+        store: ctx.store.clone(),
+        record: std::sync::Mutex::new(record),
+    });
     let ctx2 = ctx.clone();
-    let sender = sender.to_string();
     tokio::spawn(async move {
-        let ln = ctx2.ln.clone();
-        let wallet = match ctx2.wallet.clone() {
-            Some(w) => w,
-            None => return,
-        };
         let result = drive_submarine_swap(
-            ln.as_ref(),
+            ctx2.ln.as_ref(),
             chain.as_ref(),
             wallet.as_ref(),
             &swap,
-            ctx2.required_confirmations,
+            required_confirmations,
             Duration::from_secs(2),
+            resume_funding,
+            progress.as_ref(),
         )
         .await;
-        send_final_status(&ctx2.transport, &sender, swap_id, result).await;
+        if let Err(e) = ctx2.store.remove(swap_id) {
+            warn!("failed to remove swap {swap_id} from store: {e}");
+        }
+        send_final_status(&ctx2.transport, &peer, swap_id, result).await;
     });
-    Ok(())
+}
+
+/// Reconstruct a [`ReverseSwap`] from a persisted record (resume path).
+fn reverse_swap_from_record(rec: &SwapRecord) -> Result<ReverseSwap> {
+    Ok(ReverseSwap {
+        payment_hash: rec.payment_hash()?,
+        onchain_amount_sat: rec.onchain_amount_sat,
+        fee_rate_sat_vb: rec.fee_rate_sat_vb,
+        htlc_script: rec.htlc_script()?,
+        htlc_spk: rec.htlc_spk()?,
+        timeout_height: rec.timeout_height,
+        refund_key: rec.secret_key()?,
+        invoice: rec.invoice.clone(),
+    })
+}
+
+/// Reconstruct a [`SubmarineSwap`] from a persisted record (resume path).
+fn submarine_swap_from_record(rec: &SwapRecord) -> Result<SubmarineSwap> {
+    Ok(SubmarineSwap {
+        payment_hash: rec.payment_hash()?,
+        onchain_amount_sat: rec.onchain_amount_sat,
+        fee_rate_sat_vb: rec.fee_rate_sat_vb,
+        htlc_script: rec.htlc_script()?,
+        htlc_spk: rec.htlc_spk()?,
+        timeout_height: rec.timeout_height,
+        claim_key: rec.secret_key()?,
+        invoice: rec.invoice.clone(),
+        max_routing_fee_msat: rec.max_routing_fee_msat,
+    })
+}
+
+/// On startup, re-spawn drivers for any swaps that were in flight at the last shutdown/crash.
+fn resume_swaps(ctx: &ExecCtx) {
+    let records = match ctx.store.load_active() {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("failed to load persisted swaps: {e}");
+            return;
+        }
+    };
+    if records.is_empty() {
+        return;
+    }
+    if !ctx.capable {
+        warn!(
+            "{} persisted swap(s) found, but the provider is negotiation-only and cannot resume \
+             them; configure --features full with an Electrum URL + funding wallet",
+            records.len()
+        );
+        return;
+    }
+    info!("Resuming {} persisted swap(s)", records.len());
+    for rec in records {
+        let swap_id = rec.swap_id;
+        match rec.direction {
+            SwapDirection::Reverse => match reverse_swap_from_record(&rec) {
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec),
+                Err(e) => warn!("cannot resume reverse swap {swap_id}: {e}"),
+            },
+            SwapDirection::Submarine => match submarine_swap_from_record(&rec) {
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec),
+                Err(e) => warn!("cannot resume submarine swap {swap_id}: {e}"),
+            },
+        }
+    }
 }
 
 async fn send_final_status(
@@ -637,5 +931,45 @@ fn variant_name(msg: &SwapMessage) -> &'static str {
         SwapMessage::SwapStatusUpdate(_) => "SwapStatusUpdate",
         SwapMessage::CoopSignature(_) => "CoopSignature",
         SwapMessage::Reject(_) => "Reject",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(confs: u32, fee_floor: u64, allow_unsafe: bool) -> ProviderConfig {
+        ProviderConfig {
+            required_confirmations: confs,
+            onchain_fee_rate_sat_vb: fee_floor,
+            allow_unsafe,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mainnet_safety_allows_safe_and_non_mainnet() {
+        // Regtest defaults (1 conf, 2 sat/vB) are fine off-mainnet.
+        assert!(validate_mainnet_safety(&cfg(1, 2, false), Network::Regtest).is_ok());
+        // Safe mainnet values pass.
+        assert!(validate_mainnet_safety(&cfg(2, 5, false), Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn mainnet_safety_rejects_unsafe_unless_overridden() {
+        // Too few confirmations on mainnet.
+        assert!(validate_mainnet_safety(&cfg(1, 10, false), Network::Bitcoin).is_err());
+        // Fee floor too low on mainnet.
+        assert!(validate_mainnet_safety(&cfg(3, 2, false), Network::Bitcoin).is_err());
+        // The override permits both.
+        assert!(validate_mainnet_safety(&cfg(1, 2, true), Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn lnd_network_mapping() {
+        assert_eq!(lnd_network_to_bitcoin("mainnet"), Some(Network::Bitcoin));
+        assert_eq!(lnd_network_to_bitcoin("regtest"), Some(Network::Regtest));
+        assert_eq!(lnd_network_to_bitcoin("signet"), Some(Network::Signet));
+        assert_eq!(lnd_network_to_bitcoin("simnet"), None);
     }
 }

@@ -5,3 +5,7 @@ Cargo.lock
 *.pkarr
 .idea
 .vscode
+
+# Persisted in-flight swap state (provider --data-dir)
+/pubky-swap-data/
+/provider-data/

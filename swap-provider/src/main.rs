@@ -63,6 +63,19 @@ struct Cli {
     /// Routing-fee cap (msat) when paying invoices.
     #[arg(long, default_value_t = 10_000)]
     max_routing_fee_msat: u64,
+
+    /// Permit unsafe mainnet parameters (low confirmations / fee floor). Required to run on
+    /// mainnet with regtest-grade settings; intended for testing only.
+    #[arg(long)]
+    allow_unsafe: bool,
+
+    /// How long an issued quote stays valid, in seconds.
+    #[arg(long, default_value_t = 300)]
+    quote_ttl: u64,
+
+    /// Directory for persisted in-flight swap state (so a restart can resume swaps).
+    #[arg(long, default_value = "./pubky-swap-data")]
+    data_dir: String,
 }
 
 #[tokio::main]
@@ -107,6 +120,9 @@ async fn main() -> anyhow::Result<()> {
         onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
         invoice_expiry_secs: cli.invoice_expiry,
         max_routing_fee_msat: cli.max_routing_fee_msat,
+        allow_unsafe: cli.allow_unsafe,
+        quote_ttl_secs: cli.quote_ttl,
+        data_dir: cli.data_dir,
     };
 
     run(config).await

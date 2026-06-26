@@ -66,6 +66,8 @@ impl LightningBackend for LndBackend {
             pubkey: resp.identity_pubkey,
             alias: resp.alias,
             synced_to_chain: resp.synced_to_chain,
+            // LND reports each active chain's network ("mainnet"/"testnet"/"regtest"/...).
+            chain_network: resp.chains.first().map(|c| c.network.clone()),
         })
     }
 

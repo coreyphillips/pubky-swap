@@ -34,6 +34,15 @@ pub trait ChainWatcher: Send + Sync {
 
     /// Broadcast a transaction, returning its txid.
     fn broadcast(&self, tx: &Transaction) -> Result<Txid>;
+
+    /// Estimate the fee rate (sat/vB) to confirm within `target_blocks`. `Ok(None)` means the
+    /// backend has no estimate (e.g. on regtest, where `estimatefee` returns the `-1` sentinel),
+    /// in which case callers fall back to their configured fee floor. The default returns
+    /// `Ok(None)` so watchers (and test mocks) without estimation need no change.
+    fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
+        let _ = target_blocks;
+        Ok(None)
+    }
 }
 
 #[cfg(feature = "electrum")]

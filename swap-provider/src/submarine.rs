@@ -14,15 +14,17 @@
 //! The provider only pays the invoice *after* the on-chain HTLC has confirmed, so a failed
 //! Lightning payment costs it nothing on-chain.
 
-use crate::reverse::OnchainWallet;
+use crate::reverse::{OnchainWallet, ProgressSink};
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
-use bitcoin::{Network, PublicKey, ScriptBuf};
+use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf};
 use lightning_backend::LightningBackend;
 use std::time::Duration;
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, PaymentHash};
-use swap_common::onchain::{build_claim_tx, estimate_spend_fee};
+use swap_common::onchain::{
+    build_claim_tx, estimate_spend_fee, extract_preimage, resolve_fee_rate, CLAIM_FEE_TARGET_BLOCKS,
+};
 use swap_common::SwapState;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -94,6 +96,7 @@ pub async fn init_submarine_swap(
 ///
 /// NOTE: [`ChainWatcher`] calls are blocking; a production caller should run this on a
 /// blocking-friendly task. `poll` is injected for testability.
+#[allow(clippy::too_many_arguments)]
 pub async fn drive_submarine_swap(
     ln: &dyn LightningBackend,
     chain: &dyn ChainWatcher,
@@ -101,18 +104,36 @@ pub async fn drive_submarine_swap(
     swap: &SubmarineSwap,
     required_confirmations: u32,
     poll: Duration,
+    // If resuming after a restart and the HTLC funding was already observed, its outpoint.
+    // `None` on a fresh start.
+    resume_funding: Option<OutPoint>,
+    progress: &dyn ProgressSink,
 ) -> Result<SwapState> {
-    // 1. Wait for the client to fund the HTLC on-chain (give up at timeout — no risk yet).
-    let funding = loop {
-        if let Some(utxo) = chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
-            if utxo.confirmations >= required_confirmations {
-                break utxo;
+    // 1. Establish the funding outpoint. On a fresh start, wait for the client to fund the HTLC
+    //    (give up at timeout — nothing at risk yet). On resume, adopt the known outpoint, and if
+    //    we already claimed before the crash, finish immediately.
+    let funding_outpoint = match resume_funding {
+        Some(op) => {
+            if let Some(spend) = chain.find_spend(&swap.htlc_spk, &op)? {
+                if extract_preimage(&spend, &op, &swap.payment_hash).is_some() {
+                    info!("Submarine swap: already claimed before restart");
+                    return Ok(SwapState::Claimed);
+                }
             }
+            op
         }
-        if chain.tip_height()? >= swap.timeout_height {
-            return Ok(SwapState::Expired);
-        }
-        sleep(poll).await;
+        None => loop {
+            if let Some(utxo) = chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
+                if utxo.confirmations >= required_confirmations {
+                    progress.funded(utxo.outpoint);
+                    break utxo.outpoint;
+                }
+            }
+            if chain.tip_height()? >= swap.timeout_height {
+                return Ok(SwapState::Expired);
+            }
+            sleep(poll).await;
+        },
     };
     info!("Submarine swap: HTLC funding confirmed; paying the Lightning invoice");
 
@@ -136,10 +157,14 @@ pub async fn drive_submarine_swap(
         ));
     }
 
-    // 3. Claim the on-chain HTLC with the preimage.
-    let fee = estimate_spend_fee(swap.fee_rate_sat_vb, true);
+    // 3. Claim the on-chain HTLC with the preimage. Prefer a live fee estimate (the claim
+    //    races the client's refund timeout); never go below the configured floor.
+    let est = chain
+        .estimate_fee_rate(CLAIM_FEE_TARGET_BLOCKS)
+        .unwrap_or(None);
+    let fee = estimate_spend_fee(resolve_fee_rate(est, swap.fee_rate_sat_vb), true);
     let claim_tx = build_claim_tx(
-        funding.outpoint,
+        funding_outpoint,
         swap.onchain_amount_sat,
         &swap.htlc_script,
         wallet.receive_destination(),
@@ -186,6 +211,7 @@ mod tests {
                 pubkey: "mock".into(),
                 alias: "mock".into(),
                 synced_to_chain: true,
+                chain_network: None,
             })
         }
         async fn create_hold_invoice(
@@ -324,9 +350,18 @@ mod tests {
         };
         let wallet = MockWallet { spk: dest() };
 
-        let state = drive_submarine_swap(&ln, &chain, &wallet, &swap, 2, Duration::from_millis(0))
-            .await
-            .unwrap();
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(state, SwapState::Claimed);
         let broadcasts = chain.broadcasts.lock().unwrap();
@@ -359,9 +394,18 @@ mod tests {
         };
         let wallet = MockWallet { spk: dest() };
 
-        let state = drive_submarine_swap(&ln, &chain, &wallet, &swap, 2, Duration::from_millis(0))
-            .await
-            .unwrap();
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert!(matches!(state, SwapState::Failed(_)));
         assert!(
@@ -387,9 +431,18 @@ mod tests {
         };
         let wallet = MockWallet { spk: dest() };
 
-        let state = drive_submarine_swap(&ln, &chain, &wallet, &swap, 2, Duration::from_millis(0))
-            .await
-            .unwrap();
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(state, SwapState::Expired);
         assert!(chain.broadcasts.lock().unwrap().is_empty());

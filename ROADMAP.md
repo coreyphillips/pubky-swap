@@ -43,8 +43,11 @@ preimage extraction (needs a second node paying the invoice — see Phase 4 rema
   on-chain claim; and confirms a **refund is rejected before the timeout and accepted
   after** (real CLTV enforcement). Both pass.
 
-**Remaining for this phase:** real fee estimation + RBF/CPFP bumping under congestion;
-reorg handling.
+**Done:** dynamic fee estimation — claim/refund/funding transactions use a live Electrum
+`estimatefee` result clamped to a configured floor (the floor is both the minimum and the
+fallback when estimation is unavailable, e.g. on regtest).
+
+**Remaining for this phase:** RBF/CPFP fee-bumping under congestion; reorg handling.
 
 ### 🟡 Phase 4 — Reverse swaps (engine done; live wiring pending)
 `swap-provider::reverse` orchestrates the provider side end-to-end: `init_reverse_swap`
@@ -76,10 +79,15 @@ and hung — the driver now watches directly for the claim/timeout.)
   (in-flight), watches the HTLC, claims with the preimage, awaits settlement. Mock-tested +
   exercised in the full live swap.
 
+**Done since:** the reverse swap is now runnable **end-to-end from the `swap-client` CLI**
+(`--features full`): it verifies the provider's HTLC script pays its own claim key, pays the hold
+invoice via its own LND, watches the HTLC, and claims it. The provider also **persists in-flight
+swaps** (`--data-dir`) and **resumes** them on restart (idempotently — it never re-funds an
+already-funded HTLC), and enforces **network-mismatch** and **mainnet-safety** guards plus
+**single-use, expiring quotes**.
+
 **Remaining for this phase:**
 - Run the drivers' blocking chain calls via `spawn_blocking` (inline today; fine on regtest).
-- A full live **submarine** swap (engine is built + mock-tested; the on-chain + LND legs are
-  individually live-validated).
 
 ### 🟡 Phase 5 — Submarine swaps (engine done; live wiring pending)
 `swap-provider::submarine` orchestrates the provider side: `init_submarine_swap` (decode the
@@ -104,6 +112,20 @@ bitcoind/electrs apps; operator docs.
 ### Phase 8 — Hardening & extensions
 Taproot swaps (cooperative MuSig2 key-path + script-path fallback), Core Lightning backend,
 optional Liquid chain swaps.
+
+## Remaining for mainnet
+
+The swap engine works on regtest, but these are required before any signet/mainnet exposure:
+
+- **Fee-bumping (RBF/CPFP)** so a claim/refund still confirms under mempool congestion before its
+  timeout — today fees are estimated and floored but not bumped after broadcast.
+- **Reorg handling** — re-validate funding/spend depth across chain reorganizations.
+- **Submarine client execution** (the client funding wallet + refund path) and a live submarine
+  integration test; the provider side is built and mock-tested.
+- **`spawn_blocking`** for the drivers' blocking chain calls under load.
+- **Marketplace hardening** (Phase 6): offer publishing/discovery on the Pubky profile, abuse/ban
+  handling, requiring on-chain confirmation before a provider commits.
+- A **third-party security review** of the atomic-swap paths.
 
 ## Safety notes
 - Atomic-swap bugs lose real funds. Timelock math, fee-bumping under congestion, and reorg

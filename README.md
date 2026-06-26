@@ -1,139 +1,155 @@
 # pubky-swap
 
-A **self-hosted, decentralized Lightning swap marketplace** — a Boltz alternative where
-*any* node operator can advertise swaps with their own rates and facilitate them using
-their own LND (later Core Lightning) node. Discovery and negotiation ride on the
-[Pubky](https://pubky.org) network (the same encrypted-DM + follow-graph transport used by
-`bitcoin-batch-coordinator`), so there is no central swap server.
+A **self-hosted, decentralized Lightning swap marketplace.** Any node operator can advertise
+swaps at their own rates and facilitate them with their own LND node; clients discover providers
+and negotiate over the [Pubky](https://pubky.org) network (an encrypted-DM + follow-graph
+transport), so there is **no central swap server**.
 
-> ⚠️ **Status: early scaffold.** The negotiation protocol and HTLC scripting exist and are
-> tested; the actual fund-moving execution (hold invoices, on-chain lockup/claim/refund,
-> chain watching) is **not implemented yet** — see `ROADMAP.md`. Do **not** use with real
-> funds. Develop and test on **regtest** only.
+Swaps are made atomic by a single 32-byte preimage whose SHA256 is the shared Lightning payment
+hash — the on-chain HTLC can only be claimed by revealing the preimage that settles the Lightning
+leg, and vice-versa.
+
+> ⚠️ **Regtest only — do not use with real funds.** The swap engine (HTLC scripting, timelocks,
+> claim/refund, hold invoices, chain watching, crash-resume) is implemented and tested on regtest,
+> but mainnet hardening is incomplete (RBF/CPFP fee-bumping and reorg handling are still on the
+> roadmap). Atomic-swap bugs lose money. See [`ROADMAP.md`](ROADMAP.md).
 
 ## Swap types
 
-- **Submarine** (on-chain → Lightning): client locks on-chain BTC in an HTLC; provider pays
-  the client's Lightning invoice and claims the HTLC with the preimage.
-- **Reverse** (Lightning → on-chain): client pays a Lightning hold invoice; provider locks
-  on-chain BTC in an HTLC; client claims it with the preimage, letting the provider settle
-  the hold invoice.
+- **Reverse** (Lightning → on-chain): the client pays a Lightning hold invoice; the provider locks
+  on-chain BTC in an HTLC; the client claims it with the preimage, which lets the provider settle
+  the hold invoice. **Runnable end-to-end from the CLI.**
+- **Submarine** (on-chain → Lightning): the client locks on-chain BTC in an HTLC; the provider pays
+  the client's Lightning invoice and claims the HTLC with the preimage. The provider side is
+  implemented and tested; client-side execution is still on the roadmap.
 
-Both are made atomic by a single 32-byte preimage whose SHA256 is the shared Lightning
-payment hash.
+## Quickstart
+
+### 1. Prerequisites
+
+- **Rust** (stable) — <https://rustup.rs>
+- **protoc** (only for the `lnd` feature, which compiles LND's protobufs) —
+  `brew install protobuf` (macOS) / `apt install protobuf-compiler` (Debian/Ubuntu)
+
+Run `./scripts/check-prereqs.sh` to verify your toolchain and build + unit-test the workspace.
+
+### 2. Build & test
+
+```bash
+cargo build --all
+cargo test --all        # unit tests only; the regtest integration tests are #[ignore]d
+```
+
+The default build needs no external services and pulls in no LND/Electrum toolchain.
+
+### 3. Try the negotiation (no Bitcoin/LN node needed)
+
+Each side needs a Pubky identity (a recovery phrase or a `.pkarr` file).
+
+```bash
+# Provider — prints its pubky on startup
+cargo run -p swap-provider -- --recovery-phrase "<provider phrase>" \
+  --network regtest --directions submarine,reverse --min-amount 10000 --max-amount 1000000
+
+# Client (reverse swap of 50k sat) — use the provider pubky it logged
+cargo run -p swap-client -- <PROVIDER_PUBKY> --recovery-phrase "<client phrase>" \
+  --network regtest --direction reverse --amount 50000
+```
+
+The client requests a quote, receives the provider's HTLC details, and **verifies the HTLC script
+pays its own claim key** before going further. Without execution credentials (below), it stops
+there.
+
+### 4. Run a full reverse swap on regtest
+
+This needs a regtest backplane — bitcoind + electrs + **two** LND nodes with a channel between
+them (e.g. via [Polar](https://lightningpolar.com)). Build with `--features full`.
+
+**Provider** (LND + Electrum + a funded BIP84 wallet):
+
+```bash
+cargo run -p swap-provider --features full -- --recovery-phrase "<provider phrase>" \
+  --network regtest \
+  --lnd-address https://127.0.0.1:10009 --lnd-cert ~/.lnd/tls.cert \
+  --lnd-macaroon ~/.lnd/.../admin.macaroon \
+  --electrum-url tcp://127.0.0.1:60001 \
+  --wallet-mnemonic "<bip39 mnemonic for the funding wallet>" \
+  --data-dir ./provider-data
+```
+
+**Client** (its own LND to pay the hold invoice, Electrum to watch/claim, and a claim address):
+
+```bash
+cargo run -p swap-client --features full -- <PROVIDER_PUBKY> --recovery-phrase "<client phrase>" \
+  --network regtest --direction reverse --amount 50000 \
+  --lnd-address https://127.0.0.1:10011 --lnd-cert ~/.lnd-2/tls.cert \
+  --lnd-macaroon ~/.lnd-2/.../admin.macaroon \
+  --electrum-url tcp://127.0.0.1:60001 \
+  --claim-address bcrt1q...your_regtest_address
+```
+
+The client pays the hold invoice, waits for the provider's on-chain HTLC to confirm, claims it with
+the preimage, and the provider recovers the preimage to settle the invoice — atomically linking the
+two legs.
 
 ## Workspace layout
 
 | Crate | Role |
 |-------|------|
 | `pubky-transport` | Generic encrypted-DM + follow-graph transport (message-type agnostic). |
-| `swap-common` | Wire messages, swap state machine, P2WSH HTLC scripts + preimage helpers. |
+| `swap-common` | Wire messages, swap state machine, P2WSH HTLC scripts + preimage helpers, on-chain claim/refund signing, `ChainWatcher` (+ Electrum impl). |
 | `lightning` (`lightning-backend`) | `LightningBackend` trait, a no-op `StubBackend`, and a real LND gRPC backend behind the `lnd` feature. |
-| `swap-provider` | Operator daemon: advertises offers, negotiates and runs swaps. |
-| `swap-client` | Client CLI: discover providers, request quotes, drive a swap. |
+| `swap-provider` | Operator daemon: advertises offers, negotiates, and drives swaps; persists in-flight swaps and resumes them on restart. |
+| `swap-client` | Client CLI: discovers providers, requests quotes, verifies the HTLC, and executes a reverse swap. |
 
-## Build
+## Feature flags
 
-```bash
-cargo build --all
-cargo test --all
-```
+| Feature | Crate(s) | Enables |
+|---------|----------|---------|
+| `lnd` | `lightning-backend`, `swap-provider`, `swap-client` | Real LND gRPC backend (needs `protoc`). |
+| `electrum` | `swap-common` | `ElectrumWatcher` chain access (find funding, broadcast, fee estimation). |
+| `bdk-wallet` | `swap-provider` | BIP84 funding wallet over Electrum. |
+| `chain` | `swap-provider`, `swap-client` | The Electrum chain watcher. |
+| `full` | `swap-provider`, `swap-client` | Everything needed to execute swaps end-to-end. |
 
-### Enabling the LND backend
+Without the execution features a provider runs **negotiation-only** and rejects `SwapRequest`s.
 
-The real LND gRPC backend is gated behind the `lnd` cargo feature so the default build
-needs no extra toolchain. Enabling it requires **`protoc`** installed (it compiles LND's
-protobuf definitions):
+## Configuration & safety
 
-```bash
-# macOS: brew install protobuf   |   Debian/Ubuntu: apt install protobuf-compiler
-cargo build -p swap-provider --features lnd
-```
+- **Dynamic fees.** Claim/refund/funding transactions use a live Electrum fee estimate, clamped to
+  a configured floor (`--onchain-fee-rate`, sat/vB) that is both the minimum and the fallback when
+  estimation is unavailable (e.g. on regtest).
+- **Network guard.** The provider aborts on startup if its `--network` disagrees with the network
+  its LND node reports.
+- **Mainnet safety floor.** On `--network bitcoin` the provider refuses to start with unsafe
+  parameters (`required_confirmations < 2`, or a fee floor `< 5` sat/vB) unless you pass
+  `--allow-unsafe`.
+- **Quotes expire.** Issued quotes are valid for `--quote-ttl` seconds (default 300), are
+  single-use, and are pruned from memory.
+- **Crash recovery.** In-flight swaps are persisted under `--data-dir` (default `./pubky-swap-data`)
+  and resumed on restart, so a provider crash doesn't strand HTLC funds.
 
-Then point the provider at your node's gRPC URL, TLS cert, and a macaroon with invoice +
-router permissions:
+## Integration tests (regtest)
 
-```bash
-cargo run -p swap-provider --features lnd -- --recovery-phrase "<phrase>" \
-  --network regtest \
-  --lnd-address https://127.0.0.1:10009 \
-  --lnd-cert ~/.lnd/tls.cert \
-  --lnd-macaroon ~/.lnd/data/chain/bitcoin/regtest/admin.macaroon
-```
-
-Without `--features lnd` (or if the connection fails) the provider runs with a stub backend
-whose Lightning operations return `NotImplemented` — fine for exercising the negotiation
-flow, not for real swaps.
-
-### On-chain regtest integration test
-
-The HTLC engine + Electrum watcher are validated against a real bitcoind + electrs (the test
-mines/funds via `docker exec ... bitcoin-cli` and observes via electrs). It is `#[ignore]`d
-and requires the `electrum` feature:
+All are `#[ignore]`d and need real services. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup.
 
 ```bash
+# HTLC engine + Electrum watcher against bitcoind + electrs
 cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
-```
 
-Env overrides: `REGTEST_ELECTRUM_URL` (default `tcp://127.0.0.1:60001`), `REGTEST_BTC_CONTAINER`
-(default `bitcoin`); it assumes Polar bitcoind RPC defaults (port 43782, `polaruser`/`polarpass`).
+# BDK funding wallet against bitcoind + electrs
+cargo test -p swap-provider --features full --test wallet_regtest -- --ignored --nocapture
 
-There is also a BDK wallet regtest test (`swap-provider --features bdk-wallet --test
-wallet_regtest`) and a live LND smoke test:
-
-```bash
+# Live LND smoke test (hold invoice lifecycle)
 LND_GRPC_URL=https://127.0.0.1:10011 LND_CERT=/path/tls.cert LND_MACAROON=/path/admin.macaroon \
   cargo test -p lightning-backend --features lnd --test lnd_smoke -- --ignored --nocapture
-```
 
-### Executing real swaps
-
-A fully-configured provider executes swaps (not just negotiation):
-
-```bash
-cargo run -p swap-provider --features full -- --recovery-phrase "<phrase>" --network regtest \
-  --lnd-address https://127.0.0.1:10009 --lnd-cert ~/.lnd/tls.cert \
-  --lnd-macaroon ~/.lnd/.../admin.macaroon \
-  --electrum-url tcp://127.0.0.1:60001 \
-  --wallet-mnemonic "<bip39 mnemonic for the funding wallet>"
-```
-
-With LND + Electrum + a funded BDK wallet present, a `SwapRequest` triggers HTLC/hold-invoice
-creation, a `SwapAccept`, and a spawned task that drives the swap to completion. Without them
-the provider stays negotiation-only and rejects `SwapRequest`s.
-
-### End-to-end reverse swap (two LND nodes)
-
-`swap-provider/tests/full_swap_regtest.rs` runs a complete reverse swap across two real LND
-nodes (a provider node + a client node with a channel to it), bitcoind, and electrs. Provide
-both nodes' endpoints/creds + an electrum URL and run:
-
-```bash
+# Full reverse swap across two LND nodes
 LND_A_URL=https://127.0.0.1:10011 LND_A_CERT=.../A/tls.cert LND_A_MAC=.../A/admin.macaroon \
 LND_B_URL=https://127.0.0.1:10012 LND_B_CERT=.../B/tls.cert LND_B_MAC=.../B/admin.macaroon \
 REGTEST_ELECTRUM_URL=tcp://127.0.0.1:60001 \
   cargo test -p swap-provider --features full --test full_swap_regtest -- --ignored --nocapture
 ```
-
-It pays the hold invoice, funds + claims the HTLC, and asserts the provider reaches `Claimed`
-and the invoice is `Settled` — proving the Lightning and on-chain legs are atomically linked.
-
-## Try the negotiation (regtest)
-
-Each side needs a Pubky identity (recovery phrase or `.pkarr` file).
-
-```bash
-# Provider
-cargo run -p swap-provider -- --recovery-phrase "<provider pubky phrase>" \
-  --network regtest --directions submarine,reverse --min-amount 10000 --max-amount 1000000
-
-# Client (reverse swap of 50k sat) — use the provider pubky it logs on startup
-cargo run -p swap-client -- <PROVIDER_PUBKY> --recovery-phrase "<client pubky phrase>" \
-  --network regtest --direction reverse --amount 50000
-```
-
-The client will receive a quote and the provider's HTLC details. Execution beyond that is
-the next set of milestones.
 
 ## License
 
