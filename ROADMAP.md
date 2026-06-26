@@ -127,11 +127,14 @@ optional Liquid chain swaps.
 
 ## Remaining for mainnet
 
-The swap engine works on regtest, but these remain before any signet/mainnet exposure:
+All five integration tests have been **run live** against real bitcoind + electrs + two LND nodes
+and pass: the HTLC engine (`regtest`), reorg detection (`reorg_regtest`), the BDK funding wallet
+(`wallet_regtest`), and **both end-to-end swaps** (`full_swap_regtest` reverse and
+`submarine_swap_regtest`). These remain before any signet/mainnet exposure:
 
-- Automating the **two-node LND swap tests** in CI (they need a funded Lightning channel; the
-  bitcoind + electrs tests — HTLC engine, reorg detection, BDK wallet — already run via
-  `.github/workflows/regtest.yml` against the `docker-compose.regtest.yml` backplane).
+- Automating the **two-node LND swap tests** in CI (they pass manually but need a funded Lightning
+  channel, which the `docker-compose.regtest.yml` backplane doesn't yet set up; the bitcoind +
+  electrs tests already run via `.github/workflows/regtest.yml`).
 - **Signet soak testing** before any mainnet exposure.
 - A **third-party security review** of the atomic-swap paths.
 - **Marketplace hardening** (Phase 6): offer publishing/discovery on the Pubky profile, abuse/ban
