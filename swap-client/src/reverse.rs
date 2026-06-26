@@ -16,6 +16,7 @@ use swap_common::chain::ChainWatcher;
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::Preimage;
 use swap_common::onchain::{build_claim_tx, estimate_spend_fee, CLAIM_FEE_TARGET_BLOCKS};
+use swap_common::reorg::FINALITY_DEPTH;
 use tokio::time::sleep;
 use tracing::info;
 
@@ -100,6 +101,7 @@ pub async fn execute_reverse_swap(
         claim.fee_rate_sat_vb,
         poll,
         MAX_FEE_BUMPS,
+        FINALITY_DEPTH,
         build,
     )
     .await

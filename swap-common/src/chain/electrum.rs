@@ -2,7 +2,7 @@
 
 use super::{ChainWatcher, FundingUtxo};
 use crate::error::{Result, SwapError};
-use bitcoin::{OutPoint, Script, Transaction, Txid};
+use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
 use electrum_client::{Client, ElectrumApi};
 
 pub struct ElectrumWatcher {
@@ -84,6 +84,18 @@ impl ChainWatcher for ElectrumWatcher {
             .estimate_fee(target_blocks as usize)
             .map_err(|e| SwapError::Other(format!("electrum estimatefee: {e}")))?;
         Ok(crate::onchain::btc_per_kvb_to_sat_per_vb(btc_per_kvb))
+    }
+
+    fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
+        let tip = self.tip_height()?;
+        if height > tip {
+            return Ok(None);
+        }
+        let header = self
+            .client
+            .block_header(height as usize)
+            .map_err(|e| SwapError::Other(format!("electrum block_header: {e}")))?;
+        Ok(Some(header.block_hash()))
     }
 
     fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {

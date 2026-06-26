@@ -343,6 +343,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
 
     // Resume any swaps that were in flight when we last shut down / crashed.
     resume_swaps(&ctx);
+    // Watch for chain reorganizations affecting in-flight swaps.
+    spawn_reorg_monitor(&ctx);
 
     let offer = build_offer(&config, &provider_pkarr, network);
     info!(
@@ -828,6 +830,51 @@ fn submarine_swap_from_record(rec: &SwapRecord) -> Result<SubmarineSwap> {
         invoice: rec.invoice.clone(),
         max_routing_fee_msat: rec.max_routing_fee_msat,
     })
+}
+
+/// Spawn a background task that watches for chain reorganizations and re-validates the funding of
+/// in-flight swaps. The per-swap drivers already self-heal (the submarine driver re-confirms the
+/// funding depth before paying; `confirm_or_bump` re-broadcasts a reorged-out claim/refund and
+/// only treats a spend as final once it is buried), so this primarily surfaces reorgs to the
+/// operator and flags any funding that may have been orphaned.
+fn spawn_reorg_monitor(ctx: &ExecCtx) {
+    let chain = match ctx.chain.clone() {
+        Some(c) => c,
+        None => return,
+    };
+    let store = ctx.store.clone();
+    tokio::spawn(async move {
+        let mut monitor = swap_common::reorg::ReorgMonitor::new(100);
+        loop {
+            match monitor.observe(chain.as_ref()) {
+                Ok(Some(fork)) => {
+                    warn!("chain reorg detected at height {fork}; re-validating in-flight swaps");
+                    if let Ok(records) = store.load_active() {
+                        for rec in records {
+                            let (Some(op), Ok(spk)) = (rec.funding_outpoint(), rec.htlc_spk())
+                            else {
+                                continue;
+                            };
+                            let still_funded = matches!(
+                                chain.find_funding(&spk, rec.onchain_amount_sat),
+                                Ok(Some(ref u)) if u.outpoint == op
+                            );
+                            if !still_funded {
+                                warn!(
+                                    "swap {}: recorded funding {op} not found at required depth \
+                                     after the reorg; its driver will re-validate before acting",
+                                    rec.swap_id
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => debug!("reorg monitor: {e}"),
+            }
+            sleep(Duration::from_secs(30)).await;
+        }
+    });
 }
 
 /// On startup, re-spawn drivers for any swaps that were in flight at the last shutdown/crash.

@@ -26,6 +26,7 @@ use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, Pay
 use swap_common::onchain::{
     build_claim_tx, estimate_spend_fee, extract_preimage, CLAIM_FEE_TARGET_BLOCKS,
 };
+use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::SwapState;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -138,6 +139,27 @@ pub async fn drive_submarine_swap(
     };
     info!("Submarine swap: HTLC funding confirmed; paying the Lightning invoice");
 
+    // Reorg guard: paying the invoice is irreversible, so re-confirm the funding is STILL buried
+    // to the required depth right before paying. A reorg that dropped it below that depth (or
+    // orphaned it entirely) means we must not pay — otherwise we'd pay Lightning for an HTLC that
+    // no longer exists. (If it was instead spent by our own earlier claim on resume, finish.)
+    match chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat)? {
+        Some(utxo) if utxo.confirmations >= required_confirmations => {}
+        _ => {
+            if chain
+                .find_spend(&swap.htlc_spk, &funding_outpoint)?
+                .is_some()
+            {
+                info!("Submarine swap: funding already spent (prior claim); done");
+                return Ok(SwapState::Claimed);
+            }
+            warn!("Submarine swap: funding no longer confirmed at required depth (reorg?); not paying");
+            return Ok(SwapState::Failed(
+                "funding reorged below required confirmations before payment".into(),
+            ));
+        }
+    }
+
     // 2. Pay the invoice to learn the preimage. A failure costs nothing on-chain — the
     //    client simply refunds after the timeout.
     let payment = match ln
@@ -180,6 +202,7 @@ pub async fn drive_submarine_swap(
         swap.fee_rate_sat_vb,
         poll,
         MAX_FEE_BUMPS,
+        FINALITY_DEPTH,
         build,
     )
     .await

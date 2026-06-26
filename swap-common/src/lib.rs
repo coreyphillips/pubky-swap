@@ -15,6 +15,7 @@ pub mod htlc;
 pub mod keys;
 pub mod messages;
 pub mod onchain;
+pub mod reorg;
 pub mod swap;
 pub mod wallet;
 

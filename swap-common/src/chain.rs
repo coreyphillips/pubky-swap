@@ -6,7 +6,12 @@
 //! behind the `electrum` feature.
 
 use crate::error::Result;
-use bitcoin::{OutPoint, Script, Transaction, Txid};
+use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
+
+/// Confirmation count a watcher reports when it doesn't actually track depth (the default
+/// `tx_confirmations`): large enough that any finality-depth check treats the tx as final, so test
+/// mocks don't spin in fee-bump/finality loops.
+pub const ASSUMED_FINAL_CONFIRMATIONS: u32 = 1_000_000;
 
 /// A confirmed-or-mempool funding output of an HTLC.
 #[derive(Debug, Clone)]
@@ -46,12 +51,22 @@ pub trait ChainWatcher: Send + Sync {
 
     /// Confirmations of transaction `txid` (which we expect spends one of our outputs, hence the
     /// `spk` to scan its history): `Some(0)` if still in the mempool, `Some(n)` if mined `n` deep,
-    /// `None` if not found (e.g. dropped/replaced). Used by fee-bump loops to stop once a
-    /// claim/refund confirms. The default returns `Some(1)` so watchers (and test mocks) that
-    /// don't track confirmations treat a broadcast as immediately final and don't spin.
+    /// `None` if not found (e.g. dropped or reorged out). Used by fee-bump / finality loops to stop
+    /// once a claim/refund is buried, and to detect a reorged-out spend (it goes to `None`). The
+    /// default returns [`ASSUMED_FINAL_CONFIRMATIONS`] so watchers (and test mocks) that don't
+    /// track depth treat a broadcast as immediately final and don't spin.
     fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {
         let _ = (spk, txid);
-        Ok(Some(1))
+        Ok(Some(ASSUMED_FINAL_CONFIRMATIONS))
+    }
+
+    /// Block hash at `height` in the watcher's best chain (`None` if the height is unknown / above
+    /// the tip). Used to detect reorgs: a previously-seen height whose hash changed indicates the
+    /// chain was reorganized at or below it. The default returns `Ok(None)` so watchers (and test
+    /// mocks) without header access opt out of reorg detection.
+    fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
+        let _ = height;
+        Ok(None)
     }
 }
 

@@ -16,6 +16,7 @@ use swap_common::chain::ChainWatcher;
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
 use swap_common::htlc::PaymentHash;
 use swap_common::onchain::{build_refund_tx, estimate_spend_fee, REFUND_FEE_TARGET_BLOCKS};
+use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::wallet::OnchainWallet;
 use swap_common::SwapState;
 use tokio::time::sleep;
@@ -99,6 +100,7 @@ pub async fn execute_submarine_swap(
                 funding.fee_rate_sat_vb,
                 poll,
                 MAX_FEE_BUMPS,
+                FINALITY_DEPTH,
                 build,
             )
             .await

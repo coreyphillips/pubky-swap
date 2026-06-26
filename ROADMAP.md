@@ -47,9 +47,13 @@ preimage extraction (needs a second node paying the invoice — see Phase 4 rema
 `estimatefee` result clamped to a configured floor (the floor is both the minimum and the
 fallback when estimation is unavailable, e.g. on regtest). **RBF fee-bumping** — claim/refund are
 built RBF-signalling and `swap-common::fee_bump::confirm_or_bump` re-broadcasts at an escalating
-(capped) fee until the spend confirms.
+(capped) fee until the spend confirms. **Reorg handling** — spends are treated as final only at
+`reorg::FINALITY_DEPTH`; `confirm_or_bump` re-broadcasts a claim/refund that is reorged out; the
+submarine provider re-confirms the funding depth right before paying the (irreversible) invoice;
+and a background `reorg::ReorgMonitor` (block-hash continuity) flags reorgs affecting in-flight
+swaps.
 
-**Remaining for this phase:** reorg handling.
+**Phase 3 complete.**
 
 ### 🟡 Phase 4 — Reverse swaps (engine done; live wiring pending)
 `swap-provider::reverse` orchestrates the provider side end-to-end: `init_reverse_swap`
@@ -120,12 +124,15 @@ optional Liquid chain swaps.
 
 ## Remaining for mainnet
 
-The swap engine works on regtest, but these are required before any signet/mainnet exposure:
+The swap engine works on regtest, but these remain before any signet/mainnet exposure:
 
-- **Reorg handling** — re-validate funding/spend depth across chain reorganizations.
-- **CPFP** as a fallback to RBF when a spend can't be replaced (RBF bumping is implemented).
 - **`spawn_blocking`** for the drivers' blocking chain calls under load.
+- **CPFP** as a fallback to RBF when a spend can't be replaced (RBF bumping + reorg re-broadcast
+  are implemented).
+- Validating reorg handling against a **reorg-capable regtest harness** (the logic is unit-tested
+  with reorg-simulating mocks; a live deep-reorg test is not yet automated).
 - Running the `#[ignore]`d live regtest tests (reverse + submarine) in CI against a real backplane.
+- A third-party security review of the atomic-swap paths.
 - **Marketplace hardening** (Phase 6): offer publishing/discovery on the Pubky profile, abuse/ban
   handling, requiring on-chain confirmation before a provider commits.
 - A **third-party security review** of the atomic-swap paths.

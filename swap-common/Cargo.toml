@@ -15,8 +15,8 @@ hex.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# Only the timer is used, by the async fee-bump loop (see `fee_bump`).
-tokio = { version = "1", features = ["time"] }
+# `time` for the fee-bump loop; `rt`/`rt-multi-thread` for `chain::blocking` (block_in_place).
+tokio = { version = "1", features = ["time", "rt", "rt-multi-thread"] }
 
 # Electrum-backed chain watcher (feature `electrum`). Kept optional so the default build
 # pulls no networking stack.

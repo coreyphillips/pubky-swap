@@ -128,6 +128,9 @@ Without the execution features a provider runs **negotiation-only** and rejects 
   single-use, and are pruned from memory.
 - **Crash recovery.** In-flight swaps are persisted under `--data-dir` (default `./pubky-swap-data`)
   and resumed on restart, so a provider crash doesn't strand HTLC funds.
+- **Reorg resilience.** Claims/refunds are RBF-bumped and treated as final only once buried a few
+  blocks deep; a reorged-out spend is re-broadcast; the submarine provider re-confirms the funding
+  depth before paying the invoice; and a background monitor flags reorgs affecting live swaps.
 
 ## Integration tests (regtest)
 

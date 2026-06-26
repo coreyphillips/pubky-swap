@@ -26,6 +26,7 @@ use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
 use swap_common::onchain::{
     build_refund_tx, estimate_spend_fee, extract_preimage, REFUND_FEE_TARGET_BLOCKS,
 };
+use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::SwapState;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -210,6 +211,7 @@ pub async fn drive_reverse_swap(
                 swap.fee_rate_sat_vb,
                 poll,
                 MAX_FEE_BUMPS,
+                FINALITY_DEPTH,
                 build,
             )
             .await
