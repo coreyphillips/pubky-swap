@@ -30,7 +30,7 @@ mod bdk_impl {
     use crate::error::{Result, SwapError};
     use bdk::blockchain::{Blockchain, ElectrumBlockchain};
     use bdk::database::MemoryDatabase;
-    use bdk::electrum_client::Client;
+    use bdk::electrum_client::{Client, ElectrumApi};
     use bdk::keys::bip39::{Language, Mnemonic};
     use bdk::keys::{DerivableKey, ExtendedKey};
     use bdk::template::Bip84;
@@ -46,6 +46,9 @@ mod bdk_impl {
     pub struct BdkWallet {
         wallet: Mutex<Wallet<MemoryDatabase>>,
         blockchain: ElectrumBlockchain,
+        /// A separate Electrum client for fee estimation — bdk's `estimate_fee` panics on the `-1`
+        /// regtest sentinel, so we query the raw `estimatefee` and guard it ourselves.
+        fee_client: Client,
         fee_rate_sat_vb: f32,
         /// Cached wallet-controlled sweep address (refund/claim destination).
         receive_spk: ScriptBuf,
@@ -80,6 +83,8 @@ mod bdk_impl {
             let client = Client::new(electrum_url)
                 .map_err(|e| SwapError::Other(format!("electrum connect: {e}")))?;
             let blockchain = ElectrumBlockchain::from(client);
+            let fee_client = Client::new(electrum_url)
+                .map_err(|e| SwapError::Other(format!("electrum connect (fee): {e}")))?;
 
             let receive_spk = wallet
                 .get_address(AddressIndex::New)
@@ -89,6 +94,7 @@ mod bdk_impl {
             Ok(Self {
                 wallet: Mutex::new(wallet),
                 blockchain,
+                fee_client,
                 fee_rate_sat_vb,
                 receive_spk,
             })
@@ -102,14 +108,20 @@ mod bdk_impl {
         }
 
         /// Resolve the funding fee rate: prefer a live Electrum estimate, but never drop below the
-        /// configured floor. bdk's `ElectrumBlockchain::estimate_fee` does not guard the `-1`
-        /// regtest sentinel (it yields a negative `FeeRate`), so only accept an estimate above the
-        /// floor.
+        /// configured floor. Queries the raw `estimatefee` (BTC/kB) and converts via the shared
+        /// `-1`-safe helper, so the regtest sentinel falls back to the floor instead of panicking
+        /// bdk's `FeeRate` constructor.
         fn resolved_fee_rate(&self) -> FeeRate {
-            let floor = FeeRate::from_sat_per_vb(self.fee_rate_sat_vb);
-            match self.blockchain.estimate_fee(FUNDING_FEE_TARGET_BLOCKS) {
-                Ok(est) if est.as_sat_per_vb() > self.fee_rate_sat_vb => est,
-                _ => floor,
+            let estimate = self
+                .fee_client
+                .estimate_fee(FUNDING_FEE_TARGET_BLOCKS)
+                .ok()
+                .and_then(crate::onchain::btc_per_kvb_to_sat_per_vb);
+            match estimate {
+                Some(sat_vb) if sat_vb as f32 > self.fee_rate_sat_vb => {
+                    FeeRate::from_sat_per_vb(sat_vb as f32)
+                }
+                _ => FeeRate::from_sat_per_vb(self.fee_rate_sat_vb),
             }
         }
 

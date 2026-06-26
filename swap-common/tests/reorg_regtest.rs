@@ -69,11 +69,14 @@ fn reorg_monitor_detects_invalidated_block() {
     let url = env("REGTEST_ELECTRUM_URL", "tcp://127.0.0.1:60001");
     let watcher = ElectrumWatcher::new(&url).expect("connect electrs");
 
-    // Establish a baseline a few blocks up so electrs is synced.
+    // Establish a baseline and let electrs sync to the tip.
     mine(3);
-    let base_tip = u32::from_str(&cli(&["getblockcount"])).unwrap();
-    wait_for_tip(&watcher, base_tip);
+    let tip = u32::from_str(&cli(&["getblockcount"])).unwrap();
+    wait_for_tip(&watcher, tip);
 
+    // Checkpoint exactly the current tip. The monitor reports the lowest *checkpointed* height
+    // whose hash changes, so by checkpointing only `tip` and invalidating exactly that block, the
+    // detected fork is deterministically `tip`.
     let mut monitor = ReorgMonitor::new(50);
     assert_eq!(
         monitor.observe(&watcher).unwrap(),
@@ -81,42 +84,35 @@ fn reorg_monitor_detects_invalidated_block() {
         "no reorg on the first observation"
     );
 
-    // Mine two blocks we will orphan, and record the first one's height/hash.
-    let new_hashes = mine(2);
-    let reorg_height = base_tip + 1;
-    wait_for_tip(&watcher, base_tip + 2);
-    assert_eq!(
-        monitor.observe(&watcher).unwrap(),
-        None,
-        "extending the chain is not a reorg"
-    );
-    let hash_before = watcher.block_hash_at(reorg_height).unwrap();
-    assert!(hash_before.is_some());
+    let hash_before = watcher.block_hash_at(tip).unwrap().expect("hash at tip");
+    let tip_blockhash = cli(&["getblockhash", &tip.to_string()]);
 
-    // Force a reorg: invalidate the block at `reorg_height`, then mine a longer competing branch.
-    cli(&["invalidateblock", &new_hashes[0]]);
-    let replacement = mine(3);
+    // Force a reorg: invalidate the tip block (rolling back one), then mine a longer branch so the
+    // block at height `tip` is replaced by a different one.
+    cli(&["invalidateblock", &tip_blockhash]);
+    let replacement = mine(2);
     assert!(!replacement.is_empty());
     let new_tip = u32::from_str(&cli(&["getblockcount"])).unwrap();
-    wait_for_tip(&watcher, new_tip);
+    wait_for_tip(&watcher, new_tip.max(tip));
 
-    // The hash at `reorg_height` changed → the monitor reports the fork there (or below).
-    let hash_after = watcher.block_hash_at(reorg_height).unwrap();
+    // The block at `tip` is now a different one.
+    let hash_after = watcher
+        .block_hash_at(tip)
+        .unwrap()
+        .expect("hash at tip after reorg");
     assert_ne!(
         hash_before, hash_after,
-        "the block at the reorg height must have changed"
+        "the block at the checkpointed tip must have changed"
     );
+
     let fork = monitor
         .observe(&watcher)
         .unwrap()
         .expect("monitor must detect the reorg");
-    assert!(
-        fork <= reorg_height,
-        "fork height {fork} should be at or below the invalidated height {reorg_height}"
+    assert_eq!(
+        fork, tip,
+        "the detected fork should be the invalidated (checkpointed) height"
     );
 
-    println!(
-        "✅ reorg detected at height {fork} (invalidated {})",
-        new_hashes[0]
-    );
+    println!("✅ reorg detected at height {fork} (was {tip_blockhash})");
 }
