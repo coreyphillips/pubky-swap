@@ -134,6 +134,13 @@ Without the execution features a provider runs **negotiation-only** and rejects 
   blocks deep; a reorged-out spend is re-broadcast; the submarine provider re-confirms the funding
   depth before paying the invoice; and a background monitor flags reorgs affecting live swaps.
 
+## Running against your own node
+
+To point a provider/client at your own LND (with a generic walkthrough and a step-by-step
+**Umbrel** setup — where to find the cert/macaroon, the Electrs app, and the TLS gotcha), see
+[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md). ⚠️ It's not yet safe for mainnet funds — prefer a
+regtest/signet/testnet node until the [`ROADMAP.md`](ROADMAP.md) mainnet items and an audit land.
+
 ## Integration tests (regtest)
 
 All are `#[ignore]`d and need real services. A one-command backplane (bitcoind + electrs + two LND

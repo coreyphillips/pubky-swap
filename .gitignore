@@ -8,3 +8,9 @@
 # Persisted in-flight swap state (provider --data-dir)
 /pubky-swap-data/
 /provider-data/
+
+# Node credentials — never commit these (the self-hosting guide / regtest CI place them locally)
+*.macaroon
+*.cert
+*.key
+*.pem
