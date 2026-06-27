@@ -18,7 +18,7 @@ A fully-functional (swap-executing) provider needs three things, all configurabl
 |---|---|---|
 | **Lightning node** (LND, gRPC) | `--lnd-address` `--lnd-cert` `--lnd-macaroon` | A macaroon with **invoice + router** permissions (the `admin.macaroon` works). |
 | **Chain access** (Electrum/electrs) | `--electrum-url` | e.g. `tcp://host:50001` (mainnet/electrs) or `ssl://host:50002`. |
-| **Funding wallet** (on-chain) | `--wallet-mnemonic` | A BIP39 mnemonic for a BIP84 wallet **holding coins** — it funds reverse-swap HTLCs. |
+| **Funding wallet** (on-chain) | `--wallet lnd` *(or `--wallet-mnemonic`)* | `--wallet lnd` funds reverse-swap HTLCs from **LND's own on-chain balance** (no extra seed — recommended). Or use a separate BIP84 wallet with `--wallet bdk --wallet-mnemonic "…"`. |
 
 Build with the `full` feature (needs [`protoc`](https://grpc.io/docs/protoc-installation/)):
 

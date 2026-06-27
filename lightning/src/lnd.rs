@@ -11,8 +11,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use fedimint_tonic_lnd::invoicesrpc::{AddHoldInvoiceRequest, CancelInvoiceMsg, SettleInvoiceMsg};
-use fedimint_tonic_lnd::lnrpc::{GetInfoRequest, PayReqString, PaymentHash};
+use fedimint_tonic_lnd::lnrpc::{GetInfoRequest, NewAddressRequest, PayReqString, PaymentHash};
 use fedimint_tonic_lnd::routerrpc::SendPaymentRequest;
+use fedimint_tonic_lnd::signrpc::TxOut;
+use fedimint_tonic_lnd::walletrpc::SendOutputsRequest;
 
 /// LND node backend.
 ///
@@ -43,6 +45,51 @@ impl LndBackend {
         Ok(Self {
             client: Mutex::new(client),
         })
+    }
+
+    /// A fresh on-chain receive address (P2WPKH) from LND's wallet. Returned as a string; the
+    /// caller parses it for the node's network.
+    pub async fn new_address(&self) -> Result<String> {
+        let mut client = self.client.lock().await;
+        let resp = client
+            .lightning()
+            .new_address(NewAddressRequest {
+                r#type: 0, // WITNESS_PUBKEY_HASH
+                account: String::new(),
+            })
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?
+            .into_inner();
+        Ok(resp.address)
+    }
+
+    /// Send `amount_sat` to `pk_script` from LND's on-chain wallet at `sat_per_kw`, returning the
+    /// raw funding transaction (the caller locates the funding output). Requires a macaroon with
+    /// on-chain write permission.
+    pub async fn send_outputs(
+        &self,
+        pk_script: Vec<u8>,
+        amount_sat: i64,
+        sat_per_kw: i64,
+    ) -> Result<Vec<u8>> {
+        let mut client = self.client.lock().await;
+        let resp = client
+            .wallet()
+            .send_outputs(SendOutputsRequest {
+                sat_per_kw,
+                outputs: vec![TxOut {
+                    value: amount_sat,
+                    pk_script,
+                }],
+                label: "pubky-swap htlc funding".to_string(),
+                min_confs: 1,
+                spend_unconfirmed: false,
+                coin_selection_strategy: 0,
+            })
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?
+            .into_inner();
+        Ok(resp.raw_tx)
     }
 }
 
