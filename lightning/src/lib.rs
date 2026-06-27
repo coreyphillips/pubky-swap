@@ -187,3 +187,8 @@ impl LightningBackend for StubBackend {
 mod lnd;
 #[cfg(feature = "lnd")]
 pub use lnd::LndBackend;
+
+#[cfg(feature = "lnd")]
+mod lnd_wallet;
+#[cfg(feature = "lnd")]
+pub use lnd_wallet::LndWallet;

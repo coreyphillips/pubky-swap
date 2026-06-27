@@ -8,8 +8,6 @@
 //! sending the client a final `SwapStatusUpdate`. Without those pieces it stays
 //! negotiation-only and rejects `SwapRequest`s.
 
-#[cfg(feature = "lnd")]
-pub mod lnd_wallet;
 pub mod reverse;
 pub mod store;
 pub mod submarine;
@@ -444,7 +442,7 @@ async fn build_lnd_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWall
         tls_cert_path: config.lnd_cert_path.clone(),
         macaroon_path: config.lnd_macaroon_path.clone(),
     };
-    match crate::lnd_wallet::LndWallet::connect(lnd_config, config.onchain_fee_rate_sat_vb).await {
+    match lightning_backend::LndWallet::connect(lnd_config, config.onchain_fee_rate_sat_vb).await {
         Ok(w) => Some(Arc::new(w)),
         Err(e) => {
             warn!("LND on-chain wallet unavailable: {e}");

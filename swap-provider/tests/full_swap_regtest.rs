@@ -100,10 +100,10 @@ async fn full_reverse_swap_two_nodes() {
     let chain_p: Arc<dyn ChainWatcher> = Arc::new(ElectrumWatcher::new(&electrum).unwrap());
     let chain_c: Arc<dyn ChainWatcher> = Arc::new(ElectrumWatcher::new(&electrum).unwrap());
     // Funding wallet: BDK by default, or LND's own on-chain wallet with WALLET_BACKEND=lnd (which
-    // exercises swap_provider::lnd_wallet::LndWallet — funds from the provider LND's balance).
+    // exercises lightning_backend::LndWallet — funds from the provider LND's balance).
     let wallet: Arc<dyn OnchainWallet> = if env("WALLET_BACKEND", "bdk") == "lnd" {
         Arc::new(
-            swap_provider::lnd_wallet::LndWallet::connect(lnd_cfg("A"), 5)
+            lightning_backend::LndWallet::connect(lnd_cfg("A"), 5)
                 .await
                 .expect("connect LND on-chain wallet"),
         )

@@ -18,10 +18,13 @@ tokio = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 # fedimint-tonic-lnd uses rustls 0.23, which needs a CryptoProvider installed at runtime.
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+# For the LND-backed OnchainWallet (feature `lnd`).
+swap-common = { workspace = true, optional = true }
+bitcoin = { workspace = true, optional = true }
 
 [features]
 default = []
-lnd = ["dep:fedimint-tonic-lnd", "dep:tokio", "dep:hex", "dep:rustls"]
+lnd = ["dep:fedimint-tonic-lnd", "dep:tokio", "dep:hex", "dep:rustls", "dep:swap-common", "dep:bitcoin"]
 
 [dev-dependencies]
 tokio = { workspace = true }

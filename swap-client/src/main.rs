@@ -47,12 +47,19 @@ struct Cli {
     /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
     #[arg(long, default_value = "")]
     wallet_mnemonic: String,
+    /// On-chain wallet: `lnd` (fund/claim via your own LND node — no seed or claim address) or
+    /// `bdk` (a separate BIP84 wallet from --wallet-mnemonic, with --claim-address for reverse).
+    #[arg(long, default_value = "bdk")]
+    wallet: String,
     /// Fee rate (sat/vB) for the claim transaction.
     #[arg(long, default_value_t = 2)]
     onchain_fee_rate: u64,
     /// Routing-fee cap (msat) when paying the hold invoice.
     #[arg(long, default_value_t = 10_000)]
     max_routing_fee_msat: u64,
+    /// Only check the provider (request a quote and print its rates), then exit without swapping.
+    #[arg(long)]
+    quote_only: bool,
 }
 
 fn parse_direction(s: &str) -> anyhow::Result<SwapDirection> {
@@ -98,8 +105,10 @@ async fn main() -> anyhow::Result<()> {
         electrum_url: cli.electrum_url,
         claim_address: cli.claim_address,
         wallet_mnemonic: cli.wallet_mnemonic,
+        wallet_backend: cli.wallet,
         onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
         max_routing_fee_msat: cli.max_routing_fee_msat,
+        quote_only: cli.quote_only,
     };
 
     run(config).await

@@ -46,10 +46,15 @@ pub struct ClientConfig {
     pub claim_address: String,
     /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
     pub wallet_mnemonic: String,
+    /// On-chain wallet backend: `"lnd"` (fund/claim via the node's own LND wallet — no seed or
+    /// claim address needed) or `"bdk"` (a separate BIP84 wallet from `wallet_mnemonic`).
+    pub wallet_backend: String,
     /// Fee rate (sat/vB) for the claim transaction.
     pub onchain_fee_rate_sat_vb: u64,
     /// Routing-fee cap (msat) when paying the hold invoice.
     pub max_routing_fee_msat: u64,
+    /// Only request a quote (to check a provider's availability/rates) and exit without swapping.
+    pub quote_only: bool,
 }
 
 pub fn parse_network(s: &str) -> Result<Network> {
@@ -110,6 +115,22 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         quote.quote_id, quote.amount_sat, quote.fee_sat, quote.total_sat, quote.htlc_timeout_blocks
     );
 
+    // A receiving a quote confirms the peer is a live provider that serves this direction. In
+    // quote-only mode, print a machine-readable line and stop (no funds move).
+    if config.quote_only {
+        println!(
+            "QUOTE provider={} direction={:?} amount_sat={} fee_sat={} total_sat={} timeout_blocks={} confirmations={}",
+            config.provider_pkarr,
+            config.direction,
+            quote.amount_sat,
+            quote.fee_sat,
+            quote.total_sat,
+            quote.htlc_timeout_blocks,
+            quote.required_confirmations
+        );
+        return Ok(());
+    }
+
     if config.direction == SwapDirection::Submarine {
         return run_submarine(&config, &transport, network, &quote, &client_pkarr).await;
     }
@@ -160,12 +181,15 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     }
     info!("Verified HTLC script and address match our claim key and payment hash");
 
-    // 6) Execute, if the client is configured to (own LND + Electrum + a claim address).
-    if config.electrum_url.is_empty() || config.claim_address.is_empty() {
+    // 6) Execute, if the client is configured to (own LND + Electrum + a claim destination — either
+    //    an explicit --claim-address or `--wallet lnd`, which sweeps into LND's own wallet).
+    let lnd_claim = config.wallet_backend == "lnd";
+    if config.electrum_url.is_empty() || (config.claim_address.is_empty() && !lnd_claim) {
         warn!(
             "Reverse swap negotiated and HTLC verified, but execution config is missing. To pay \
              the hold invoice and claim on-chain, rebuild with --features full and pass \
-             --lnd-address/--lnd-cert/--lnd-macaroon, --electrum-url, and --claim-address."
+             --lnd-address/--lnd-cert/--lnd-macaroon, --electrum-url, and --claim-address (or \
+             --wallet lnd to sweep into LND)."
         );
         return Ok(());
     }
@@ -174,7 +198,11 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         .invoice
         .clone()
         .ok_or_else(|| anyhow!("provider did not include a hold invoice"))?;
-    let dest_spk = parse_address_spk(&config.claim_address, network)?;
+    let dest_spk = if lnd_claim {
+        build_wallet(&config, network).await?.receive_destination()
+    } else {
+        parse_address_spk(&config.claim_address, network)?
+    };
     let ln = make_backend(&config).await?;
     let chain = build_chain(&config)?;
 
@@ -213,12 +241,13 @@ async fn run_submarine(
     client_pkarr: &str,
 ) -> Result<()> {
     // Execution needs our own LN node (to issue + watch the invoice), Electrum, and a funding
-    // wallet. Without them we can't even produce the invoice the SwapRequest carries.
-    if config.electrum_url.is_empty() || config.wallet_mnemonic.is_empty() {
+    // wallet (LND's own with `--wallet lnd`, or a BDK wallet from `--wallet-mnemonic`).
+    let have_wallet = config.wallet_backend == "lnd" || !config.wallet_mnemonic.is_empty();
+    if config.electrum_url.is_empty() || !have_wallet {
         warn!(
             "Submarine swap quoted, but execution config is missing. To run it, rebuild with \
              --features full and pass --lnd-address/--lnd-cert/--lnd-macaroon, --electrum-url, \
-             and --wallet-mnemonic."
+             and --wallet lnd (or --wallet-mnemonic)."
         );
         return Ok(());
     }
@@ -289,7 +318,7 @@ async fn run_submarine(
 
     // 6) Fund the HTLC and wait for settlement (or refund at timeout).
     let chain = build_chain(config)?;
-    let wallet = build_wallet(config, network)?;
+    let wallet = build_wallet(config, network).await?;
     let funding = SubmarineFunding {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
@@ -309,23 +338,41 @@ fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {
     PublicKey::from_slice(&bytes).map_err(|e| anyhow!("parse public key: {e}"))
 }
 
-/// Build the on-chain funding wallet (submarine swaps). Requires the `bdk-wallet` feature.
-#[cfg(feature = "bdk-wallet")]
-fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn OnchainWallet>> {
-    let wallet = swap_common::wallet::BdkWallet::from_mnemonic(
-        &config.wallet_mnemonic,
-        network,
-        &config.electrum_url,
-        config.onchain_fee_rate_sat_vb as f32,
-    )
-    .map_err(|e| anyhow!("funding wallet: {e}"))?;
-    Ok(Arc::new(wallet))
-}
-
-#[cfg(not(feature = "bdk-wallet"))]
-fn build_wallet(_config: &ClientConfig, _network: Network) -> Result<Arc<dyn OnchainWallet>> {
+/// Build the on-chain wallet used to fund submarine HTLCs and/or receive reverse-swap sweeps:
+/// `--wallet lnd` (the node's own LND wallet, no seed) or a BDK wallet from `--wallet-mnemonic`.
+async fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn OnchainWallet>> {
+    if config.wallet_backend == "lnd" {
+        #[cfg(feature = "lnd")]
+        {
+            let lnd_config = LndConfig {
+                address: config.lnd_address.clone(),
+                tls_cert_path: config.lnd_cert_path.clone(),
+                macaroon_path: config.lnd_macaroon_path.clone(),
+            };
+            let wallet =
+                lightning_backend::LndWallet::connect(lnd_config, config.onchain_fee_rate_sat_vb)
+                    .await
+                    .map_err(|e| anyhow!("LND on-chain wallet: {e}"))?;
+            return Ok(Arc::new(wallet));
+        }
+        #[cfg(not(feature = "lnd"))]
+        return Err(anyhow!("--wallet lnd requires the `lnd` feature"));
+    }
+    let _ = network;
+    #[cfg(feature = "bdk-wallet")]
+    {
+        let wallet = swap_common::wallet::BdkWallet::from_mnemonic(
+            &config.wallet_mnemonic,
+            network,
+            &config.electrum_url,
+            config.onchain_fee_rate_sat_vb as f32,
+        )
+        .map_err(|e| anyhow!("funding wallet: {e}"))?;
+        Ok(Arc::new(wallet))
+    }
+    #[cfg(not(feature = "bdk-wallet"))]
     Err(anyhow!(
-        "client built without the `bdk-wallet` feature; rebuild with --features full to fund submarine swaps"
+        "no on-chain wallet available; use --wallet lnd, or rebuild with --features full for --wallet-mnemonic"
     ))
 }
 
