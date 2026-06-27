@@ -1,0 +1,91 @@
+//! Chain observation needed to drive a swap: find the funding UTXO, count confirmations,
+//! learn the tip height (for timeouts), and broadcast claim/refund transactions.
+//!
+//! The trait is synchronous because the Electrum client is blocking; async callers wrap these in
+//! [`run_blocking`] so they don't stall the runtime. An [`ElectrumWatcher`] implementation is
+//! provided behind the `electrum` feature.
+
+use crate::error::Result;
+use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
+
+/// Confirmation count a watcher reports when it doesn't actually track depth (the default
+/// `tx_confirmations`): large enough that any finality-depth check treats the tx as final, so test
+/// mocks don't spin in fee-bump/finality loops.
+pub const ASSUMED_FINAL_CONFIRMATIONS: u32 = 1_000_000;
+
+/// Run a blocking [`ChainWatcher`] call without stalling the async runtime.
+///
+/// The watcher methods are synchronous (the Electrum client blocks), so calling them directly in an
+/// async driver would block a runtime worker. On a multi-threaded runtime this uses
+/// `block_in_place`, which signals the runtime to keep other tasks progressing on sibling workers;
+/// on a current-thread runtime (e.g. `#[tokio::test]`, or no runtime at all) it just runs inline,
+/// since `block_in_place` would panic there. Borrowed data is fine — nothing needs to be `'static`.
+pub fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
+/// A confirmed-or-mempool funding output of an HTLC.
+#[derive(Debug, Clone)]
+pub struct FundingUtxo {
+    pub outpoint: OutPoint,
+    pub value_sat: u64,
+    /// 0 while unconfirmed (in the mempool).
+    pub confirmations: u32,
+}
+
+/// Minimal chain access for the swap state machine. `Send + Sync` so a watcher can be shared
+/// (behind `Arc`) with spawned per-swap driver tasks.
+pub trait ChainWatcher: Send + Sync {
+    /// Current best block height.
+    fn tip_height(&self) -> Result<u32>;
+
+    /// Find an unspent output paying exactly `expected_value_sat` to `spk` (the HTLC P2WSH
+    /// scriptPubKey), if one exists.
+    fn find_funding(&self, spk: &Script, expected_value_sat: u64) -> Result<Option<FundingUtxo>>;
+
+    /// Find the transaction (if any) that spends `outpoint`. Used to detect the
+    /// counterparty's claim (so the preimage can be recovered) or refund. `spk` is the
+    /// HTLC scriptPubKey, used to scan history.
+    fn find_spend(&self, spk: &Script, outpoint: &OutPoint) -> Result<Option<Transaction>>;
+
+    /// Broadcast a transaction, returning its txid.
+    fn broadcast(&self, tx: &Transaction) -> Result<Txid>;
+
+    /// Estimate the fee rate (sat/vB) to confirm within `target_blocks`. `Ok(None)` means the
+    /// backend has no estimate (e.g. on regtest, where `estimatefee` returns the `-1` sentinel),
+    /// in which case callers fall back to their configured fee floor. The default returns
+    /// `Ok(None)` so watchers (and test mocks) without estimation need no change.
+    fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
+        let _ = target_blocks;
+        Ok(None)
+    }
+
+    /// Confirmations of transaction `txid` (which we expect spends one of our outputs, hence the
+    /// `spk` to scan its history): `Some(0)` if still in the mempool, `Some(n)` if mined `n` deep,
+    /// `None` if not found (e.g. dropped or reorged out). Used by fee-bump / finality loops to stop
+    /// once a claim/refund is buried, and to detect a reorged-out spend (it goes to `None`). The
+    /// default returns [`ASSUMED_FINAL_CONFIRMATIONS`] so watchers (and test mocks) that don't
+    /// track depth treat a broadcast as immediately final and don't spin.
+    fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {
+        let _ = (spk, txid);
+        Ok(Some(ASSUMED_FINAL_CONFIRMATIONS))
+    }
+
+    /// Block hash at `height` in the watcher's best chain (`None` if the height is unknown / above
+    /// the tip). Used to detect reorgs: a previously-seen height whose hash changed indicates the
+    /// chain was reorganized at or below it. The default returns `Ok(None)` so watchers (and test
+    /// mocks) without header access opt out of reorg detection.
+    fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
+        let _ = height;
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "electrum")]
+mod electrum;
+#[cfg(feature = "electrum")]
+pub use electrum::ElectrumWatcher;

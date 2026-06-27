@@ -1,0 +1,106 @@
+# Contributing to pubky-swap
+
+Thanks for your interest! This is safety-critical software — atomic-swap bugs lose real money — so
+the bar for changes to the swap engine is high. Please read the safety invariants below before
+touching timelock, fee, or HTLC code.
+
+## Development setup
+
+1. Install **Rust** (stable) via <https://rustup.rs>.
+2. For anything LND-related, install **protoc** (`brew install protobuf` /
+   `apt install protobuf-compiler`). The default build doesn't need it.
+3. Verify your toolchain and run the build + unit tests:
+
+   ```bash
+   ./scripts/check-prereqs.sh
+   ```
+
+## Everyday commands
+
+```bash
+cargo build --all
+cargo test --all                       # unit tests (fast, no external services)
+cargo fmt --all                        # format
+cargo fmt --all --check                # CI-style format check
+cargo clippy --all-targets             # lint (please keep it warning-free)
+cargo clippy -p swap-provider --features full --all-targets   # lint feature-gated code too
+```
+
+Both formatting (`cargo fmt --all --check`) and a warning-free `cargo clippy` are expected on every
+change.
+
+## Feature flags
+
+Most execution code is behind cargo features so the default build stays toolchain-light:
+
+| Feature | Crate(s) | Enables |
+|---------|----------|---------|
+| `lnd` | `lightning-backend`, `swap-provider`, `swap-client` | Real LND gRPC backend (needs `protoc`). |
+| `electrum` | `swap-common` | `ElectrumWatcher`. |
+| `bdk-wallet` | `swap-provider` | BIP84 funding wallet. |
+| `chain` | `swap-provider`, `swap-client` | Electrum chain watcher. |
+| `full` | `swap-provider`, `swap-client` | Everything needed to execute swaps. |
+
+When you add code behind a feature, build it explicitly (e.g.
+`cargo build -p swap-provider --features full`) — the default `cargo build --all` won't compile it.
+
+## Tests
+
+- **Unit tests** run with `cargo test --all` and use trait mocks (no Bitcoin/Lightning needed).
+  The on-chain HTLC spends are additionally validated against real Bitcoin script consensus via
+  `libbitcoinconsensus`.
+- **Integration tests** are marked `#[ignore]` and need a regtest backplane. Defaults the tests
+  assume: bitcoind RPC `polaruser`/`polarpass` on port `43782`, Electrum at `tcp://127.0.0.1:60001`
+  (override with `REGTEST_ELECTRUM_URL`), bitcoind container name `bitcoin` (override with
+  `REGTEST_BTC_CONTAINER`).
+
+  - **bitcoind + electrs tests** (`swap-common` `regtest`/`reorg_regtest`, `swap-provider`
+    `wallet_regtest`): spin up the backplane with
+    `docker compose -f docker-compose.regtest.yml up -d`, then run the test with
+    `-- --ignored --nocapture`.
+  - **Two-node LND swap tests** (`full_swap_regtest`, `submarine_swap_regtest`): the compose
+    backplane includes two LND nodes; `scripts/setup-regtest-lnd.sh` opens a funded, balanced
+    channel between them (so both swap directions have liquidity). Then export the creds and run:
+
+    ```bash
+    docker compose -f docker-compose.regtest.yml up -d
+    ./scripts/setup-regtest-lnd.sh
+    docker cp lnd-a:/home/lnd/.lnd/tls.cert ./lnd-a-tls.cert
+    docker cp lnd-a:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-a-admin.macaroon
+    docker cp lnd-b:/home/lnd/.lnd/tls.cert ./lnd-b-tls.cert
+    docker cp lnd-b:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-b-admin.macaroon
+    LND_A_URL=https://127.0.0.1:10011 LND_A_CERT=./lnd-a-tls.cert LND_A_MAC=./lnd-a-admin.macaroon \
+    LND_B_URL=https://127.0.0.1:10012 LND_B_CERT=./lnd-b-tls.cert LND_B_MAC=./lnd-b-admin.macaroon \
+    REGTEST_ELECTRUM_URL=tcp://127.0.0.1:60001 \
+      cargo test -p swap-provider --features full --test full_swap_regtest -- --ignored --nocapture
+    ```
+
+    [Polar](https://lightningpolar.com) works too if you prefer a GUI (point the env vars at its
+    nodes).
+
+## CI
+
+`.github/workflows/ci.yml` runs fmt, clippy (all feature combos), the build matrix, and unit tests
+on every push/PR. `.github/workflows/regtest.yml` brings up the full `docker-compose.regtest.yml`
+backplane, opens a funded channel via `scripts/setup-regtest-lnd.sh`, and runs **all** the
+integration tests — including both two-node LND swaps — on a manual/weekly trigger.
+
+## Safety invariants (do not break these)
+
+- **A provider must not commit on-chain funds until the counterparty's leg is sufficiently
+  confirmed/accepted.** A client must not reveal the preimage until the provider's lockup is
+  confirmed.
+- **Timelocks:** the refund path uses `nLockTime = timeout` with a non-final sequence so
+  `OP_CHECKLOCKTIMEVERIFY` is enforced; the claim path has no timelock. Any change here must keep
+  the `swap-common` consensus tests (claim valid, refund valid only at/after timeout, wrong-preimage
+  and wrong-key rejected) passing.
+- **Fees:** claim/refund/funding fees use a live estimate clamped to the configured floor. Never
+  let the effective rate drop below the floor, and never produce a sub-dust output.
+- **Resume must be idempotent:** a restarted provider must not re-fund an HTLC it already funded
+  (it adopts the persisted/observed funding outpoint) and must detect an already-completed claim.
+
+If a change affects any of the above, add or update a test that demonstrates the safe behavior.
+
+## Roadmap
+
+See [`ROADMAP.md`](ROADMAP.md) for what's done and what's still required before mainnet.

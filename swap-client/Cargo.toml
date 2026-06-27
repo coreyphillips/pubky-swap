@@ -1,0 +1,35 @@
+[package]
+name = "swap-client"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "pubky-swap client: discover providers, request quotes, and drive a swap"
+
+[features]
+default = []
+# Enable the real LND gRPC backend (pay/issue invoices). Requires protoc at build time.
+lnd = ["lightning-backend/lnd"]
+# Enable the Electrum chain watcher (to watch/claim/refund the HTLC on-chain).
+chain = ["swap-common/electrum"]
+# Enable the BDK funding wallet (to fund the HTLC in a submarine swap).
+bdk-wallet = ["swap-common/bdk-wallet"]
+# Everything needed to execute a swap end-to-end from the CLI.
+full = ["lnd", "chain", "bdk-wallet"]
+
+[dependencies]
+pubky-transport.workspace = true
+swap-common.workspace = true
+lightning-backend.workspace = true
+bitcoin.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+hex.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

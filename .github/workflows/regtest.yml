@@ -1,0 +1,65 @@
+name: Regtest integration
+
+# Runs every #[ignore]d integration test against a real backplane: bitcoind + electrs + two LND
+# nodes with a funded channel (set up by scripts/setup-regtest-lnd.sh). Manual + weekly, so it
+# never blocks PRs.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+env:
+  CARGO_TERM_COLOR: always
+  LND_A_URL: https://127.0.0.1:10011
+  LND_A_CERT: ./lnd-a-tls.cert
+  LND_A_MAC: ./lnd-a-admin.macaroon
+  LND_B_URL: https://127.0.0.1:10012
+  LND_B_CERT: ./lnd-b-tls.cert
+  LND_B_MAC: ./lnd-b-admin.macaroon
+  REGTEST_ELECTRUM_URL: tcp://127.0.0.1:60001
+
+jobs:
+  regtest:
+    name: full regtest integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start backplane + open a funded channel
+        run: |
+          docker compose -f docker-compose.regtest.yml up -d
+          ./scripts/setup-regtest-lnd.sh
+          sleep 20 # let electrs finish indexing
+
+      - name: Export LND credentials
+        run: |
+          docker cp lnd-a:/home/lnd/.lnd/tls.cert ./lnd-a-tls.cert
+          docker cp lnd-a:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-a-admin.macaroon
+          docker cp lnd-b:/home/lnd/.lnd/tls.cert ./lnd-b-tls.cert
+          docker cp lnd-b:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-b-admin.macaroon
+
+      - name: HTLC engine + Electrum watcher
+        run: cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
+
+      - name: Reorg detection
+        run: cargo test -p swap-common --features electrum --test reorg_regtest -- --ignored --nocapture
+
+      - name: BDK funding wallet
+        run: cargo test -p swap-provider --features full --test wallet_regtest -- --ignored --nocapture
+
+      - name: Reverse swap (two LND nodes)
+        run: cargo test -p swap-provider --features full --test full_swap_regtest -- --ignored --nocapture
+
+      - name: Submarine swap (two LND nodes)
+        run: cargo test -p swap-provider --features full --test submarine_swap_regtest -- --ignored --nocapture
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.regtest.yml down -v

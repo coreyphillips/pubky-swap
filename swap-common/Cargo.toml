@@ -1,0 +1,37 @@
+[package]
+name = "swap-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared types for the pubky-swap marketplace: wire messages, swap state machine, and HTLC scripts"
+
+[dependencies]
+bitcoin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+hex.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# `time` for the fee-bump loop; `rt`/`rt-multi-thread` for `chain::blocking` (block_in_place).
+tokio = { version = "1", features = ["time", "rt", "rt-multi-thread"] }
+
+# Electrum-backed chain watcher (feature `electrum`). Kept optional so the default build
+# pulls no networking stack.
+electrum-client = { version = "0.18", optional = true }
+# BDK funding wallet (feature `bdk-wallet`). Optional so the default build stays light.
+bdk = { version = "0.30", features = ["all-keys", "keys-bip39"], optional = true }
+
+[dev-dependencies]
+# Enables Transaction::verify (libbitcoinconsensus) so tests validate the claim/refund
+# witnesses against real Bitcoin script consensus rules. Test builds only.
+bitcoin = { version = "0.30", features = ["bitcoinconsensus"] }
+# The async runtime for `#[tokio::test]` (fee-bump loop tests).
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+
+[features]
+default = []
+electrum = ["dep:electrum-client"]
+bdk-wallet = ["dep:bdk"]

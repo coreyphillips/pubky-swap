@@ -1,0 +1,99 @@
+# Full regtest backplane (bitcoind + electrs + two LND nodes) matching the integration tests'
+# defaults:
+#   - bitcoind RPC on :43782 (polaruser / polarpass), container named "bitcoin"
+#   - electrs Electrum RPC on :60001
+#   - LND "A" (provider) gRPC on :10011, LND "B" (client) gRPC on :10012
+#
+# Bring it up + open a funded channel:
+#   docker compose -f docker-compose.regtest.yml up -d
+#   ./scripts/setup-regtest-lnd.sh
+# Then run the integration tests (see scripts/setup-regtest-lnd.sh output / CONTRIBUTING.md).
+# Tear down:  docker compose -f docker-compose.regtest.yml down -v
+#
+# NOTE: container names ("bitcoin", "lnd-a", "lnd-b") are fixed so the tests' `docker exec` and the
+# setup script can find them — this will conflict with an already-running Polar/regtest stack using
+# the same names. Image versions may need adjusting for your environment.
+
+services:
+  bitcoin:
+    image: polarlightning/bitcoind:27.0
+    container_name: bitcoin
+    command:
+      - bitcoind
+      - -regtest
+      - -server
+      - -txindex
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcport=43782
+      - -rpcuser=polaruser
+      - -rpcpassword=polarpass
+      - -fallbackfee=0.0002
+      - -zmqpubrawblock=tcp://0.0.0.0:28334
+      - -zmqpubrawtx=tcp://0.0.0.0:28335
+    ports:
+      - "43782:43782"
+
+  electrs:
+    image: ghcr.io/vulpemventures/electrs:latest
+    container_name: electrs
+    depends_on:
+      - bitcoin
+    command:
+      - --network=regtest
+      - --daemon-rpc-addr=bitcoin:43782
+      - --cookie=polaruser:polarpass
+      - --electrum-rpc-addr=0.0.0.0:60001
+      - --http-addr=0.0.0.0:3002
+      - --jsonrpc-import
+      - -vvv
+    ports:
+      - "60001:60001"
+
+  lnd-a:
+    image: polarlightning/lnd:0.18.5-beta
+    container_name: lnd-a
+    depends_on:
+      - bitcoin
+    command:
+      - lnd
+      - --noseedbackup
+      - --alias=lnd-a
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoin:43782
+      - --bitcoind.rpcuser=polaruser
+      - --bitcoind.rpcpass=polarpass
+      - --bitcoind.zmqpubrawblock=tcp://bitcoin:28334
+      - --bitcoind.zmqpubrawtx=tcp://bitcoin:28335
+      - --rpclisten=0.0.0.0:10009
+      - --listen=0.0.0.0:9735
+      - --tlsextradomain=localhost
+      - --tlsextraip=127.0.0.1
+    ports:
+      - "10011:10009"
+
+  lnd-b:
+    image: polarlightning/lnd:0.18.5-beta
+    container_name: lnd-b
+    depends_on:
+      - bitcoin
+    command:
+      - lnd
+      - --noseedbackup
+      - --alias=lnd-b
+      - --bitcoin.active
+      - --bitcoin.regtest
+      - --bitcoin.node=bitcoind
+      - --bitcoind.rpchost=bitcoin:43782
+      - --bitcoind.rpcuser=polaruser
+      - --bitcoind.rpcpass=polarpass
+      - --bitcoind.zmqpubrawblock=tcp://bitcoin:28334
+      - --bitcoind.zmqpubrawtx=tcp://bitcoin:28335
+      - --rpclisten=0.0.0.0:10009
+      - --listen=0.0.0.0:9735
+      - --tlsextradomain=localhost
+      - --tlsextraip=127.0.0.1
+    ports:
+      - "10012:10009"

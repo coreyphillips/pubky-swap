@@ -1,0 +1,27 @@
+[package]
+# Named `lightning-backend` to avoid confusion with LDK's `lightning` crate.
+name = "lightning-backend"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lightning node backend abstraction for pubky-swap (LND first; CLN later)"
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+
+# Real LND gRPC backend (feature `lnd`). Kept optional so the default build needs no
+# protoc/cmake toolchain; enable with `--features lnd`.
+fedimint-tonic-lnd = { version = "0.4", optional = true }
+tokio = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
+# fedimint-tonic-lnd uses rustls 0.23, which needs a CryptoProvider installed at runtime.
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+
+[features]
+default = []
+lnd = ["dep:fedimint-tonic-lnd", "dep:tokio", "dep:hex", "dep:rustls"]
+
+[dev-dependencies]
+tokio = { workspace = true }
