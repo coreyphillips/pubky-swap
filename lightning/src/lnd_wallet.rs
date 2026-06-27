@@ -1,18 +1,17 @@
-//! An [`OnchainWallet`] backed by LND's own on-chain wallet (feature `lnd`).
+//! An [`OnchainWallet`](swap_common::wallet::OnchainWallet) backed by LND's own on-chain wallet
+//! (feature `lnd`).
 //!
-//! Instead of a separate BDK wallet + seed, the provider funds reverse-swap HTLCs straight from
-//! LND's on-chain balance and sweeps claims/refunds back into it. The claim/refund transactions are
-//! still built and signed by the swap engine (they spend via the HTLC branch keys, not LND's keys);
-//! LND is only used for the plain funding send and to supply a sweep address.
+//! Lets a provider (or client) fund HTLCs and sweep claims/refunds from its LND node's on-chain
+//! balance instead of a separate BDK seed. The claim/refund transactions are still built and signed
+//! by the swap engine (they spend via the HTLC branch keys, not LND's keys); LND only does the
+//! plain funding send and supplies a sweep address.
 //!
 //! `OnchainWallet` is synchronous but LND's gRPC is async, so calls are bridged onto the running
 //! Tokio runtime: the future is `spawn`ed and the (blocking) trait method waits on a channel. This
-//! is safe because the drivers already invoke wallet methods via `chain::run_blocking`
-//! (`block_in_place`), so blocking the calling worker doesn't stall the runtime.
+//! is safe because the drivers invoke wallet methods via `chain::run_blocking` (`block_in_place`).
 
-use anyhow::anyhow;
+use crate::{LndBackend, LndConfig};
 use bitcoin::{Address, OutPoint, ScriptBuf, Transaction};
-use lightning_backend::{LndBackend, LndConfig};
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -31,18 +30,17 @@ pub struct LndWallet {
 impl LndWallet {
     /// Connect to LND and cache a sweep address. `fee_rate_sat_vb` is the rate used for HTLC
     /// funding sends.
-    pub async fn connect(config: LndConfig, fee_rate_sat_vb: u64) -> anyhow::Result<Self> {
+    pub async fn connect(
+        config: LndConfig,
+        fee_rate_sat_vb: u64,
+    ) -> std::result::Result<Self, String> {
         let backend = Arc::new(
             LndBackend::connect(config)
                 .await
-                .map_err(|e| anyhow!("LND connect: {e}"))?,
+                .map_err(|e| e.to_string())?,
         );
-        let addr = backend
-            .new_address()
-            .await
-            .map_err(|e| anyhow!("LND new_address: {e}"))?;
-        let receive_spk =
-            parse_address_spk(&addr).map_err(|e| anyhow!("LND sweep address: {e}"))?;
+        let addr = backend.new_address().await.map_err(|e| e.to_string())?;
+        let receive_spk = parse_address_spk(&addr)?;
         Ok(Self {
             backend,
             receive_spk,
@@ -73,8 +71,7 @@ impl OnchainWallet for LndWallet {
         self.receive_spk.clone()
     }
 
-    // cpfp_bump uses the trait default (None): claim/refund are RBF-bumped by the swap engine; a
-    // CPFP path via LND's BumpFee is a possible future addition.
+    // cpfp_bump uses the trait default (None): claim/refund are RBF-bumped by the swap engine.
 }
 
 /// Parse an LND-supplied address into its scriptPubKey, trusting the node's own network.
@@ -156,16 +153,15 @@ mod tests {
         let op = funding_outpoint(&tx, &spk).expect("must find the output");
         assert_eq!(op.vout, 1);
         assert_eq!(op.txid, tx.txid());
-        // A script we didn't pay isn't found.
         let missing = ScriptBuf::from_hex("0014ffffffffffffffffffffffffffffffffffffffff").unwrap();
         assert!(funding_outpoint(&tx, &missing).is_none());
     }
 
     #[test]
     fn sat_per_kw_conversion_and_floor() {
-        assert_eq!(sat_per_kw(10), 2500); // 10 sat/vB -> 2500 sat/kw
+        assert_eq!(sat_per_kw(10), 2500);
         assert_eq!(sat_per_kw(5), 1250);
-        assert_eq!(sat_per_kw(1), 253); // 250 < 253 floor
+        assert_eq!(sat_per_kw(1), 253);
         assert_eq!(sat_per_kw(0), 253);
     }
 }

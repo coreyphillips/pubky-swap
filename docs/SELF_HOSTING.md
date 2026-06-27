@@ -159,6 +159,18 @@ Notes:
 The client needs its **own** LND (to pay/issue invoices) and chain access; the flags mirror the
 provider's. Build with `--features full`.
 
+**Check a provider first.** `--quote-only` requests a quote and prints the provider's
+availability/rates without swapping — handy to confirm a pubky is a live provider:
+
+```bash
+cargo run -p swap-client --features full -- <PROVIDER_PUBKY> \
+  --recovery-phrase "<client pubky phrase>" --direction reverse --amount 50000 --quote-only
+```
+
+**Seedless with `--wallet lnd`.** Like the provider, the client can fund submarine HTLCs and receive
+reverse-swap sweeps via **LND's own wallet** — no `--wallet-mnemonic` and no `--claim-address`
+needed. Add `--wallet lnd` to either command below (and drop those two flags).
+
 **Reverse swap** (you receive on-chain BTC for Lightning):
 
 ```bash

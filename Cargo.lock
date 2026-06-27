@@ -1511,9 +1511,11 @@ name = "lightning-backend"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bitcoin",
  "fedimint-tonic-lnd",
  "hex",
  "rustls 0.23.41",
+ "swap-common",
  "thiserror 1.0.69",
  "tokio",
 ]
