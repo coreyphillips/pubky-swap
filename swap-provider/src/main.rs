@@ -76,6 +76,11 @@ struct Cli {
     /// Directory for persisted in-flight swap state (so a restart can resume swaps).
     #[arg(long, default_value = "./pubky-swap-data")]
     data_dir: String,
+
+    /// On-chain funding wallet: `lnd` (fund from your LND node's own wallet — no separate seed) or
+    /// `bdk` (a separate BIP84 wallet from --wallet-mnemonic).
+    #[arg(long, default_value = "bdk")]
+    wallet: String,
 }
 
 #[tokio::main]
@@ -123,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         allow_unsafe: cli.allow_unsafe,
         quote_ttl_secs: cli.quote_ttl,
         data_dir: cli.data_dir,
+        wallet_backend: cli.wallet,
     };
 
     run(config).await

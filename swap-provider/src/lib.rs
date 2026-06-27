@@ -8,6 +8,8 @@
 //! sending the client a final `SwapStatusUpdate`. Without those pieces it stays
 //! negotiation-only and rejects `SwapRequest`s.
 
+#[cfg(feature = "lnd")]
+pub mod lnd_wallet;
 pub mod reverse;
 pub mod store;
 pub mod submarine;
@@ -74,6 +76,9 @@ pub struct ProviderConfig {
     pub quote_ttl_secs: u64,
     /// Directory for persisted in-flight swap state (so a restart can resume them).
     pub data_dir: String,
+    /// On-chain funding wallet backend: `"lnd"` (fund from LND's own wallet, no seed) or `"bdk"`
+    /// (a separate BIP84 wallet from `wallet_mnemonic`).
+    pub wallet_backend: String,
 }
 
 impl Default for ProviderConfig {
@@ -102,6 +107,7 @@ impl Default for ProviderConfig {
             allow_unsafe: false,
             quote_ttl_secs: 300,
             data_dir: "./pubky-swap-data".to_string(),
+            wallet_backend: "bdk".to_string(),
         }
     }
 }
@@ -304,7 +310,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     };
 
     let chain = build_chain(&config);
-    let wallet = build_wallet(&config);
+    let wallet = build_wallet(&config).await;
 
     let capable = ln_ready && chain.is_some() && wallet.is_some();
     if capable {
@@ -421,8 +427,39 @@ fn build_chain(_config: &ProviderConfig) -> Option<Arc<dyn ChainWatcher>> {
     None
 }
 
+/// Build the on-chain funding wallet. `wallet_backend = "lnd"` funds from LND's own on-chain
+/// balance (no separate seed); anything else uses the BDK wallet from `--wallet-mnemonic`.
+async fn build_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
+    if config.wallet_backend == "lnd" {
+        build_lnd_wallet(config).await
+    } else {
+        build_bdk_wallet(config)
+    }
+}
+
+#[cfg(feature = "lnd")]
+async fn build_lnd_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
+    let lnd_config = LndConfig {
+        address: config.lnd_address.clone(),
+        tls_cert_path: config.lnd_cert_path.clone(),
+        macaroon_path: config.lnd_macaroon_path.clone(),
+    };
+    match crate::lnd_wallet::LndWallet::connect(lnd_config, config.onchain_fee_rate_sat_vb).await {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            warn!("LND on-chain wallet unavailable: {e}");
+            None
+        }
+    }
+}
+#[cfg(not(feature = "lnd"))]
+async fn build_lnd_wallet(_config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
+    warn!("wallet-backend 'lnd' requires the `lnd` feature");
+    None
+}
+
 #[cfg(feature = "bdk-wallet")]
-fn build_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
+fn build_bdk_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
     if config.wallet_mnemonic.is_empty() || config.electrum_url.is_empty() {
         return None;
     }
@@ -441,7 +478,7 @@ fn build_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
     }
 }
 #[cfg(not(feature = "bdk-wallet"))]
-fn build_wallet(_config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
+fn build_bdk_wallet(_config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
     None
 }
 

@@ -99,25 +99,23 @@ async fn full_reverse_swap_two_nodes() {
     );
     let chain_p: Arc<dyn ChainWatcher> = Arc::new(ElectrumWatcher::new(&electrum).unwrap());
     let chain_c: Arc<dyn ChainWatcher> = Arc::new(ElectrumWatcher::new(&electrum).unwrap());
-    let wallet: Arc<dyn OnchainWallet> = Arc::new(
-        BdkWallet::from_mnemonic(
-            &env("WALLET_MNEMONIC", MNEMONIC),
-            Network::Regtest,
-            &electrum,
-            5.0,
+    // Funding wallet: BDK by default, or LND's own on-chain wallet with WALLET_BACKEND=lnd (which
+    // exercises swap_provider::lnd_wallet::LndWallet — funds from the provider LND's balance).
+    let wallet: Arc<dyn OnchainWallet> = if env("WALLET_BACKEND", "bdk") == "lnd" {
+        Arc::new(
+            swap_provider::lnd_wallet::LndWallet::connect(lnd_cfg("A"), 5)
+                .await
+                .expect("connect LND on-chain wallet"),
         )
-        .expect("build funding wallet"),
-    );
-
-    // Make sure the provider wallet has coins to fund the HTLC.
-    {
+    } else {
         let bdk = BdkWallet::from_mnemonic(
             &env("WALLET_MNEMONIC", MNEMONIC),
             Network::Regtest,
             &electrum,
             5.0,
         )
-        .unwrap();
+        .expect("build funding wallet");
+        // Make sure the BDK wallet has coins to fund the HTLC.
         if bdk.balance().unwrap() < AMOUNT_SAT + 50_000 {
             let deposit = bdk.deposit_address().unwrap().to_string();
             cli(&["sendtoaddress", &deposit, "0.5"]);
@@ -129,7 +127,8 @@ async fn full_reverse_swap_two_nodes() {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
-    }
+        Arc::new(bdk)
+    };
 
     // Shared swap secrets / keys.
     let secp = bitcoin::secp256k1::Secp256k1::new();
