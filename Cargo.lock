@@ -2144,6 +2144,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "futures",
+ "mainline",
  "pkarr",
  "pubky-messenger",
  "serde",
