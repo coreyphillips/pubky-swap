@@ -22,6 +22,9 @@ pub mod rendezvous;
 #[cfg(feature = "iroh")]
 pub mod p2p;
 
+#[cfg(feature = "iroh")]
+pub mod identity;
+
 #[derive(Error, Debug)]
 pub enum TransportError {
     #[error("transport error: {0}")]

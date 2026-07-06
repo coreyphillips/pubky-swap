@@ -60,6 +60,11 @@ struct Cli {
     /// Only check the provider (request a quote and print its rates), then exit without swapping.
     #[arg(long)]
     quote_only: bool,
+
+    /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating, so a provider that
+    /// isn't already following us starts polling us. Requires a build with `--features iroh`.
+    #[arg(long)]
+    rendezvous_iroh: bool,
 }
 
 fn parse_direction(s: &str) -> anyhow::Result<SwapDirection> {
@@ -109,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
         max_routing_fee_msat: cli.max_routing_fee_msat,
         quote_only: cli.quote_only,
+        rendezvous_iroh: cli.rendezvous_iroh,
     };
 
     run(config).await

@@ -55,6 +55,9 @@ pub struct ClientConfig {
     pub max_routing_fee_msat: u64,
     /// Only request a quote (to check a provider's availability/rates) and exit without swapping.
     pub quote_only: bool,
+    /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating, so a provider that
+    /// isn't already following us starts polling us for the swap DM. Requires the `iroh` feature.
+    pub rendezvous_iroh: bool,
 }
 
 pub fn parse_network(s: &str) -> Result<Network> {
@@ -81,6 +84,10 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     let client_pkarr = transport.public_key_string();
     info!("Client pubky: {client_pkarr}");
     transport.add_known_peer(config.provider_pkarr.clone());
+
+    // Optionally ring the provider's iroh doorbell so a provider that isn't already following us
+    // starts polling us for the swap DM below.
+    maybe_ring_provider(&config).await;
 
     // For reverse swaps the client owns the preimage and the on-chain claim key.
     let secp = Secp256k1::new();
@@ -331,6 +338,38 @@ async fn run_submarine(
     let state = execute_submarine_swap(ln, chain, wallet, funding, Duration::from_secs(2)).await?;
     info!("Submarine swap finished: {state:?}");
     Ok(())
+}
+
+/// Ring the provider's iroh rendezvous (doorbell) so it starts polling us, when enabled and built
+/// with the `iroh` feature. Best-effort: a failure just falls back to relying on the provider
+/// already following us.
+#[cfg(feature = "iroh")]
+async fn maybe_ring_provider(config: &ClientConfig) {
+    if !config.rendezvous_iroh {
+        return;
+    }
+    let secret = match pubky_transport::identity::secret_from_recovery(
+        &config.recovery_method,
+        &config.recovery_value,
+        &config.passphrase,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("iroh rendezvous disabled: {e}");
+            return;
+        }
+    };
+    match pubky_transport::p2p::ring_provider(secret, &config.provider_pkarr).await {
+        Ok(()) => info!("Rang provider iroh doorbell; it should start polling us"),
+        Err(e) => warn!("iroh rendezvous ring failed ({e}); relying on the provider following us"),
+    }
+}
+
+#[cfg(not(feature = "iroh"))]
+async fn maybe_ring_provider(config: &ClientConfig) {
+    if config.rendezvous_iroh {
+        warn!("--rendezvous-iroh set but this build lacks the `iroh` feature; ignoring");
+    }
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {

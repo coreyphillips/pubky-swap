@@ -16,6 +16,9 @@ bdk-wallet = ["swap-common/bdk-wallet"]
 chain = ["swap-common/electrum"]
 # Everything needed to actually execute swaps end-to-end.
 full = ["lnd", "bdk-wallet", "chain"]
+# Learn interested client pubkys over the iroh P2P rendezvous (doorbell) instead of only the
+# follow graph. See pubky-transport's `p2p` module.
+iroh = ["pubky-transport/iroh"]
 
 [dependencies]
 pubky-transport.workspace = true

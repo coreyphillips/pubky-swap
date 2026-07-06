@@ -82,6 +82,10 @@ pub struct ProviderConfig {
     /// follow graph do not grow without bound. `0` disables idle reaping. Peers are also evicted
     /// as soon as their swap completes, regardless of this value.
     pub peer_idle_ttl_secs: u64,
+    /// Accept iroh P2P rendezvous connections (the "doorbell"): a client that knows our pubky can
+    /// connect and be added to the poll set without a pre-existing follow. Requires the `iroh`
+    /// build feature.
+    pub rendezvous_iroh: bool,
 }
 
 impl Default for ProviderConfig {
@@ -112,6 +116,7 @@ impl Default for ProviderConfig {
             data_dir: "./pubky-swap-data".to_string(),
             wallet_backend: "bdk".to_string(),
             peer_idle_ttl_secs: 3600,
+            rendezvous_iroh: false,
         }
     }
 }
@@ -357,6 +362,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     spawn_reorg_monitor(&ctx);
     // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
     spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
+    // Accept iroh rendezvous connections (the doorbell), if enabled and built with `--features iroh`.
+    maybe_spawn_iroh_rendezvous(&ctx, &config);
 
     let offer = build_offer(&config, &provider_pkarr, network);
     info!(
@@ -955,6 +962,51 @@ fn resume_swaps(ctx: &ExecCtx) {
                 Err(e) => warn!("cannot resume submarine swap {swap_id}: {e}"),
             },
         }
+    }
+}
+
+/// Start accepting iroh rendezvous (doorbell) connections when enabled and built with the `iroh`
+/// feature: a client that knows our pubky connects, and its authenticated pubky is added to the
+/// poll set (unpinned, so eviction still applies) so the swap can proceed over pubky-DM.
+#[cfg(feature = "iroh")]
+fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig) {
+    if !config.rendezvous_iroh {
+        return;
+    }
+    let secret = match pubky_transport::identity::secret_from_recovery(
+        &config.recovery_method,
+        &config.recovery_value,
+        &config.passphrase,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("iroh rendezvous disabled: {e}");
+            return;
+        }
+    };
+    let transport = ctx.transport.clone();
+    tokio::spawn(async move {
+        match pubky_transport::p2p::RendezvousServer::bind(secret).await {
+            Ok(mut server) => {
+                match server.pubky() {
+                    Ok(pk) => info!("iroh rendezvous online (doorbell) as {pk}"),
+                    Err(_) => info!("iroh rendezvous online (doorbell)"),
+                }
+                while let Some(pubky) = server.next_peer().await {
+                    info!("iroh rendezvous: {pubky} connected; polling it for a swap request");
+                    transport.add_known_peer(pubky);
+                }
+                warn!("iroh rendezvous accept loop ended");
+            }
+            Err(e) => warn!("iroh rendezvous failed to start: {e}"),
+        }
+    });
+}
+
+#[cfg(not(feature = "iroh"))]
+fn maybe_spawn_iroh_rendezvous(_ctx: &ExecCtx, config: &ProviderConfig) {
+    if config.rendezvous_iroh {
+        warn!("--rendezvous-iroh set but this build lacks the `iroh` feature; ignoring");
     }
 }
 

@@ -16,6 +16,8 @@ chain = ["swap-common/electrum"]
 bdk-wallet = ["swap-common/bdk-wallet"]
 # Everything needed to execute a swap end-to-end from the CLI.
 full = ["lnd", "chain", "bdk-wallet"]
+# Ring the provider's iroh P2P rendezvous (doorbell) so it starts polling us for the swap DM.
+iroh = ["pubky-transport/iroh"]
 
 [dependencies]
 pubky-transport.workspace = true
