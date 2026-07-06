@@ -81,6 +81,12 @@ struct Cli {
     /// `bdk` (a separate BIP84 wallet from --wallet-mnemonic).
     #[arg(long, default_value = "bdk")]
     wallet: String,
+
+    /// Seconds of inactivity before an unpinned peer (a client that never completed a swap) is
+    /// evicted from the poll set and unfollowed. 0 disables idle reaping. Peers are evicted
+    /// immediately on swap completion regardless of this value.
+    #[arg(long, default_value_t = 3600)]
+    peer_idle_ttl: u64,
 }
 
 #[tokio::main]
@@ -129,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
         quote_ttl_secs: cli.quote_ttl,
         data_dir: cli.data_dir,
         wallet_backend: cli.wallet,
+        peer_idle_ttl_secs: cli.peer_idle_ttl,
     };
 
     run(config).await

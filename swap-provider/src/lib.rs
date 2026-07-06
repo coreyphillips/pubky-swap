@@ -77,6 +77,11 @@ pub struct ProviderConfig {
     /// On-chain funding wallet backend: `"lnd"` (fund from LND's own wallet, no seed) or `"bdk"`
     /// (a separate BIP84 wallet from `wallet_mnemonic`).
     pub wallet_backend: String,
+    /// Seconds of inactivity after which an unpinned peer (a client that contacted us but never
+    /// reached a terminal swap) is evicted from the poll set and unfollowed, so the poll set and
+    /// follow graph do not grow without bound. `0` disables idle reaping. Peers are also evicted
+    /// as soon as their swap completes, regardless of this value.
+    pub peer_idle_ttl_secs: u64,
 }
 
 impl Default for ProviderConfig {
@@ -106,6 +111,7 @@ impl Default for ProviderConfig {
             quote_ttl_secs: 300,
             data_dir: "./pubky-swap-data".to_string(),
             wallet_backend: "bdk".to_string(),
+            peer_idle_ttl_secs: 3600,
         }
     }
 }
@@ -349,6 +355,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     resume_swaps(&ctx);
     // Watch for chain reorganizations affecting in-flight swaps.
     spawn_reorg_monitor(&ctx);
+    // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
+    spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
 
     let offer = build_offer(&config, &provider_pkarr, network);
     info!(
@@ -708,6 +716,7 @@ fn spawn_reverse_driver(ctx: &ExecCtx, swap: ReverseSwap, record: SwapRecord) {
             warn!("failed to remove swap {swap_id} from store: {e}");
         }
         send_final_status(&ctx2.transport, &peer, swap_id, result).await;
+        evict_peer_if_idle(&ctx2, &peer).await;
     });
 }
 
@@ -835,6 +844,7 @@ fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord
             warn!("failed to remove swap {swap_id} from store: {e}");
         }
         send_final_status(&ctx2.transport, &peer, swap_id, result).await;
+        evict_peer_if_idle(&ctx2, &peer).await;
     });
 }
 
@@ -946,6 +956,49 @@ fn resume_swaps(ctx: &ExecCtx) {
             },
         }
     }
+}
+
+/// Evict a peer from the poll set (and best-effort unfollow it) once it has no remaining active
+/// swaps, so the provider stops polling and following counterparties after their swaps finish.
+/// This keeps the poll set and the persistent follow graph bounded. A returning client must be
+/// re-discovered (e.g. via DHT rendezvous) to be polled again.
+async fn evict_peer_if_idle(ctx: &ExecCtx, peer: &str) {
+    let still_active = match ctx.store.load_active() {
+        Ok(recs) => recs.iter().any(|r| r.peer == peer),
+        // On a store error, keep the peer rather than risk evicting one mid-swap.
+        Err(e) => {
+            warn!("could not check active swaps before evicting {peer}: {e}");
+            true
+        }
+    };
+    if still_active {
+        return;
+    }
+    ctx.transport.evict_peer(peer).await;
+    info!("Evicted peer {peer} (no active swaps remaining)");
+}
+
+/// Periodically evict idle, unpinned peers: clients that contacted us but never reached a
+/// terminal swap state (e.g. requested a quote and vanished). Peers that complete a swap are
+/// evicted immediately by [`evict_peer_if_idle`]; this reaper only catches abandoned ones.
+/// Operator-curated follows are pinned and never idle-reaped.
+fn spawn_peer_reaper(ctx: &ExecCtx, idle_ttl: Duration) {
+    if idle_ttl.is_zero() {
+        return;
+    }
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        // Check periodically, bounded so a small TTL stays responsive without busy-looping.
+        let interval = idle_ttl
+            .min(Duration::from_secs(60))
+            .max(Duration::from_secs(1));
+        loop {
+            sleep(interval).await;
+            for peer in ctx.transport.idle_unpinned_peers(idle_ttl) {
+                evict_peer_if_idle(&ctx, &peer).await;
+            }
+        }
+    });
 }
 
 async fn send_final_status(
