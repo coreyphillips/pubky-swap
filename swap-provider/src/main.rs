@@ -62,6 +62,28 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     electrum_timeout_secs: u8,
 
+    /// Lightning backend: `lnd` (gRPC to your own node) or `beignet` (HTTP to a beignet daemon).
+    #[arg(long, default_value = "lnd")]
+    lightning: String,
+
+    /// Base URL of a beignet daemon.
+    #[arg(long, default_value = "http://127.0.0.1:2112")]
+    beignet_url: String,
+
+    /// Bearer token for the beignet daemon. Prefer the BEIGNET_API_TOKEN environment variable:
+    /// a token passed on the command line is visible to anything that can read the process table,
+    /// and this one authorises spending.
+    #[arg(long, default_value = "", env = "BEIGNET_API_TOKEN")]
+    beignet_token: String,
+
+    /// PEM root certificate for the beignet daemon, if it was started with --tls-cert.
+    #[arg(long, default_value = "")]
+    beignet_tls_cert: String,
+
+    /// API prefix for the beignet daemon, e.g. /v1.
+    #[arg(long, default_value = "")]
+    beignet_api_prefix: String,
+
     /// Electrum server URL for the chain watcher / funding wallet (e.g. tcp://127.0.0.1:60001).
     #[arg(long, default_value = "")]
     electrum_url: String,
@@ -118,8 +140,9 @@ struct Cli {
     #[arg(long, default_value = "./pubky-swap-data")]
     data_dir: String,
 
-    /// On-chain funding wallet: `lnd` (fund from your LND node's own wallet — no separate seed) or
-    /// `bdk` (a separate BIP84 wallet from --wallet-mnemonic).
+    /// On-chain funding wallet: `lnd` (your LND node's own wallet, no separate seed),
+    /// `beignet` (a beignet daemon's wallet), or `bdk` (a separate BIP84 wallet from
+    /// --wallet-mnemonic).
     #[arg(long, default_value = "bdk")]
     wallet: String,
 
@@ -176,9 +199,14 @@ async fn main() -> anyhow::Result<()> {
         max_new_swaps_per_peer_per_hour: cli.max_new_swaps_per_peer_per_hour,
         directions: parse_directions(&cli.directions)?,
         broadcast_offer: cli.broadcast_offer,
+        lightning_backend: cli.lightning,
         lnd_address: cli.lnd_address,
         lnd_cert_path: cli.lnd_cert,
         lnd_macaroon_path: cli.lnd_macaroon,
+        beignet_url: cli.beignet_url,
+        beignet_token: cli.beignet_token,
+        beignet_tls_cert: cli.beignet_tls_cert,
+        beignet_api_prefix: cli.beignet_api_prefix,
         electrum_url: cli.electrum_url,
         electrum_socks5: cli.electrum_socks5,
         electrum_timeout_secs: cli.electrum_timeout_secs,

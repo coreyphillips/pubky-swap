@@ -12,6 +12,8 @@ default = []
 lnd = ["lightning-backend/lnd"]
 # Enable the Electrum chain watcher (to watch/claim/refund the HTLC on-chain).
 chain = ["swap-common/electrum"]
+# Use a beignet daemon for Lightning and/or the on-chain wallet. Needs no protoc.
+beignet = ["dep:beignet-backend"]
 # Enable the BDK funding wallet (to fund the HTLC in a submarine swap).
 bdk-wallet = ["swap-common/bdk-wallet"]
 # Everything needed to execute a swap end-to-end from the CLI.
@@ -23,6 +25,7 @@ iroh = ["pubky-transport/iroh"]
 pubky-transport.workspace = true
 swap-common.workspace = true
 lightning-backend.workspace = true
+beignet-backend = { workspace = true, optional = true }
 bitcoin.workspace = true
 tokio.workspace = true
 clap.workspace = true

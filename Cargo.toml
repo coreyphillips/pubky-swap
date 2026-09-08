@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "beignet-backend",
     "pubky-transport",
     "swap-common",
     "lightning",
@@ -40,7 +41,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # CLI / logging
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -48,4 +49,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pubky-transport = { path = "pubky-transport" }
 swap-common = { path = "swap-common" }
 lightning-backend = { path = "lightning" }
+beignet-backend = { path = "beignet-backend" }
 swap-client = { path = "swap-client" }
