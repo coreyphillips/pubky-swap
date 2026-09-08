@@ -46,6 +46,26 @@ struct Cli {
     #[arg(long, default_value_t = 30)]
     electrum_timeout_secs: u8,
 
+    /// Lightning backend: `lnd` (gRPC to your own node) or `beignet` (HTTP to a beignet daemon).
+    #[arg(long, default_value = "lnd")]
+    lightning: String,
+
+    /// Base URL of a beignet daemon.
+    #[arg(long, default_value = "http://127.0.0.1:2112")]
+    beignet_url: String,
+
+    /// Bearer token for the beignet daemon. Prefer the BEIGNET_API_TOKEN environment variable.
+    #[arg(long, default_value = "", env = "BEIGNET_API_TOKEN")]
+    beignet_token: String,
+
+    /// PEM root certificate for the beignet daemon, if it was started with --tls-cert.
+    #[arg(long, default_value = "")]
+    beignet_tls_cert: String,
+
+    /// API prefix for the beignet daemon, e.g. /v1.
+    #[arg(long, default_value = "")]
+    beignet_api_prefix: String,
+
     /// Electrum server URL for watching/claiming the on-chain HTLC.
     #[arg(long, default_value = "")]
     electrum_url: String,
@@ -55,8 +75,9 @@ struct Cli {
     /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
     #[arg(long, default_value = "")]
     wallet_mnemonic: String,
-    /// On-chain wallet: `lnd` (fund/claim via your own LND node — no seed or claim address) or
-    /// `bdk` (a separate BIP84 wallet from --wallet-mnemonic, with --claim-address for reverse).
+    /// On-chain wallet: `lnd` (your LND node's own wallet), `beignet` (a beignet daemon's
+    /// wallet), or `bdk` (a separate BIP84 wallet from --wallet-mnemonic). `lnd` and `beignet`
+    /// need no --claim-address.
     #[arg(long, default_value = "bdk")]
     wallet: String,
     /// Fee rate (sat/vB) for the claim transaction.
@@ -133,6 +154,11 @@ async fn main() -> anyhow::Result<()> {
         provider_pkarr: cli.provider,
         direction: parse_direction(&cli.direction)?,
         amount_sat: cli.amount,
+        lightning_backend: cli.lightning,
+        beignet_url: cli.beignet_url,
+        beignet_token: cli.beignet_token,
+        beignet_tls_cert: cli.beignet_tls_cert,
+        beignet_api_prefix: cli.beignet_api_prefix,
         lnd_address: cli.lnd_address,
         lnd_cert_path: cli.lnd_cert,
         lnd_macaroon_path: cli.lnd_macaroon,

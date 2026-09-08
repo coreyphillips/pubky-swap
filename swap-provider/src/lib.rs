@@ -18,6 +18,8 @@ pub mod submarine;
 pub mod wallet;
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "beignet")]
+use beignet_backend::BeignetLightningBackend;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Network, OutPoint, PublicKey, Txid};
 #[cfg(feature = "lnd")]
@@ -75,9 +77,20 @@ pub struct ProviderConfig {
     pub directions: Vec<SwapDirection>,
     /// Push the offer to all discovered followers on startup.
     pub broadcast_offer: bool,
+    /// Which Lightning backend to use: `"lnd"` or `"beignet"`.
+    pub lightning_backend: String,
     pub lnd_address: String,
     pub lnd_cert_path: String,
     pub lnd_macaroon_path: String,
+    /// Base URL of a beignet daemon, e.g. `http://127.0.0.1:2112`.
+    pub beignet_url: String,
+    /// Bearer token for that daemon. Prefer the environment over a flag: an argv value is
+    /// visible to anything that can read the process table.
+    pub beignet_token: String,
+    /// PEM root certificate, when the daemon was started with `--tls-cert`.
+    pub beignet_tls_cert: String,
+    /// Optional `/v1` API prefix.
+    pub beignet_api_prefix: String,
     /// SOCKS5 proxy for Electrum, e.g. `127.0.0.1:9050`. Required to reach a `.onion`
     /// server; empty means a direct connection.
     pub electrum_socks5: String,
@@ -136,9 +149,14 @@ impl Default for ProviderConfig {
             max_new_swaps_per_peer_per_hour: 6,
             directions: vec![SwapDirection::Submarine, SwapDirection::Reverse],
             broadcast_offer: false,
+            lightning_backend: "lnd".to_string(),
             lnd_address: "https://127.0.0.1:10009".to_string(),
             lnd_cert_path: String::new(),
             lnd_macaroon_path: String::new(),
+            beignet_url: "http://127.0.0.1:2112".to_string(),
+            beignet_token: String::new(),
+            beignet_tls_cert: String::new(),
+            beignet_api_prefix: String::new(),
             electrum_socks5: String::new(),
             electrum_timeout_secs: 30,
             electrum_url: String::new(),
@@ -586,6 +604,9 @@ fn spawn_record_pruner(ctx: &ExecCtx) {
 
 /// Run the provider daemon.
 pub async fn run(config: ProviderConfig) -> Result<()> {
+    // Mutable so a backend capability probe can narrow the advertised directions.
+    #[cfg_attr(not(feature = "beignet"), allow(unused_mut))]
+    let mut config = config;
     let network = parse_network(&config.network)?;
     // Refuse to start with unsafe mainnet parameters (guards programmatic callers too).
     validate_timelocks(&config)?;
@@ -637,8 +658,33 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         }
     };
 
+    // Ask a beignet daemon what it is and what it can do, before advertising anything. A
+    // network mismatch or a competing swap role aborts here rather than surfacing mid-swap.
+    let beignet = beignet_preflight(&config, network).await?;
+
     let chain = build_chain(&config);
-    let wallet = build_wallet(&config).await;
+    let wallet = build_wallet(&config, chain.clone()).await;
+
+    // Reverse swaps need a hold invoice whose final CLTV outlives the on-chain refund. A beignet
+    // that cannot set one cannot serve them safely, so drop the direction rather than advertising
+    // something we would have to refuse after a counterparty's payment is already held.
+    #[cfg(feature = "beignet")]
+    if let Some(p) = &beignet {
+        if !p.can_serve_reverse_swaps() && config.directions.contains(&SwapDirection::Reverse) {
+            warn!(
+                "this beignet cannot set a hold invoice's final CLTV expiry, so reverse swaps \
+                 will not be advertised (see beignet#744). Submarine swaps are unaffected."
+            );
+            config.directions.retain(|d| *d != SwapDirection::Reverse);
+            if config.directions.is_empty() {
+                return Err(anyhow!(
+                    "reverse swaps are the only configured direction, and this beignet cannot \
+                     serve them safely; configure submarine swaps or use an LND backend"
+                ));
+            }
+        }
+    }
+    let _ = &beignet;
 
     let capable = ln_ready && chain.is_some() && wallet.is_some();
     if capable {
@@ -752,9 +798,76 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     }
 }
 
+/// A shared HTTP client for the configured beignet daemon.
+///
+/// One client for both roles, so a provider using beignet for Lightning and for its wallet opens
+/// one connection pool and runs one preflight rather than two.
+#[cfg(feature = "beignet")]
+fn beignet_http(config: &ProviderConfig) -> Result<Arc<beignet_backend::BeignetHttp>> {
+    let mut cfg = beignet_backend::BeignetConfig::new(&config.beignet_url);
+    // Prefer the environment: an argv token is visible to anything that can read the process
+    // table, and this one authorises spending.
+    let token = std::env::var("BEIGNET_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| (!config.beignet_token.is_empty()).then(|| config.beignet_token.clone()));
+    cfg = cfg.with_token(token);
+    cfg.api_prefix = config.beignet_api_prefix.clone();
+    if !config.beignet_tls_cert.is_empty() {
+        cfg.tls_cert_pem = Some(
+            std::fs::read(&config.beignet_tls_cert)
+                .with_context(|| format!("read {}", config.beignet_tls_cert))?,
+        );
+    }
+    Ok(Arc::new(
+        beignet_backend::BeignetHttp::new(cfg).map_err(|e| anyhow!("{e}"))?,
+    ))
+}
+
+/// Check the beignet daemon is one we can safely use, and say what it can do.
+#[cfg(feature = "beignet")]
+async fn beignet_preflight(
+    config: &ProviderConfig,
+    network: Network,
+) -> Result<Option<beignet_backend::Preflight>> {
+    if config.lightning_backend != "beignet" && config.wallet_backend != "beignet" {
+        return Ok(None);
+    }
+    let http = beignet_http(config)?;
+    let preflight = match beignet_backend::capability::probe(&http).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("beignet is not reachable ({e}); the provider will run negotiation-only");
+            return Ok(None);
+        }
+    };
+    // A network mismatch or a competing swap role is fatal, not a warning: both are ways to lose
+    // money quietly.
+    preflight.report(network).map_err(|e| anyhow!("{e}"))?;
+    Ok(Some(preflight))
+}
+
+#[cfg(not(feature = "beignet"))]
+async fn beignet_preflight(_config: &ProviderConfig, _network: Network) -> Result<Option<()>> {
+    Ok(None)
+}
+
 /// Construct the Lightning backend. Real LND with the `lnd` feature (and a successful
 /// connection), otherwise a stub.
 async fn make_backend(config: &ProviderConfig) -> Arc<dyn LightningBackend> {
+    if config.lightning_backend == "beignet" {
+        #[cfg(feature = "beignet")]
+        {
+            match beignet_http(config) {
+                Ok(http) => return Arc::new(BeignetLightningBackend::new(http)),
+                Err(e) => warn!("beignet client could not be built ({e}); falling back to stub"),
+            }
+        }
+        #[cfg(not(feature = "beignet"))]
+        warn!("--lightning beignet needs a build with --features beignet; falling back to stub");
+        return Arc::new(StubBackend::new());
+    }
+
     let lnd_config = LndConfig {
         address: config.lnd_address.clone(),
         tls_cert_path: config.lnd_cert_path.clone(),
@@ -799,12 +912,55 @@ fn build_chain(_config: &ProviderConfig) -> Option<Arc<dyn ChainWatcher>> {
 
 /// Build the on-chain funding wallet. `wallet_backend = "lnd"` funds from LND's own on-chain
 /// balance (no separate seed); anything else uses the BDK wallet from `--wallet-mnemonic`.
-async fn build_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
-    if config.wallet_backend == "lnd" {
-        build_lnd_wallet(config).await
-    } else {
-        build_bdk_wallet(config)
+async fn build_wallet(
+    config: &ProviderConfig,
+    chain: Option<Arc<dyn ChainWatcher>>,
+) -> Option<Arc<dyn OnchainWallet>> {
+    match config.wallet_backend.as_str() {
+        "lnd" => build_lnd_wallet(config).await,
+        "beignet" => build_beignet_wallet(config, chain).await,
+        _ => build_bdk_wallet(config),
     }
+}
+
+#[cfg(feature = "beignet")]
+async fn build_beignet_wallet(
+    config: &ProviderConfig,
+    chain: Option<Arc<dyn ChainWatcher>>,
+) -> Option<Arc<dyn OnchainWallet>> {
+    let network = parse_network(&config.network).ok()?;
+    let http = match beignet_http(config) {
+        Ok(h) => h,
+        Err(e) => {
+            warn!("beignet wallet unavailable: {e}");
+            return None;
+        }
+    };
+    // The chain watcher is passed through so the wallet can locate a funding output if the daemon
+    // ever stops returning the raw transaction. It is a fallback, not the normal path.
+    match beignet_backend::BeignetWallet::connect(
+        http,
+        network,
+        config.onchain_fee_rate_sat_vb,
+        chain,
+    )
+    .await
+    {
+        Ok(w) => Some(Arc::new(w)),
+        Err(e) => {
+            warn!("beignet wallet unavailable: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "beignet"))]
+async fn build_beignet_wallet(
+    _config: &ProviderConfig,
+    _chain: Option<Arc<dyn ChainWatcher>>,
+) -> Option<Arc<dyn OnchainWallet>> {
+    warn!("--wallet beignet needs a build with --features beignet");
+    None
 }
 
 #[cfg(feature = "lnd")]

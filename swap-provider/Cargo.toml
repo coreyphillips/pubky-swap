@@ -14,6 +14,8 @@ lnd = ["lightning-backend/lnd"]
 bdk-wallet = ["swap-common/bdk-wallet"]
 # Enable the Electrum chain watcher.
 chain = ["swap-common/electrum"]
+# Use a beignet daemon for Lightning and/or the on-chain wallet. Needs no protoc.
+beignet = ["dep:beignet-backend"]
 # Everything needed to actually execute swaps end-to-end.
 full = ["lnd", "bdk-wallet", "chain"]
 # Learn interested client pubkys over the iroh P2P rendezvous (doorbell) instead of only the
@@ -24,6 +26,7 @@ iroh = ["pubky-transport/iroh"]
 pubky-transport.workspace = true
 swap-common.workspace = true
 lightning-backend.workspace = true
+beignet-backend = { workspace = true, optional = true }
 bitcoin.workspace = true
 tokio.workspace = true
 clap.workspace = true

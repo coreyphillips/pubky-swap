@@ -40,6 +40,16 @@ pub struct ClientConfig {
     pub provider_pkarr: String,
     pub direction: SwapDirection,
     pub amount_sat: u64,
+    /// Lightning backend: `"lnd"` or `"beignet"`.
+    pub lightning_backend: String,
+    /// Base URL of a beignet daemon.
+    pub beignet_url: String,
+    /// Bearer token for that daemon.
+    pub beignet_token: String,
+    /// PEM root certificate, when the daemon was started with `--tls-cert`.
+    pub beignet_tls_cert: String,
+    /// Optional `/v1` API prefix.
+    pub beignet_api_prefix: String,
     /// LND gRPC endpoint used to pay the hold invoice (reverse-swap execution).
     pub lnd_address: String,
     pub lnd_cert_path: String,
@@ -82,6 +92,17 @@ pub struct ClientConfig {
     /// A submarine swap's refund key is generated here and exists nowhere else. Losing it does
     /// not fail the swap, it makes the on-chain output unspendable by anyone, forever.
     pub data_dir: String,
+}
+
+/// Whether the configured wallet backend can both fund an HTLC and supply a sweep destination
+/// on its own, with no `--claim-address` and no separate seed.
+fn wallet_is_self_sufficient(config: &ClientConfig) -> bool {
+    matches!(config.wallet_backend.as_str(), "lnd" | "beignet")
+}
+
+/// Whether a wallet is configured at all.
+fn wallet_is_configured(config: &ClientConfig) -> bool {
+    wallet_is_self_sufficient(config) || !config.wallet_mnemonic.is_empty()
 }
 
 /// The policy this client holds providers to.
@@ -333,8 +354,8 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 
     // 6) Execute, if the client is configured to (own LND + Electrum + a claim destination — either
     //    an explicit --claim-address or `--wallet lnd`, which sweeps into LND's own wallet).
-    let lnd_claim = config.wallet_backend == "lnd";
-    if config.electrum_url.is_empty() || (config.claim_address.is_empty() && !lnd_claim) {
+    let self_sufficient = wallet_is_self_sufficient(&config);
+    if config.electrum_url.is_empty() || (config.claim_address.is_empty() && !self_sufficient) {
         warn!(
             "Reverse swap negotiated and HTLC verified, but execution config is missing. To pay \
              the hold invoice and claim on-chain, rebuild with --features full and pass \
@@ -348,7 +369,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         .invoice
         .clone()
         .ok_or_else(|| anyhow!("provider did not include a hold invoice"))?;
-    let dest_spk = if lnd_claim {
+    let dest_spk = if self_sufficient {
         build_wallet(&config, network).await?.receive_destination()
     } else {
         parse_address_spk(&config.claim_address, network)?
@@ -446,8 +467,7 @@ async fn run_submarine(
 ) -> Result<()> {
     // Execution needs our own LN node (to issue + watch the invoice), Electrum, and a funding
     // wallet (LND's own with `--wallet lnd`, or a BDK wallet from `--wallet-mnemonic`).
-    let have_wallet = config.wallet_backend == "lnd" || !config.wallet_mnemonic.is_empty();
-    if config.electrum_url.is_empty() || !have_wallet {
+    if config.electrum_url.is_empty() || !wallet_is_configured(config) {
         warn!(
             "Submarine swap quoted, but execution config is missing. To run it, rebuild with \
              --features full and pass --lnd-address/--lnd-cert/--lnd-macaroon, --electrum-url, \
@@ -647,6 +667,25 @@ fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {
 /// Build the on-chain wallet used to fund submarine HTLCs and/or receive reverse-swap sweeps:
 /// `--wallet lnd` (the node's own LND wallet, no seed) or a BDK wallet from `--wallet-mnemonic`.
 async fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn OnchainWallet>> {
+    if config.wallet_backend == "beignet" {
+        #[cfg(feature = "beignet")]
+        {
+            let chain = build_chain(config).ok();
+            let wallet = beignet_backend::BeignetWallet::connect(
+                beignet_http(config)?,
+                network,
+                config.onchain_fee_rate_sat_vb,
+                chain,
+            )
+            .await
+            .map_err(|e| anyhow!("beignet wallet: {e}"))?;
+            return Ok(Arc::new(wallet));
+        }
+        #[cfg(not(feature = "beignet"))]
+        return Err(anyhow!(
+            "--wallet beignet requires a build with --features beignet"
+        ));
+    }
     if config.wallet_backend == "lnd" {
         #[cfg(feature = "lnd")]
         {
@@ -691,8 +730,42 @@ fn parse_address_spk(addr: &str, network: Network) -> Result<ScriptBuf> {
     Ok(address.script_pubkey())
 }
 
-/// Build the Lightning backend used to pay the hold invoice. Requires the `lnd` feature.
+/// A shared HTTP client for the configured beignet daemon.
+#[cfg(feature = "beignet")]
+fn beignet_http(config: &ClientConfig) -> Result<Arc<beignet_backend::BeignetHttp>> {
+    let mut cfg = beignet_backend::BeignetConfig::new(&config.beignet_url);
+    let token = std::env::var("BEIGNET_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| (!config.beignet_token.is_empty()).then(|| config.beignet_token.clone()));
+    cfg = cfg.with_token(token);
+    cfg.api_prefix = config.beignet_api_prefix.clone();
+    if !config.beignet_tls_cert.is_empty() {
+        cfg.tls_cert_pem = Some(
+            std::fs::read(&config.beignet_tls_cert)
+                .map_err(|e| anyhow!("read {}: {e}", config.beignet_tls_cert))?,
+        );
+    }
+    Ok(Arc::new(
+        beignet_backend::BeignetHttp::new(cfg).map_err(|e| anyhow!("{e}"))?,
+    ))
+}
+
+/// Build the Lightning backend: a beignet daemon over HTTP, or the node's own LND over gRPC.
 async fn make_backend(config: &ClientConfig) -> Result<Arc<dyn LightningBackend>> {
+    if config.lightning_backend == "beignet" {
+        #[cfg(feature = "beignet")]
+        {
+            return Ok(Arc::new(beignet_backend::BeignetLightningBackend::new(
+                beignet_http(config)?,
+            )));
+        }
+        #[cfg(not(feature = "beignet"))]
+        return Err(anyhow!(
+            "--lightning beignet requires a build with --features beignet"
+        ));
+    }
+
     let lnd_config = LndConfig {
         address: config.lnd_address.clone(),
         tls_cert_path: config.lnd_cert_path.clone(),
