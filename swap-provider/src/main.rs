@@ -78,6 +78,33 @@ struct Cli {
     #[arg(long, default_value_t = 10_000)]
     max_routing_fee_msat: u64,
 
+    /// Swaps this provider will drive at once.
+    #[arg(long, default_value_t = 25)]
+    max_concurrent_swaps: usize,
+
+    /// Swaps one counterparty may have in flight at once. Low by design: a counterparty that
+    /// pays a hold invoice and never claims costs you two on-chain fees and a timeout of locked
+    /// capital, at no cost to itself.
+    #[arg(long, default_value_t = 2)]
+    max_concurrent_per_peer: usize,
+
+    /// Most this provider will have committed on chain across all live swaps.
+    #[arg(long, default_value_t = 5_000_000)]
+    max_total_exposure_sat: u64,
+
+    /// Most this provider will have committed to any one counterparty.
+    #[arg(long, default_value_t = 1_000_000)]
+    max_exposure_per_peer_sat: u64,
+
+    /// On-chain balance kept back, so committing to a swap never leaves the wallet unable to pay
+    /// for a refund it may owe.
+    #[arg(long, default_value_t = 100_000)]
+    min_onchain_reserve_sat: u64,
+
+    /// New swaps one counterparty may start per hour.
+    #[arg(long, default_value_t = 6)]
+    max_new_swaps_per_peer_per_hour: u32,
+
     /// Permit unsafe mainnet parameters (low confirmations / fee floor). Required to run on
     /// mainnet with regtest-grade settings; intended for testing only.
     #[arg(long)]
@@ -141,6 +168,12 @@ async fn main() -> anyhow::Result<()> {
         required_confirmations: cli.confirmations,
         htlc_timeout_blocks: cli.timeout_blocks,
         min_claim_window_blocks: cli.min_claim_window_blocks,
+        max_concurrent_swaps: cli.max_concurrent_swaps,
+        max_concurrent_per_peer: cli.max_concurrent_per_peer,
+        max_total_exposure_sat: cli.max_total_exposure_sat,
+        max_exposure_per_peer_sat: cli.max_exposure_per_peer_sat,
+        min_onchain_reserve_sat: cli.min_onchain_reserve_sat,
+        max_new_swaps_per_peer_per_hour: cli.max_new_swaps_per_peer_per_hour,
         directions: parse_directions(&cli.directions)?,
         broadcast_offer: cli.broadcast_offer,
         lnd_address: cli.lnd_address,

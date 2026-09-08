@@ -59,21 +59,71 @@ pub struct SwapOffer {
     pub lightning_node_id: Option<String>,
     /// Unix seconds after which the offer is stale.
     pub valid_until_unix: u64,
+    /// What the provider expects to spend on chain to run one swap of this kind, at the fee rate
+    /// it is currently seeing.
+    ///
+    /// The provider pays a transaction fee on every swap: the funding transaction for a reverse
+    /// swap, the claim for a submarine one, plus a share of the refund sweeps that unhappy paths
+    /// require. Quoting only a service fee means quoting below cost, so this is priced in and
+    /// shown separately rather than buried.
+    #[serde(default)]
+    pub onchain_fee_sat: u64,
+    /// The sat/vB the figure above was priced at, so a client can see the fee environment the
+    /// quote assumes.
+    #[serde(default)]
+    pub fee_rate_sat_vb: u64,
 }
 
+/// A quoted fee, split so the client can see what it is paying for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuoteFee {
+    /// What the provider charges for the service.
+    pub service_fee_sat: u64,
+    /// What the provider expects to spend on chain running the swap.
+    pub onchain_fee_sat: u64,
+    /// The two together, which is what the client actually pays.
+    pub total_fee_sat: u64,
+}
+
+/// How many times the on-chain cost a swap must be worth before it is worth doing.
+///
+/// Below this the fee dominates the trade and both sides are better off not bothering, so the
+/// advertised minimum rises with the fee environment instead of staying at a number chosen when
+/// fees were low.
+pub const MIN_AMOUNT_FEE_MULTIPLE: u64 = 10;
+
 impl SwapOffer {
-    /// Fee the provider charges for a swap of `amount_sat`.
-    pub fn quote_fee(&self, amount_sat: u64) -> u64 {
+    /// Fee the provider charges for a swap of `amount_sat`, itemised.
+    ///
+    /// The on-chain component is what makes this honest. With the shipped defaults (500 sat base,
+    /// 2000 ppm) a 100k sat swap earned 700 sat, while the funding transaction alone costs around
+    /// 770 sat at the 5 sat/vB mainnet floor: every mainnet swap ran at a loss, and the unhappy
+    /// path added a refund sweep on top.
+    pub fn quote_fee(&self, amount_sat: u64) -> QuoteFee {
         let proportional = (u128::from(amount_sat) * u128::from(self.fee_ppm) / 1_000_000) as u64;
-        self.base_fee_sat.saturating_add(proportional)
+        let service_fee_sat = self.base_fee_sat.saturating_add(proportional);
+        QuoteFee {
+            service_fee_sat,
+            onchain_fee_sat: self.onchain_fee_sat,
+            total_fee_sat: service_fee_sat.saturating_add(self.onchain_fee_sat),
+        }
     }
 
     pub fn supports(&self, dir: SwapDirection) -> bool {
         self.directions.contains(&dir)
     }
 
+    /// The smallest swap worth doing at the current fee environment.
+    ///
+    /// A configured minimum from a quiet mempool becomes uneconomic in a busy one, so the
+    /// effective floor tracks the on-chain cost.
+    pub fn effective_min_amount_sat(&self) -> u64 {
+        self.min_amount_sat
+            .max(self.onchain_fee_sat.saturating_mul(MIN_AMOUNT_FEE_MULTIPLE))
+    }
+
     pub fn accepts_amount(&self, amount_sat: u64) -> bool {
-        amount_sat >= self.min_amount_sat && amount_sat <= self.max_amount_sat
+        amount_sat >= self.effective_min_amount_sat() && amount_sat <= self.max_amount_sat
     }
 }
 
@@ -91,7 +141,17 @@ pub struct Quote {
     pub offer_id: Uuid,
     pub direction: SwapDirection,
     pub amount_sat: u64,
+    /// The whole fee: service plus the provider's expected on-chain cost.
     pub fee_sat: u64,
+    /// The service half of `fee_sat`.
+    #[serde(default)]
+    pub service_fee_sat: u64,
+    /// The on-chain half of `fee_sat`: what the provider expects to spend in miner fees.
+    #[serde(default)]
+    pub onchain_fee_sat: u64,
+    /// The sat/vB the on-chain component was priced at.
+    #[serde(default)]
+    pub fee_rate_sat_vb: u64,
     /// What the client ultimately pays (amount + fee for submarine; LN invoice amount for
     /// reverse). Kept explicit so the client can sanity-check before committing.
     pub total_sat: u64,
@@ -184,17 +244,42 @@ mod tests {
             htlc_timeout_blocks: 144,
             lightning_node_id: None,
             valid_until_unix: 0,
+            onchain_fee_sat: 0,
+            fee_rate_sat_vb: 0,
         }
     }
 
     #[test]
-    fn quote_fee_is_base_plus_proportional() {
-        let offer = sample_offer();
-        // 500 base + 0.2% of 1_000_000 = 500 + 2000 = 2500
-        assert_eq!(offer.quote_fee(1_000_000), 2_500);
+    fn quote_fee_is_itemised_service_plus_onchain_cost() {
+        let mut offer = sample_offer();
+        // 500 base + 0.2% of 1_000_000 = 500 + 2000 = 2500 of service fee.
+        let fee = offer.quote_fee(1_000_000);
+        assert_eq!(fee.service_fee_sat, 2_500);
+        assert_eq!(fee.onchain_fee_sat, 0);
+        assert_eq!(fee.total_fee_sat, 2_500);
+
+        // The provider's own on-chain cost is added on top and shown separately, rather than
+        // being absorbed into a service fee that does not cover it.
+        offer.onchain_fee_sat = 1_400;
+        let fee = offer.quote_fee(1_000_000);
+        assert_eq!(fee.service_fee_sat, 2_500);
+        assert_eq!(fee.onchain_fee_sat, 1_400);
+        assert_eq!(fee.total_fee_sat, 3_900);
+
         assert!(offer.supports(SwapDirection::Reverse));
+    }
+
+    #[test]
+    fn the_minimum_rises_with_the_on_chain_cost() {
+        let mut offer = sample_offer();
         assert!(offer.accepts_amount(10_000));
         assert!(!offer.accepts_amount(9_999));
+
+        // In a busy mempool a 10k sat swap would be mostly fee, so the floor rises with it.
+        offer.onchain_fee_sat = 2_000;
+        assert_eq!(offer.effective_min_amount_sat(), 20_000);
+        assert!(!offer.accepts_amount(10_000));
+        assert!(offer.accepts_amount(20_000));
     }
 
     #[test]
@@ -205,6 +290,9 @@ mod tests {
             direction: SwapDirection::Reverse,
             amount_sat: 50_000,
             fee_sat: 500,
+            service_fee_sat: 500,
+            onchain_fee_sat: 0,
+            fee_rate_sat_vb: 5,
             total_sat: 50_500,
             htlc_timeout_blocks: 144,
             required_confirmations: 1,

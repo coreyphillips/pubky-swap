@@ -14,6 +14,17 @@ pub trait OnchainWallet: Send + Sync {
     /// A wallet-controlled scriptPubKey for swept funds (a reverse-swap refund or submarine-swap
     /// claim destination).
     fn receive_destination(&self) -> ScriptBuf;
+
+    /// Confirmed balance available to fund a swap, if the wallet can report one.
+    ///
+    /// Used as a preflight: a reverse swap creates a hold invoice, takes the client's Lightning
+    /// payment, and only then tries to fund the HTLC. Discovering there is nothing to fund with
+    /// at that point is the worst possible moment, because the counterparty's money is already
+    /// held. `None` means "cannot say", which callers treat as "do not block on this" rather than
+    /// as zero.
+    fn spendable_balance_sat(&self) -> Result<Option<u64>> {
+        Ok(None)
+    }
     /// Best-effort **child-pays-for-parent**: spend `parent` (a stuck claim/refund output that
     /// pays this wallet) with a high-fee child at `fee_rate_sat_vb`, pulling the parent in. Used as
     /// a fallback when an RBF replacement can't be broadcast. Returns the child txid, or `Ok(None)`
@@ -183,6 +194,18 @@ mod bdk_impl {
                 txid: tx.txid(),
                 vout,
             })
+        }
+
+        fn spendable_balance_sat(&self) -> Result<Option<u64>> {
+            // Only confirmed funds count. Unconfirmed change is not something to promise a
+            // counterparty a funded HTLC against.
+            let w = self.locked()?;
+            w.sync(&self.blockchain, SyncOptions::default())
+                .map_err(|e| SwapError::transient("wallet sync", e))?;
+            let b = w
+                .get_balance()
+                .map_err(|e| SwapError::transient("wallet balance", e))?;
+            Ok(Some(b.confirmed))
         }
 
         fn receive_destination(&self) -> ScriptBuf {
