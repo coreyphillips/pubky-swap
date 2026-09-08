@@ -28,6 +28,10 @@ use swap_common::wallet::{BdkWallet, OnchainWallet};
 use swap_common::{random_keypair, SwapState};
 use swap_provider::submarine::{drive_submarine_swap, init_submarine_swap};
 
+/// A unique wallet directory per run, so tests never share a database.
+fn temp_wallet_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("pubky-swap-test-wallet-{}", uuid::Uuid::new_v4()))
+}
 const MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const AMOUNT_SAT: u64 = 50_000;
@@ -102,6 +106,7 @@ async fn full_submarine_swap_two_nodes() {
             Network::Regtest,
             &electrum,
             5.0,
+            &temp_wallet_dir(),
         )
         .expect("client funding wallet"),
     );
@@ -111,6 +116,7 @@ async fn full_submarine_swap_two_nodes() {
             Network::Regtest,
             &electrum,
             5.0,
+            &temp_wallet_dir(),
         )
         .expect("provider claim wallet"),
     );
@@ -122,6 +128,7 @@ async fn full_submarine_swap_two_nodes() {
             Network::Regtest,
             &electrum,
             5.0,
+            &temp_wallet_dir(),
         )
         .unwrap();
         if bdk.balance().unwrap() < AMOUNT_SAT + 50_000 {

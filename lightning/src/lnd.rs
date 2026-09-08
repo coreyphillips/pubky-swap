@@ -63,6 +63,47 @@ impl LndBackend {
         Ok(resp.address)
     }
 
+    /// LND's own fee estimate for `conf_target` blocks, in sat per 1000 weight units.
+    ///
+    /// `None` when the node cannot say (regtest, or an unsynced fee estimator), which callers
+    /// treat as "use the configured floor" rather than as zero.
+    pub async fn estimate_fee_sat_per_kw(&self, conf_target: i32) -> Result<Option<i64>> {
+        use fedimint_tonic_lnd::walletrpc::EstimateFeeRequest;
+        let mut client = self.client.lock().await;
+        let resp = client
+            .wallet()
+            .estimate_fee(EstimateFeeRequest { conf_target })
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?
+            .into_inner();
+        Ok((resp.sat_per_kw > 0).then_some(resp.sat_per_kw))
+    }
+
+    /// Bump an unconfirmed transaction's fee, using CPFP when the output is ours.
+    ///
+    /// `walletrpc.BumpFee` is what makes CPFP available to an `--wallet lnd` provider at all: the
+    /// claim and refund transactions are built and signed by the swap engine, not by LND, so LND
+    /// cannot replace them. It can spend their output at a high fee and pull them in.
+    pub async fn bump_fee(&self, txid: &str, vout: u32, sat_per_vbyte: u64) -> Result<()> {
+        use fedimint_tonic_lnd::lnrpc::OutPoint as LndOutPoint;
+        use fedimint_tonic_lnd::walletrpc::BumpFeeRequest;
+        let mut client = self.client.lock().await;
+        client
+            .wallet()
+            .bump_fee(BumpFeeRequest {
+                outpoint: Some(LndOutPoint {
+                    txid_str: txid.to_string(),
+                    output_index: vout,
+                    ..Default::default()
+                }),
+                sat_per_vbyte,
+                ..Default::default()
+            })
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?;
+        Ok(())
+    }
+
     /// Send `amount_sat` to `pk_script` from LND's on-chain wallet at `sat_per_kw`, returning the
     /// raw funding transaction (the caller locates the funding output). Requires a macaroon with
     /// on-chain write permission.

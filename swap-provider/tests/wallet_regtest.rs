@@ -17,6 +17,10 @@ use swap_common::random_keypair;
 use swap_provider::reverse::OnchainWallet;
 use swap_provider::wallet::BdkWallet;
 
+/// A unique wallet directory per run, so tests never share a database.
+fn temp_wallet_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("pubky-swap-test-wallet-{}", uuid::Uuid::new_v4()))
+}
 // A standard BIP39 test mnemonic.
 const MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -64,8 +68,14 @@ fn bdk_wallet_funds_htlc() {
         mine(110);
     }
 
-    let wallet =
-        BdkWallet::from_mnemonic(MNEMONIC, Network::Regtest, &electrum_url(), 5.0).unwrap();
+    let wallet = BdkWallet::from_mnemonic(
+        MNEMONIC,
+        Network::Regtest,
+        &electrum_url(),
+        5.0,
+        &temp_wallet_dir(),
+    )
+    .unwrap();
 
     // Fund the BDK wallet with 0.5 BTC and confirm it.
     let deposit = wallet.deposit_address().unwrap().to_string();

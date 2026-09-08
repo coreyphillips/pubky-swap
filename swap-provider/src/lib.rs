@@ -839,6 +839,7 @@ fn build_bdk_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
         network,
         &config.electrum_url,
         config.onchain_fee_rate_sat_vb as f32,
+        &std::path::Path::new(&config.data_dir).join("wallet"),
     ) {
         Ok(w) => Some(Arc::new(w)),
         Err(e) => {

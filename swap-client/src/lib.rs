@@ -672,6 +672,7 @@ async fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn
             network,
             &config.electrum_url,
             config.onchain_fee_rate_sat_vb as f32,
+            &std::path::Path::new(&config.data_dir).join("wallet"),
         )
         .map_err(|e| anyhow!("funding wallet: {e}"))?;
         Ok(Arc::new(wallet))
