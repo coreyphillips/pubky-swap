@@ -16,7 +16,7 @@ pub mod wallet;
 
 use anyhow::{anyhow, Context, Result};
 use bitcoin::secp256k1::Secp256k1;
-use bitcoin::{Network, OutPoint, PublicKey};
+use bitcoin::{Network, OutPoint, PublicKey, Txid};
 #[cfg(feature = "lnd")]
 use lightning_backend::LndBackend;
 use lightning_backend::{LightningBackend, LndConfig, StubBackend};
@@ -28,7 +28,7 @@ use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
 use swap_common::{messages::*, NetworkSpec, SwapDirection, SwapState};
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::reverse::{
@@ -297,19 +297,203 @@ struct StoreProgress {
     record: std::sync::Mutex<SwapRecord>,
 }
 
-impl ProgressSink for StoreProgress {
-    fn funded(&self, outpoint: OutPoint) {
+impl StoreProgress {
+    /// Apply `f` to the record and persist it.
+    ///
+    /// A failure to persist is logged at `error!`, not `warn!`: a record that is not on disk is
+    /// a swap that will not be resumed, which for a funded HTLC means a refund that never
+    /// happens. It is the loudest thing this daemon can be quiet about.
+    fn update(&self, what: &str, f: impl FnOnce(&mut SwapRecord)) {
         let mut rec = match self.record.lock() {
             Ok(r) => r,
-            Err(_) => return,
+            Err(poisoned) => poisoned.into_inner(),
         };
-        rec.funding_txid_hex = Some(outpoint.txid.to_string());
-        rec.funding_vout = Some(outpoint.vout);
-        rec.state = SwapState::LockupConfirmed;
+        f(&mut rec);
+        rec.updated_at_unix = now_unix();
         if let Err(e) = self.store.put(&rec) {
-            warn!("failed to persist funding for swap {}: {e}", rec.swap_id);
+            error!(
+                "FAILED TO PERSIST {what} for swap {}: {e}. This swap will not be resumed after \
+                 a restart; if it is funded, its refund depends on this process staying up.",
+                rec.swap_id
+            );
         }
     }
+
+    fn set_state(&self, state: SwapState) {
+        self.update("state", |rec| rec.state = state);
+    }
+
+    fn set_terminal(&self, state: SwapState) {
+        let mut rec = match self.record.lock() {
+            Ok(r) => r,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        rec.state = state;
+        rec.updated_at_unix = now_unix();
+        if let Err(e) = self.store.mark_terminal(&rec) {
+            warn!(
+                "failed to record the terminal state of swap {}: {e}",
+                rec.swap_id
+            );
+        }
+    }
+
+    /// Note a failure and return how many have accumulated.
+    fn record_error(&self, e: &anyhow::Error, transient: bool) -> u32 {
+        let mut attempts = 0;
+        self.update("error", |rec| {
+            rec.last_error = Some(e.to_string());
+            if transient {
+                rec.retry_count = rec.retry_count.saturating_add(1);
+            }
+            attempts = rec.retry_count;
+        });
+        attempts
+    }
+
+    fn snapshot(&self) -> Option<SwapRecord> {
+        self.record.lock().ok().map(|r| r.clone())
+    }
+}
+
+impl ProgressSink for StoreProgress {
+    fn funding_intent(&self, tip: u32) {
+        // Written *before* the funding transaction is broadcast.
+        //
+        // Recording the outpoint afterwards is not enough: a crash between broadcast and persist
+        // leaves a funded HTLC with no record of it, and a resumed driver that cannot find the
+        // output (because the counterparty already claimed it, or Electrum is lagging, or the
+        // value does not match exactly) funds a second one. This marker tells a resumed driver
+        // that a funding may exist and to go looking for it rather than paying again.
+        self.update("funding intent", |rec| {
+            rec.funding_intent_at_height = Some(tip);
+            rec.funding_attempts = rec.funding_attempts.saturating_add(1);
+            rec.state = SwapState::LockupPending;
+        });
+    }
+
+    fn funded(&self, outpoint: OutPoint) {
+        self.update("funding outpoint", |rec| {
+            rec.funding_txid_hex = Some(outpoint.txid.to_string());
+            rec.funding_vout = Some(outpoint.vout);
+            rec.funding_intent_at_height = None;
+            rec.state = SwapState::LockupConfirmed;
+        });
+    }
+
+    fn invoice_pay_started(&self) {
+        // Written before `pay_invoice`, so a resumed driver knows a payment may be in flight and
+        // consults the node rather than paying a second time.
+        self.update("invoice payment intent", |rec| {
+            rec.invoice_pay_started_at_unix = Some(now_unix());
+            rec.state = SwapState::InvoicePending;
+        });
+    }
+
+    fn invoice_paid(&self) {
+        self.update("invoice paid", |rec| rec.state = SwapState::InvoicePaid);
+    }
+
+    fn claim_observed(&self, txid: Txid) {
+        // Written before the hold invoice is settled. The preimage itself is deliberately not
+        // persisted: on resume it is re-extracted from this transaction on chain.
+        self.update("observed claim", |rec| {
+            rec.claim_observed_txid_hex = Some(txid.to_string());
+            rec.state = SwapState::InvoicePaid;
+        });
+    }
+
+    fn spend_broadcast(&self, txid: Txid) {
+        self.update("broadcast spend", |rec| {
+            rec.spend_txid_hex = Some(txid.to_string());
+            rec.state = SwapState::ClaimPending;
+        });
+    }
+}
+
+/// How long a terminal swap record is kept before the background sweeper removes it.
+const TERMINAL_RECORD_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Attempts a driver gets on transient failures before the swap is given up on.
+const MAX_DRIVER_RETRIES: u32 = 10;
+
+/// Whether a driver error looks like something retrying could fix.
+///
+/// The drivers return `anyhow::Error`, so the structured `SwapError` classification is recovered
+/// from the chain rather than by matching a variant. Anything unrecognised counts as permanent:
+/// an unclassified error should not silently earn itself an unbounded retry loop.
+fn is_transient(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<swap_common::SwapError>()
+            .is_some_and(|s| s.is_transient())
+    })
+}
+
+/// Finish a driver run: persist what happened, tell the peer, and decide whether to try again.
+///
+/// The record is never deleted here. It used to be, unconditionally, on every return including
+/// errors -- and every `?` in a driver propagates, including `chain.tip_height()?`. So a single
+/// Electrum blip on a funded swap deleted its record, which meant no resume, which meant the
+/// refund was never attempted and the provider's coins sat in an HTLC nobody was watching.
+async fn finish_driver_run(
+    ctx: &ExecCtx,
+    progress: &StoreProgress,
+    peer: &str,
+    swap_id: Uuid,
+    result: Result<SwapState>,
+    respawn: impl FnOnce(&ExecCtx, SwapRecord),
+) {
+    match result {
+        Ok(state) if state.is_terminal() => {
+            progress.set_terminal(state.clone());
+            send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
+            evict_peer_if_idle(ctx, peer).await;
+        }
+        Ok(state) => {
+            // A non-terminal return means the driver handed control back rather than finishing:
+            // re-enter it on the state it left behind.
+            warn!("swap {swap_id} returned non-terminal state {state:?}; re-entering the driver");
+            progress.set_state(state);
+            if let Some(rec) = progress.snapshot() {
+                respawn(ctx, rec);
+            }
+        }
+        Err(e) => {
+            let transient = is_transient(&e);
+            let attempts = progress.record_error(&e, transient);
+            if transient && attempts < MAX_DRIVER_RETRIES {
+                warn!(
+                    "swap {swap_id} hit a transient failure ({e}); attempt {attempts} of \
+                     {MAX_DRIVER_RETRIES}, re-entering the driver"
+                );
+                if let Some(rec) = progress.snapshot() {
+                    respawn(ctx, rec);
+                }
+            } else {
+                error!("swap {swap_id} failed permanently: {e}");
+                let state = SwapState::Failed(e.to_string());
+                progress.set_terminal(state.clone());
+                send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
+                evict_peer_if_idle(ctx, peer).await;
+            }
+        }
+    }
+}
+
+/// Sweep terminal swap records that are old enough to drop.
+fn spawn_record_pruner(ctx: &ExecCtx) {
+    let store = ctx.store.clone();
+    tokio::spawn(async move {
+        loop {
+            match store.prune_terminal(TERMINAL_RECORD_RETENTION) {
+                Ok(n) if n > 0 => info!("pruned {n} terminal swap record(s)"),
+                Ok(_) => {}
+                Err(e) => warn!("pruning terminal swap records failed: {e}"),
+            }
+            sleep(Duration::from_secs(3600)).await;
+        }
+    });
 }
 
 /// Run the provider daemon.
@@ -405,6 +589,9 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     resume_swaps(&ctx);
     // Watch for chain reorganizations affecting in-flight swaps.
     spawn_reorg_monitor(&ctx);
+    // Sweep terminal swap records once they are old enough to drop. Records are retained
+    // rather than deleted on completion, so a driver failure can never take one with it.
+    spawn_record_pruner(&ctx);
     // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
     spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
     // Accept iroh rendezvous connections (the doorbell), if enabled and built with `--features iroh`.
@@ -725,6 +912,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         funding_txid_hex: None,
         funding_vout: None,
         state: SwapState::Created,
+        ..SwapRecord::new_progress()
     };
     if let Err(e) = ctx.store.put(&record) {
         warn!("failed to persist reverse swap {swap_id}: {e}");
@@ -765,11 +953,13 @@ fn spawn_reverse_driver(ctx: &ExecCtx, swap: ReverseSwap, record: SwapRecord) {
             progress.as_ref(),
         )
         .await;
-        if let Err(e) = ctx2.store.remove(swap_id) {
-            warn!("failed to remove swap {swap_id} from store: {e}");
-        }
-        send_final_status(&ctx2.transport, &peer, swap_id, result).await;
-        evict_peer_if_idle(&ctx2, &peer).await;
+        finish_driver_run(&ctx2, &progress, &peer, swap_id, result, |ctx, rec| {
+            match reverse_swap_from_record(&rec, ctx.timelock) {
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec),
+                Err(e) => error!("cannot re-enter reverse swap {swap_id}: {e}"),
+            }
+        })
+        .await;
     });
 }
 
@@ -855,6 +1045,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         funding_txid_hex: None,
         funding_vout: None,
         state: SwapState::Created,
+        ..SwapRecord::new_progress()
     };
     if let Err(e) = ctx.store.put(&record) {
         warn!("failed to persist submarine swap {swap_id}: {e}");
@@ -874,6 +1065,7 @@ fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord
         None => return,
     };
     let resume_funding = record.funding_outpoint();
+    let already_attempted_payment = record.invoice_pay_started_at_unix.is_some();
     let peer = record.peer.clone();
     let swap_id = record.swap_id;
     let required_confirmations = record.required_confirmations;
@@ -891,14 +1083,17 @@ fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord
             required_confirmations,
             Duration::from_secs(2),
             resume_funding,
+            already_attempted_payment,
             progress.as_ref(),
         )
         .await;
-        if let Err(e) = ctx2.store.remove(swap_id) {
-            warn!("failed to remove swap {swap_id} from store: {e}");
-        }
-        send_final_status(&ctx2.transport, &peer, swap_id, result).await;
-        evict_peer_if_idle(&ctx2, &peer).await;
+        finish_driver_run(&ctx2, &progress, &peer, swap_id, result, |ctx, rec| {
+            match submarine_swap_from_record(&rec, ctx.timelock) {
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec),
+                Err(e) => error!("cannot re-enter submarine swap {swap_id}: {e}"),
+            }
+        })
+        .await;
     });
 }
 
@@ -991,12 +1186,19 @@ fn resume_swaps(ctx: &ExecCtx) {
         return;
     }
     if !ctx.capable {
-        warn!(
-            "{} persisted swap(s) found, but the provider is negotiation-only and cannot resume \
-             them; configure --features full with an Electrum URL + funding wallet",
+        // Refusing to start is the honest reaction here. These records may be funded HTLCs whose
+        // refunds only happen if something is driving them, and a daemon that comes up
+        // negotiation-only looks healthy while quietly abandoning them. Better to fail loudly
+        // than to run in a state where the operator has no reason to look.
+        error!(
+            "{} in-flight swap(s) are persisted under the data directory, but this provider \
+             cannot execute swaps (LND, Electrum, or a funding wallet is missing). Some of those \
+             swaps may hold committed on-chain funds whose refund depends on being driven. \
+             Refusing to start: fix the backend configuration, or move the records aside if you \
+             are certain they are dead.",
             records.len()
         );
-        return;
+        std::process::exit(1);
     }
     info!("Resuming {} persisted swap(s)", records.len());
     for rec in records {
@@ -1172,6 +1374,29 @@ fn variant_name(msg: &SwapMessage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// One momentary Electrum failure used to delete a funded swap's record, because the driver
+    /// called `store.remove` on every return including errors and every `?` in a driver
+    /// propagates. No record meant no resume, which meant the refund was never attempted.
+    #[test]
+    fn transient_backend_failures_are_classified_as_retryable() {
+        let transient: anyhow::Error =
+            swap_common::SwapError::transient("electrum tip", "connection reset").into();
+        assert!(is_transient(&transient));
+
+        // Wrapped in context, as the drivers do.
+        let wrapped = transient.context("tip height");
+        assert!(is_transient(&wrapped));
+
+        // A protocol violation is not retryable, and neither is an unclassified error: an error
+        // nobody has thought about should not silently earn an unbounded retry loop.
+        let permanent: anyhow::Error =
+            swap_common::SwapError::Permanent("preimage does not match".into()).into();
+        assert!(!is_transient(&permanent));
+        let unclassified: anyhow::Error = swap_common::SwapError::Other("who knows".into()).into();
+        assert!(!is_transient(&unclassified));
+        assert!(!is_transient(&anyhow!("a bare string error")));
+    }
     use super::*;
 
     fn cfg(confs: u32, fee_floor: u64, allow_unsafe: bool) -> ProviderConfig {

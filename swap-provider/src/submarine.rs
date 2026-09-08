@@ -18,7 +18,7 @@ use crate::reverse::{OnchainWallet, ProgressSink};
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
-use lightning_backend::LightningBackend;
+use lightning_backend::{LightningBackend, PaymentStatus};
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
@@ -134,6 +134,9 @@ pub async fn drive_submarine_swap(
     // If resuming after a restart and the HTLC funding was already observed, its outpoint.
     // `None` on a fresh start.
     resume_funding: Option<OutPoint>,
+    // True when a previous run recorded that it was about to pay the invoice. Combined with the
+    // node's own answer, this is what keeps a resumed driver from paying twice.
+    already_attempted_payment: bool,
     progress: &dyn ProgressSink,
 ) -> Result<SwapState> {
     // 1. Establish the funding outpoint. On a fresh start, wait for the client to fund the HTLC
@@ -202,16 +205,63 @@ pub async fn drive_submarine_swap(
         )));
     }
 
-    // 2. Pay the invoice to learn the preimage. A failure costs nothing on-chain — the
-    //    client simply refunds after the timeout.
+    // 2. Pay the invoice to learn the preimage. A failure costs nothing on-chain: the client
+    //    simply refunds after the timeout.
+    //
+    //    Ask the node first. A driver resumed after a crash cannot tell from its own state
+    //    whether a payment went out, and the two possibilities want opposite actions: paying
+    //    again risks paying twice, while assuming it was paid abandons an HTLC we have already
+    //    bought. The node knows, so ask it.
     let payment = match ln
-        .pay_invoice(&swap.invoice, swap.max_routing_fee_msat)
+        .payment_status(swap.payment_hash)
         .await
+        .map_err(|e| anyhow!("payment status: {e}"))?
     {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("Submarine swap: invoice payment failed: {e}");
-            return Ok(SwapState::Failed(format!("invoice payment failed: {e}")));
+        PaymentStatus::Succeeded(p) => {
+            info!("Submarine swap: the invoice was already paid; proceeding to the claim");
+            progress.invoice_paid();
+            p
+        }
+        PaymentStatus::InFlight => {
+            // Wait it out rather than launching a second attempt. The claim-window gate above
+            // bounds how long this can go on.
+            info!("Submarine swap: a payment is already in flight; waiting for it to settle");
+            sleep(poll).await;
+            return Ok(SwapState::InvoicePending);
+        }
+        PaymentStatus::Failed(reason) => {
+            warn!("Submarine swap: the invoice payment failed permanently: {reason}");
+            return Ok(SwapState::Failed(format!(
+                "invoice payment failed: {reason}"
+            )));
+        }
+        PaymentStatus::Unknown => {
+            if resume_funding.is_some() && already_attempted_payment {
+                // We recorded an intent to pay and the node has no record of it. Do not assume
+                // either way: keep polling. Paying again could pay twice; giving up would
+                // abandon an HTLC we may already have bought.
+                warn!(
+                    "Submarine swap: a payment was started but the node has no record of it; \
+                     polling rather than paying again"
+                );
+                sleep(poll).await;
+                return Ok(SwapState::InvoicePending);
+            }
+            // Record the intent before the irreversible call.
+            progress.invoice_pay_started();
+            match ln
+                .pay_invoice(&swap.invoice, swap.max_routing_fee_msat)
+                .await
+            {
+                Ok(p) => {
+                    progress.invoice_paid();
+                    p
+                }
+                Err(e) => {
+                    warn!("Submarine swap: invoice payment failed: {e}");
+                    return Ok(SwapState::Failed(format!("invoice payment failed: {e}")));
+                }
+            }
         }
     };
 
@@ -342,6 +392,8 @@ mod tests {
         /// Set the moment `pay_invoice` is called, so a test can assert the irreversible
         /// step was never taken.
         paid: Mutex<bool>,
+        /// What the "node" reports about the payment, so a test can model a resumed driver.
+        status: Mutex<lightning_backend::PaymentStatus>,
     }
     impl MockLn {
         fn new(payment_hash: [u8; 32], pay_preimage: Option<[u8; 32]>) -> Self {
@@ -349,7 +401,13 @@ mod tests {
                 payment_hash,
                 pay_preimage,
                 paid: Mutex::new(false),
+                status: Mutex::new(lightning_backend::PaymentStatus::Unknown),
             }
+        }
+        /// Report this payment status, as a node that already knows about the payment would.
+        fn with_status(self, status: lightning_backend::PaymentStatus) -> Self {
+            *self.status.lock().unwrap() = status;
+            self
         }
     }
     #[async_trait::async_trait]
@@ -401,6 +459,12 @@ mod tests {
                 }),
                 None => Err(LightningError::PaymentFailed("no route".into())),
             }
+        }
+        async fn payment_status(
+            &self,
+            _ph: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::PaymentStatus> {
+            Ok(self.status.lock().unwrap().clone())
         }
         async fn decode_invoice(&self, _bolt11: &str) -> lightning_backend::Result<DecodedInvoice> {
             Ok(DecodedInvoice {
@@ -525,6 +589,7 @@ mod tests {
             2,
             Duration::from_millis(0),
             None,
+            false,
             &(),
         )
         .await
@@ -566,6 +631,7 @@ mod tests {
             2,
             Duration::from_millis(0),
             None,
+            false,
             &(),
         )
         .await
@@ -584,6 +650,99 @@ mod tests {
     /// Paying the invoice is irreversible, but recovering the money means winning an on-chain
     /// race against a refund the client can fee-bump. With no window there is no race to win, so
     /// the provider refuses and the client simply refunds its own funding.
+    /// A driver resumed after a crash must not pay a second time for the same swap.
+    ///
+    /// Its own state cannot distinguish "the payment never went out" from "it went out and we
+    /// crashed before recording it", and those want opposite actions. The node knows, so the
+    /// driver asks it: a payment the node already settled is adopted rather than repeated.
+    #[tokio::test]
+    async fn a_resumed_driver_adopts_an_already_settled_payment() {
+        let preimage = generate_preimage();
+        let ln = MockLn::new(payment_hash(&preimage), Some(preimage)).with_status(
+            lightning_backend::PaymentStatus::Succeeded(PaymentResult {
+                preimage,
+                fee_msat: 0,
+            }),
+        );
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain {
+            tip: MOCK_TIP,
+            funding: Some(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat,
+                confirmations: 3,
+            }),
+            broadcasts: Mutex::new(Vec::new()),
+        };
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            1,
+            Duration::from_millis(0),
+            Some(funding_outpoint()),
+            true, // a previous run recorded that it was about to pay
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state, SwapState::Claimed);
+        assert!(
+            !*ln.paid.lock().unwrap(),
+            "a settled payment must be adopted, not repeated"
+        );
+        assert_eq!(
+            chain.broadcasts.lock().unwrap().len(),
+            1,
+            "the claim must still be broadcast against the HTLC we already bought"
+        );
+    }
+
+    /// The other half: a payment the node has no record of, after we recorded an intent to make
+    /// it. Neither paying nor giving up is safe, so the driver waits instead of guessing.
+    #[tokio::test]
+    async fn a_resumed_driver_with_an_unknown_payment_neither_pays_nor_abandons() {
+        let preimage = generate_preimage();
+        let ln = MockLn::new(payment_hash(&preimage), Some(preimage));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain {
+            tip: MOCK_TIP,
+            funding: Some(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat,
+                confirmations: 3,
+            }),
+            broadcasts: Mutex::new(Vec::new()),
+        };
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            1,
+            Duration::from_millis(0),
+            Some(funding_outpoint()),
+            true,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            state,
+            SwapState::InvoicePending,
+            "must hand back, not decide"
+        );
+        assert!(!*ln.paid.lock().unwrap(), "must not pay a second time");
+        assert!(chain.broadcasts.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn refuses_to_pay_when_the_claim_window_is_too_short() {
         let preimage = generate_preimage();
@@ -610,6 +769,7 @@ mod tests {
             1,
             Duration::from_millis(0),
             None,
+            false,
             &(),
         )
         .await
@@ -654,6 +814,7 @@ mod tests {
             2,
             Duration::from_millis(0),
             None,
+            false,
             &(),
         )
         .await

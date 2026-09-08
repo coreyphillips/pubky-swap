@@ -220,6 +220,12 @@ mod tests {
         async fn pay_invoice(&self, _: &str, _: u64) -> lightning_backend::Result<PaymentResult> {
             Err(LightningError::NotImplemented("mock".into()))
         }
+        async fn payment_status(
+            &self,
+            _ph: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::PaymentStatus> {
+            Ok(lightning_backend::PaymentStatus::Unknown)
+        }
         async fn decode_invoice(&self, _: &str) -> lightning_backend::Result<DecodedInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }

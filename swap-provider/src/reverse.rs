@@ -40,9 +40,25 @@ pub use swap_common::wallet::OnchainWallet;
 /// Hook for persisting a driver's progress so a restart can resume it. The provider supplies an
 /// implementation that updates and persists the swap's [`crate::store::SwapRecord`]; the unit
 /// `()` is a no-op used by tests.
+///
+/// The ordering matters more than the contents. Every method that names an *intent* is called
+/// **before** the irreversible act it describes, so a crash in the gap leaves a marker saying
+/// "this may have happened, go and check" rather than nothing at all. Recording only outcomes
+/// leaves a window where funds have moved and no trace of it exists.
 pub trait ProgressSink: Send + Sync {
+    /// About to broadcast a funding transaction, at the given tip height.
+    fn funding_intent(&self, _tip: u32) {}
     /// The HTLC funding outpoint is now known (funded by us, or observed on-chain).
     fn funded(&self, _outpoint: OutPoint) {}
+    /// About to pay a Lightning invoice, which cannot be undone.
+    fn invoice_pay_started(&self) {}
+    /// The invoice payment succeeded.
+    fn invoice_paid(&self) {}
+    /// A counterparty spend revealing the preimage has been seen, identified by txid. The
+    /// preimage itself is never persisted; it is re-extracted from this transaction on resume.
+    fn claim_observed(&self, _txid: Txid) {}
+    /// We broadcast a claim or refund.
+    fn spend_broadcast(&self, _txid: Txid) {}
 }
 
 impl ProgressSink for () {}
@@ -239,6 +255,10 @@ pub async fn drive_reverse_swap(
                      at {}; funding on-chain HTLC",
                     swap.timeout_height
                 );
+                // Record the intent before broadcasting. A crash in this gap otherwise
+                // leaves a funded HTLC with nothing on disk pointing at it, and a resumed
+                // driver that cannot find the output funds a second one.
+                progress.funding_intent(tip);
                 let op =
                     run_blocking(|| wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat))?;
                 progress.funded(op);
@@ -307,6 +327,9 @@ pub async fn drive_reverse_swap(
             if let Some(preimage) = extract_preimage(&spend, &funding_outpoint, &swap.payment_hash)
             {
                 if !settled {
+                    // Persist that we have seen the claim before settling against it, so a
+                    // crash between the two resumes from the right place.
+                    progress.claim_observed(spend_txid);
                     match ln.settle_hold_invoice(preimage).await {
                         Ok(()) => {
                             info!("Reverse swap: client claimed; hold invoice settled");
@@ -510,6 +533,12 @@ mod tests {
             _max_fee_msat: u64,
         ) -> lightning_backend::Result<PaymentResult> {
             Err(LightningError::NotImplemented("mock".into()))
+        }
+        async fn payment_status(
+            &self,
+            _ph: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::PaymentStatus> {
+            Ok(lightning_backend::PaymentStatus::Unknown)
         }
         async fn decode_invoice(&self, _bolt11: &str) -> lightning_backend::Result<DecodedInvoice> {
             Err(LightningError::NotImplemented("mock".into()))

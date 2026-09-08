@@ -62,6 +62,24 @@ pub enum InvoiceState {
     Cancelled,
 }
 
+/// What a node knows about an outbound payment.
+///
+/// This is the ground truth a resumed driver needs. Without it, "did I already pay this?" can
+/// only be answered from our own persisted intent, which cannot distinguish "the payment was
+/// never sent" from "it was sent and we crashed before recording it" -- and those want opposite
+/// actions.
+#[derive(Debug, Clone)]
+pub enum PaymentStatus {
+    /// The node has no record of this payment hash.
+    Unknown,
+    /// An attempt is in flight.
+    InFlight,
+    /// Settled, with the preimage.
+    Succeeded(PaymentResult),
+    /// Permanently failed, so paying again is safe.
+    Failed(String),
+}
+
 /// Result of paying a BOLT11 invoice.
 #[derive(Debug, Clone)]
 pub struct PaymentResult {
@@ -177,6 +195,13 @@ pub trait LightningBackend: Send + Sync {
     /// Pay a BOLT11 invoice, returning the preimage on success.
     async fn pay_invoice(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentResult>;
 
+    /// What the node knows about an outbound payment for `payment_hash`.
+    ///
+    /// Consulted before paying, so a resumed driver never pays twice for one swap. Backends that
+    /// cannot answer should return [`PaymentStatus::Unknown`], which callers treat as "do not
+    /// assume it is safe to pay again".
+    async fn payment_status(&self, payment_hash: [u8; 32]) -> Result<PaymentStatus>;
+
     /// Decode a BOLT11 invoice's payment hash and amount.
     async fn decode_invoice(&self, bolt11: &str) -> Result<DecodedInvoice>;
 }
@@ -232,6 +257,9 @@ impl LightningBackend for StubBackend {
         Err(LightningError::NotImplemented(STUB.into()))
     }
     async fn pay_invoice(&self, _bolt11: &str, _max_fee_msat: u64) -> Result<PaymentResult> {
+        Err(LightningError::NotImplemented(STUB.into()))
+    }
+    async fn payment_status(&self, _payment_hash: [u8; 32]) -> Result<PaymentStatus> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
     async fn decode_invoice(&self, _bolt11: &str) -> Result<DecodedInvoice> {
