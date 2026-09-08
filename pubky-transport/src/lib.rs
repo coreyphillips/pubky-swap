@@ -9,9 +9,10 @@
 use pkarr::PublicKey;
 use pubky_messenger::PrivateMessengerClient;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -35,11 +36,77 @@ pub enum TransportError {
 
 pub type Result<T> = std::result::Result<T, TransportError>;
 
+/// A tracked peer in the poll set.
+#[derive(Debug, Clone)]
+struct PeerEntry {
+    /// Pinned peers are never idle-reaped (e.g. operator-curated follows loaded by
+    /// [`Transport::discover_peers`], or a client's configured provider). They are still removed
+    /// by an explicit [`Transport::evict_peer`].
+    pinned: bool,
+    /// Last time we added or read a message from this peer, for idle reaping.
+    last_seen: Instant,
+}
+
+/// The set of peers a transport polls, with pin + idle-reaping bookkeeping. Extracted from
+/// [`Transport`] so its lifecycle logic is unit-testable without a live messenger.
+#[derive(Default)]
+struct PeerSet {
+    peers: RwLock<HashMap<String, PeerEntry>>,
+}
+
+impl PeerSet {
+    /// Insert a peer or bump its last-seen time. `pinned` only ever sets the pin flag (a touch
+    /// never un-pins an already-pinned peer).
+    fn touch_or_add(&self, pubky: String, pinned: bool) {
+        if let Ok(mut peers) = self.peers.write() {
+            peers
+                .entry(pubky)
+                .and_modify(|e| {
+                    e.last_seen = Instant::now();
+                    if pinned {
+                        e.pinned = true;
+                    }
+                })
+                .or_insert(PeerEntry {
+                    pinned,
+                    last_seen: Instant::now(),
+                });
+        }
+    }
+
+    fn all(&self) -> Vec<String> {
+        self.peers
+            .read()
+            .map(|p| p.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn idle_unpinned(&self, ttl: Duration) -> Vec<String> {
+        let now = Instant::now();
+        self.peers
+            .read()
+            .map(|peers| {
+                peers
+                    .iter()
+                    .filter(|(_, e)| !e.pinned && now.duration_since(e.last_seen) >= ttl)
+                    .map(|(p, _)| p.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn remove(&self, pubky: &str) {
+        if let Ok(mut peers) = self.peers.write() {
+            peers.remove(pubky);
+        }
+    }
+}
+
 /// Transport layer wrapper for pubky-messenger.
 pub struct Transport {
     messenger: PrivateMessengerClient,
     /// Peers to poll for messages (a coordinator/provider polls all known peers).
-    known_peers: Arc<RwLock<HashSet<String>>>,
+    known_peers: Arc<PeerSet>,
     /// Processed message IDs, for deduplication across polls.
     processed_messages: Arc<RwLock<HashSet<String>>>,
 }
@@ -75,7 +142,7 @@ impl Transport {
     fn wrap(messenger: PrivateMessengerClient) -> Self {
         Self {
             messenger,
-            known_peers: Arc::new(RwLock::new(HashSet::new())),
+            known_peers: Arc::new(PeerSet::default()),
             processed_messages: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -85,19 +152,40 @@ impl Transport {
         self.messenger.public_key_string()
     }
 
-    /// Track a peer so it is polled by [`receive_all`].
+    /// Track a peer so it is polled by [`receive_all`], and refresh its last-seen time.
+    ///
+    /// If the peer is already tracked its pinned status is preserved; this only bumps last-seen
+    /// (so re-adding a pinned peer does not unpin it).
     pub fn add_known_peer(&self, peer_pkarr: String) {
-        if let Ok(mut peers) = self.known_peers.write() {
-            peers.insert(peer_pkarr);
-        }
+        self.known_peers.touch_or_add(peer_pkarr, false);
+    }
+
+    /// Track a peer and mark it pinned, so it is polled but never idle-reaped (only an explicit
+    /// [`evict_peer`](Self::evict_peer) removes it). Use for operator-curated follows and a
+    /// client's configured provider.
+    pub fn pin_peer(&self, peer_pkarr: String) {
+        self.known_peers.touch_or_add(peer_pkarr, true);
     }
 
     /// Snapshot of currently known peers.
     pub fn get_known_peers(&self) -> Vec<String> {
-        self.known_peers
-            .read()
-            .map(|p| p.iter().cloned().collect())
-            .unwrap_or_default()
+        self.known_peers.all()
+    }
+
+    /// Unpinned peers whose last activity is older than `ttl` (candidates for idle reaping).
+    pub fn idle_unpinned_peers(&self, ttl: Duration) -> Vec<String> {
+        self.known_peers.idle_unpinned(ttl)
+    }
+
+    /// Stop tracking a peer: drop it from the in-memory poll set and best-effort remove any
+    /// follow relationship (so the persistent follow graph does not grow without bound). A
+    /// failed `delete_follow` is logged, not propagated, so the peer is always removed from the
+    /// poll set. Removes pinned peers too.
+    pub async fn evict_peer(&self, pubky: &str) {
+        self.known_peers.remove(pubky);
+        if let Err(e) = self.messenger.delete_follow(pubky).await {
+            debug!("evict_peer: best-effort unfollow of {pubky} failed: {e}");
+        }
     }
 
     /// Discover peers (users *we* follow) from the Pubky follow graph.
@@ -114,7 +202,8 @@ impl Transport {
             .map_err(|e| TransportError::Messenger(format!("get followed users: {e}")))?;
         let mut discovered = Vec::new();
         for user in followed {
-            self.add_known_peer(user.pubky.clone());
+            // Operator-curated follows are pinned: polled, but not idle-reaped.
+            self.pin_peer(user.pubky.clone());
             discovered.push(user.pubky);
         }
         Ok(discovered)
@@ -135,9 +224,7 @@ impl Transport {
             .delete_follow(pubky)
             .await
             .map_err(|e| TransportError::Messenger(format!("unfollow {pubky}: {e}")))?;
-        if let Ok(mut peers) = self.known_peers.write() {
-            peers.remove(pubky);
-        }
+        self.known_peers.remove(pubky);
         Ok(())
     }
 
@@ -310,5 +397,54 @@ impl SwapTransport for Transport {
     }
     async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
         Transport::receive_all(self).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn touch_add_and_list() {
+        let set = PeerSet::default();
+        set.touch_or_add("a".into(), false);
+        set.touch_or_add("b".into(), true);
+        let mut all = set.all();
+        all.sort();
+        assert_eq!(all, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn pinned_peers_are_never_idle_reaped() {
+        let set = PeerSet::default();
+        set.touch_or_add("dynamic".into(), false);
+        set.touch_or_add("pinned".into(), true);
+        // ttl == 0 => every peer counts as idle, but pinned ones are excluded.
+        let idle = set.idle_unpinned(Duration::ZERO);
+        assert_eq!(idle, vec!["dynamic".to_string()]);
+    }
+
+    #[test]
+    fn touch_does_not_unpin() {
+        let set = PeerSet::default();
+        set.touch_or_add("p".into(), true);
+        set.touch_or_add("p".into(), false); // a plain re-add / touch must not clear the pin
+        assert!(set.idle_unpinned(Duration::ZERO).is_empty());
+    }
+
+    #[test]
+    fn fresh_peer_not_reaped_under_positive_ttl() {
+        let set = PeerSet::default();
+        set.touch_or_add("a".into(), false);
+        // A just-added peer is not idle for an hour.
+        assert!(set.idle_unpinned(Duration::from_secs(3600)).is_empty());
+    }
+
+    #[test]
+    fn remove_drops_peer() {
+        let set = PeerSet::default();
+        set.touch_or_add("a".into(), false);
+        set.remove("a");
+        assert!(set.all().is_empty());
     }
 }
