@@ -6,6 +6,7 @@
 //! - [`onchain`] — build & sign HTLC claim/refund transactions.
 //! - [`fee_bump`] — replace-by-fee bumping for claim/refund spends.
 //! - [`chain`] — chain observation (`ChainWatcher`; Electrum impl behind feature `electrum`).
+//! - [`timelock`] — cross-leg timelock invariants (the ordering that makes a swap atomic).
 //! - [`keys`] — key helpers.
 
 pub mod chain;
@@ -17,6 +18,7 @@ pub mod messages;
 pub mod onchain;
 pub mod reorg;
 pub mod swap;
+pub mod timelock;
 pub mod wallet;
 
 pub use error::{Result, SwapError};

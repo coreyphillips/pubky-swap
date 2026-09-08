@@ -4,8 +4,8 @@
 //! `invoicesrpc`; payments and node info from `lnrpc`. Requires `protoc` at build time.
 
 use crate::{
-    DecodedInvoice, HoldInvoice, InvoiceState, LightningBackend, LightningError, LndConfig,
-    NodeInfo, PaymentResult, Result,
+    AcceptedHtlc, DecodedInvoice, HoldInvoice, HoldInvoiceRequest, InvoiceState, InvoiceStatus,
+    LightningBackend, LightningError, LndConfig, NodeInfo, PaymentResult, Result,
 };
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -93,6 +93,13 @@ impl LndBackend {
     }
 }
 
+/// Narrow a `u64` to the `i64` LND's protobufs use, refusing rather than wrapping into a
+/// negative value that the node would interpret as something else entirely.
+fn to_i64(value: u64, what: &str) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|_| LightningError::Backend(format!("{what} {value} does not fit in i64")))
+}
+
 fn to_32(bytes: &[u8], what: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
@@ -118,21 +125,25 @@ impl LightningBackend for LndBackend {
         })
     }
 
-    async fn create_hold_invoice(
-        &self,
-        payment_hash: [u8; 32],
-        amount_msat: u64,
-        expiry_secs: u64,
-        memo: &str,
-    ) -> Result<HoldInvoice> {
+    async fn create_hold_invoice(&self, req: HoldInvoiceRequest) -> Result<HoldInvoice> {
+        // A zero delta makes LND substitute `--bitcoin.timelockdelta` (80 by default), which is
+        // shorter than any sensible on-chain timeout. Refusing here keeps the failure at swap
+        // setup rather than after a client's payment is already held.
+        if req.cltv_expiry_delta == 0 {
+            return Err(LightningError::Backend(
+                "refusing to create a hold invoice with a zero final CLTV delta: LND would                  substitute its own default, which is shorter than the on-chain timeout"
+                    .into(),
+            ));
+        }
         let mut client = self.client.lock().await;
         let resp = client
             .invoices()
             .add_hold_invoice(AddHoldInvoiceRequest {
-                memo: memo.to_string(),
-                hash: payment_hash.to_vec(),
-                value_msat: amount_msat as i64,
-                expiry: expiry_secs as i64,
+                memo: req.memo.clone(),
+                hash: req.payment_hash.to_vec(),
+                value_msat: to_i64(req.amount_msat, "invoice amount_msat")?,
+                expiry: to_i64(req.expiry_secs, "invoice expiry_secs")?,
+                cltv_expiry: u64::from(req.cltv_expiry_delta),
                 ..Default::default()
             })
             .await
@@ -140,8 +151,8 @@ impl LightningBackend for LndBackend {
             .into_inner();
         Ok(HoldInvoice {
             bolt11: resp.payment_request,
-            payment_hash,
-            amount_msat,
+            payment_hash: req.payment_hash,
+            amount_msat: req.amount_msat,
         })
     }
 
@@ -156,8 +167,8 @@ impl LightningBackend for LndBackend {
             .lightning()
             .add_invoice(fedimint_tonic_lnd::lnrpc::Invoice {
                 memo: memo.to_string(),
-                value_msat: amount_msat as i64,
-                expiry: expiry_secs as i64,
+                value_msat: to_i64(amount_msat, "invoice amount_msat")?,
+                expiry: to_i64(expiry_secs, "invoice expiry_secs")?,
                 ..Default::default()
             })
             .await
@@ -172,7 +183,7 @@ impl LightningBackend for LndBackend {
         })
     }
 
-    async fn invoice_state(&self, payment_hash: [u8; 32]) -> Result<InvoiceState> {
+    async fn invoice_status(&self, payment_hash: [u8; 32]) -> Result<InvoiceStatus> {
         let mut client = self.client.lock().await;
         let resp = client
             .lightning()
@@ -184,7 +195,7 @@ impl LightningBackend for LndBackend {
             .map_err(|s| LightningError::Backend(s.to_string()))?
             .into_inner();
         // lnrpc.Invoice.InvoiceState: OPEN=0, SETTLED=1, CANCELED=2, ACCEPTED=3
-        Ok(match resp.state {
+        let state = match resp.state {
             0 => InvoiceState::Open,
             1 => InvoiceState::Settled,
             2 => InvoiceState::Cancelled,
@@ -194,6 +205,24 @@ impl LightningBackend for LndBackend {
                     "unknown invoice state {other}"
                 )))
             }
+        };
+        // Only HTLCs still held count. lnrpc.InvoiceHTLC.InvoiceHTLCState: ACCEPTED=0,
+        // SETTLED=1, CANCELED=2 — a settled or cancelled HTLC no longer bounds our deadline.
+        let htlcs = resp
+            .htlcs
+            .iter()
+            .filter(|h| h.state == 0)
+            .map(|h| AcceptedHtlc {
+                amount_msat: h.amt_msat,
+                // `expiry_height` is a signed field. A value we cannot read becomes 0,
+                // which fails the timelock check closed rather than open.
+                expiry_height: u32::try_from(h.expiry_height).unwrap_or(0),
+            })
+            .collect();
+        Ok(InvoiceStatus {
+            state,
+            amount_paid_msat: u64::try_from(resp.amt_paid_msat).unwrap_or(0),
+            htlcs,
         })
     }
 
@@ -231,7 +260,7 @@ impl LightningBackend for LndBackend {
                 // Generous: a reverse-swap hold invoice stays in-flight until the on-chain
                 // claim reveals the preimage and the provider settles.
                 timeout_seconds: 300,
-                fee_limit_msat: max_fee_msat as i64,
+                fee_limit_msat: to_i64(max_fee_msat, "max_fee_msat")?,
                 ..Default::default()
             })
             .await
@@ -255,7 +284,9 @@ impl LightningBackend for LndBackend {
                     let preimage = to_32(&preimage_bytes, "preimage")?;
                     return Ok(PaymentResult {
                         preimage,
-                        fee_msat: payment.fee_msat as u64,
+                        // A negative fee is nonsense; clamping to 0 keeps it from becoming a
+                        // near-u64::MAX value that would poison any accounting downstream.
+                        fee_msat: u64::try_from(payment.fee_msat).unwrap_or(0),
                     });
                 }
                 3 => {
@@ -282,9 +313,26 @@ impl LightningBackend for LndBackend {
         let hash_bytes = hex::decode(&resp.payment_hash)
             .map_err(|e| LightningError::Backend(format!("decode payment_hash: {e}")))?;
         let payment_hash = to_32(&hash_bytes, "payment_hash")?;
+        // `num_msat` is a signed field. A negative value cast with `as u64` becomes an enormous
+        // amount, which downstream would treat as a colossal swap; reject it instead.
+        let amount_msat = u64::try_from(resp.num_msat).map_err(|_| {
+            LightningError::Backend(format!(
+                "invoice reports a negative amount {}",
+                resp.num_msat
+            ))
+        })?;
+        let min_final_cltv_expiry = u32::try_from(resp.cltv_expiry).map_err(|_| {
+            LightningError::Backend(format!(
+                "invoice reports an out-of-range final CLTV expiry {}",
+                resp.cltv_expiry
+            ))
+        })?;
         Ok(DecodedInvoice {
             payment_hash,
-            amount_msat: resp.num_msat as u64,
+            amount_msat,
+            min_final_cltv_expiry,
+            // LND reports 0 for an amountless invoice, where the payer chooses the amount.
+            amount_is_explicit: resp.num_msat > 0,
         })
     }
 }

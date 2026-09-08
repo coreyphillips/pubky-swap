@@ -34,8 +34,14 @@ struct Cli {
     fee_ppm: u64,
     #[arg(long, default_value_t = 1)]
     confirmations: u32,
+    /// Blocks from a swap being accepted to its on-chain HTLC refund branch opening.
     #[arg(long, default_value_t = 144)]
     timeout_blocks: u32,
+
+    /// Minimum blocks that must remain before the on-chain timeout for the provider to take an
+    /// irreversible step (paying a submarine invoice, or committing funds to a reverse HTLC).
+    #[arg(long, default_value_t = swap_common::timelock::PROVIDER_MIN_CLAIM_WINDOW)]
+    min_claim_window_blocks: u32,
 
     /// Push the offer to discovered followers on startup.
     #[arg(long)]
@@ -126,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         fee_ppm: cli.fee_ppm,
         required_confirmations: cli.confirmations,
         htlc_timeout_blocks: cli.timeout_blocks,
+        min_claim_window_blocks: cli.min_claim_window_blocks,
         directions: parse_directions(&cli.directions)?,
         broadcast_offer: cli.broadcast_offer,
         lnd_address: cli.lnd_address,

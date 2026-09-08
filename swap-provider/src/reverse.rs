@@ -18,7 +18,7 @@
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
-use lightning_backend::{InvoiceState, LightningBackend};
+use lightning_backend::{HoldInvoiceRequest, InvoiceState, LightningBackend};
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
@@ -27,9 +27,10 @@ use swap_common::onchain::{
     build_refund_tx, estimate_spend_fee, extract_preimage, REFUND_FEE_TARGET_BLOCKS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
+use swap_common::timelock::{self, TimelockParams};
 use swap_common::SwapState;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 // The funding-wallet abstraction now lives in `swap-common` so the submarine-swap client can
 // reuse it; re-exported here for the provider's existing call sites.
@@ -58,6 +59,9 @@ pub struct ReverseSwap {
     pub refund_key: SecretKey,
     /// The hold-invoice BOLT11 the client must pay.
     pub invoice: String,
+    /// The timelock model this swap was created under. The driver re-checks against it before
+    /// committing on-chain funds.
+    pub timelock: TimelockParams,
 }
 
 /// Create the reverse swap: a hold invoice plus the on-chain HTLC the provider will fund.
@@ -74,6 +78,7 @@ pub async fn init_reverse_swap(
     timeout_height: u32,
     invoice_expiry_secs: u64,
     network: Network,
+    timelock: TimelockParams,
 ) -> Result<ReverseSwap> {
     let htlc_script = build_htlc_script(
         &payment_hash,
@@ -84,14 +89,27 @@ pub async fn init_reverse_swap(
     let htlc_spk = htlc_p2wsh_address(&htlc_script, network).script_pubkey();
 
     // The client pays the on-chain amount plus the provider's fee over Lightning.
-    let invoice_amount_msat = (onchain_amount_sat + provider_fee_sat) * 1000;
+    let invoice_amount_msat = onchain_amount_sat
+        .checked_add(provider_fee_sat)
+        .and_then(|sat| sat.checked_mul(1000))
+        .ok_or_else(|| {
+            anyhow!("invoice amount overflows: {onchain_amount_sat} + {provider_fee_sat} sat")
+        })?;
+
+    // The incoming Lightning HTLC has to outlive our on-chain refund window, or a client can let
+    // the LN leg expire (recovering its sats) and still claim the on-chain HTLC for free. Left
+    // unset, LND applies `--bitcoin.timelockdelta`, which is 80 blocks by default and far short
+    // of a 144-block on-chain timeout.
+    let cltv_expiry_delta = timelock::reverse_invoice_cltv_delta(&timelock)
+        .map_err(|e| anyhow!("hold invoice CLTV delta: {e}"))?;
     let hold = ln
-        .create_hold_invoice(
+        .create_hold_invoice(HoldInvoiceRequest {
             payment_hash,
-            invoice_amount_msat,
-            invoice_expiry_secs,
-            "pubky-swap reverse",
-        )
+            amount_msat: invoice_amount_msat,
+            expiry_secs: invoice_expiry_secs,
+            cltv_expiry_delta,
+            memo: "pubky-swap reverse".to_string(),
+        })
         .await
         .map_err(|e| anyhow!("create hold invoice: {e}"))?;
 
@@ -104,6 +122,7 @@ pub async fn init_reverse_swap(
         timeout_height,
         refund_key: provider_refund_key,
         invoice: hold.bolt11,
+        timelock,
     })
 }
 
@@ -148,20 +167,77 @@ pub async fn drive_reverse_swap(
         }
         sleep(poll).await;
     }
-    info!("Reverse swap: hold invoice accepted; funding on-chain HTLC");
+    info!("Reverse swap: hold invoice accepted");
 
-    // 2. Fund the on-chain HTLC — idempotently, so a resumed driver never double-funds.
+    // 2. Establish the HTLC funding outpoint, idempotently, so a resumed driver never
+    //    double-funds. Only the branch that commits *new* funds is gated on the timelocks: once
+    //    coins are already in the HTLC the money is at risk either way, and refusing there would
+    //    strand it instead of driving it to a refund.
     let funding_outpoint = match resume_funding {
         // Resumed with a known outpoint: we already funded before the restart.
         Some(op) => op,
         None => match run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))?
         {
-            // Already funded (and still unspent) — adopt the existing output.
+            // Already funded (and still unspent) - adopt the existing output.
             Some(u) => {
                 progress.funded(u.outpoint);
                 u.outpoint
             }
             None => {
+                // About to commit funds. Verify the *realised* timelocks first.
+                //
+                // Asking for a CLTV delta is not the same as getting one: a node may clamp it,
+                // ignore it, or apply its own default. LND's default is 80 blocks, well short of
+                // a 144-block on-chain timeout, which would let a client reclaim its sats over
+                // Lightning and *then* claim the on-chain HTLC for free. So read back the expiry
+                // the accepted HTLC actually carries and refuse unless the Lightning leg
+                // genuinely outlives our refund window.
+                //
+                // Refusing costs nobody anything: the payment is still held, so cancelling
+                // returns it in full.
+                let status = ln
+                    .invoice_status(swap.payment_hash)
+                    .await
+                    .map_err(|e| anyhow!("invoice status: {e}"))?;
+                let ln_expiry = match status.earliest_htlc_expiry() {
+                    Some(h) => h,
+                    None => {
+                        warn!("Reverse swap: invoice accepted but no HTLC is held; not funding");
+                        if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
+                            warn!("Reverse swap: failed to cancel hold invoice: {e}");
+                        }
+                        return Ok(SwapState::Failed(
+                            "no held HTLC on an accepted invoice".into(),
+                        ));
+                    }
+                };
+                let tip = run_blocking(|| chain.tip_height())?;
+                if let Err(violation) = timelock::check_reverse_before_fund(
+                    tip,
+                    swap.timeout_height,
+                    ln_expiry,
+                    &swap.timelock,
+                ) {
+                    error!(
+                        "Reverse swap: refusing to fund the HTLC, timelock violation: \
+                         {violation}. Cancelling the hold invoice; the client's payment is \
+                         returned in full."
+                    );
+                    if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
+                        warn!(
+                            "Reverse swap: failed to cancel hold invoice after refusing to \
+                             fund: {e}"
+                        );
+                    }
+                    return Ok(SwapState::Failed(format!(
+                        "timelock violation: {violation}"
+                    )));
+                }
+                info!(
+                    "Reverse swap: lightning HTLC expires at {ln_expiry}, on-chain refund opens \
+                     at {}; funding on-chain HTLC",
+                    swap.timeout_height
+                );
                 let op =
                     run_blocking(|| wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat))?;
                 progress.funded(op);
@@ -256,12 +332,20 @@ mod tests {
     use swap_common::random_keypair;
 
     const AMOUNT: u64 = 100_000;
-    const TIMEOUT: u32 = 800_000;
+    /// Chain tip the mocks report. The timeout sits a realistic 144 blocks above it, so the
+    /// timelock checks exercise the same arithmetic production does.
+    const MOCK_TIP: u32 = 700_000;
+    const TIMEOUT: u32 = MOCK_TIP + 144;
 
     struct MockLn {
         state: Mutex<InvoiceState>,
         settled_preimage: Mutex<Option<[u8; 32]>>,
         cancelled: Mutex<bool>,
+        /// The expiry height the "node" reports for the held HTLC. Scriptable so a test can
+        /// reproduce a node that ignored the requested CLTV delta.
+        htlc_expiry: Mutex<Option<u32>>,
+        /// The delta the last `create_hold_invoice` asked for.
+        requested_cltv_delta: Mutex<Option<u32>>,
     }
     impl MockLn {
         fn new(initial: InvoiceState) -> Self {
@@ -269,7 +353,15 @@ mod tests {
                 state: Mutex::new(initial),
                 settled_preimage: Mutex::new(None),
                 cancelled: Mutex::new(false),
+                // Safe by default: an expiry derived from the delta the caller asked for.
+                htlc_expiry: Mutex::new(None),
+                requested_cltv_delta: Mutex::new(None),
             }
+        }
+        /// Report this exact expiry height for the held HTLC, whatever delta was requested.
+        fn with_htlc_expiry(self, height: u32) -> Self {
+            *self.htlc_expiry.lock().unwrap() = Some(height);
+            self
         }
     }
     #[async_trait::async_trait]
@@ -284,15 +376,17 @@ mod tests {
         }
         async fn create_hold_invoice(
             &self,
-            payment_hash: [u8; 32],
-            amount_msat: u64,
-            _expiry_secs: u64,
-            _memo: &str,
+            req: lightning_backend::HoldInvoiceRequest,
         ) -> lightning_backend::Result<HoldInvoice> {
+            assert_ne!(
+                req.cltv_expiry_delta, 0,
+                "a hold invoice must carry an explicit final CLTV delta"
+            );
+            *self.requested_cltv_delta.lock().unwrap() = Some(req.cltv_expiry_delta);
             Ok(HoldInvoice {
                 bolt11: "lnbcrt-mock".into(),
-                payment_hash,
-                amount_msat,
+                payment_hash: req.payment_hash,
+                amount_msat: req.amount_msat,
             })
         }
         async fn create_invoice(
@@ -303,8 +397,29 @@ mod tests {
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
-        async fn invoice_state(&self, _ph: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
-            Ok(*self.state.lock().unwrap())
+        async fn invoice_status(
+            &self,
+            _ph: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::InvoiceStatus> {
+            let state = *self.state.lock().unwrap();
+            let htlcs = if state == InvoiceState::Accepted {
+                // Either the scripted expiry, or one derived from the delta that was asked for
+                // (what an honest node does).
+                let expiry = self.htlc_expiry.lock().unwrap().unwrap_or_else(|| {
+                    MOCK_TIP + self.requested_cltv_delta.lock().unwrap().unwrap_or(0)
+                });
+                vec![lightning_backend::AcceptedHtlc {
+                    amount_msat: 0,
+                    expiry_height: expiry,
+                }]
+            } else {
+                vec![]
+            };
+            Ok(lightning_backend::InvoiceStatus {
+                state,
+                amount_paid_msat: 0,
+                htlcs,
+            })
         }
         async fn settle_hold_invoice(&self, preimage: [u8; 32]) -> lightning_backend::Result<()> {
             *self.settled_preimage.lock().unwrap() = Some(preimage);
@@ -374,6 +489,14 @@ mod tests {
         }
     }
 
+    /// The timelock model the tests run under: the shipped defaults with the mocks' timeout.
+    fn params() -> TimelockParams {
+        TimelockParams {
+            htlc_timeout_blocks: TIMEOUT - MOCK_TIP,
+            ..TimelockParams::default()
+        }
+    }
+
     fn dest() -> ScriptBuf {
         ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap()
     }
@@ -409,6 +532,7 @@ mod tests {
             TIMEOUT,
             3600,
             Network::Regtest,
+            params(),
         )
         .await
         .unwrap();
@@ -428,7 +552,7 @@ mod tests {
         .unwrap();
 
         let chain = MockChain {
-            tip: 700_000, // below timeout
+            tip: MOCK_TIP, // below timeout
             funding: Some(FundingUtxo {
                 outpoint,
                 value_sat: AMOUNT,
@@ -485,6 +609,7 @@ mod tests {
             TIMEOUT,
             3600,
             Network::Regtest,
+            params(),
         )
         .await
         .unwrap();
@@ -531,6 +656,195 @@ mod tests {
         assert!(ln.settled_preimage.lock().unwrap().is_none());
     }
 
+    /// A wallet whose `fund_htlc` must never be reached: proves the provider refuses to commit
+    /// on-chain funds rather than committing them and losing them.
+    struct NeverFundWallet {
+        refund_spk: ScriptBuf,
+    }
+    impl OnchainWallet for NeverFundWallet {
+        fn fund_htlc(
+            &self,
+            _htlc_spk: &ScriptBuf,
+            _amount_sat: u64,
+        ) -> swap_common::Result<OutPoint> {
+            panic!("the provider must not fund an HTLC whose lightning leg expires first");
+        }
+        fn receive_destination(&self) -> ScriptBuf {
+            self.refund_spk.clone()
+        }
+    }
+
+    /// The reverse-swap theft vector.
+    ///
+    /// Left unset, LND applies `--bitcoin.timelockdelta` (80 blocks) to a hold invoice, while the
+    /// on-chain HTLC refunds after 144. The incoming Lightning HTLC therefore dies ~64 blocks
+    /// before the provider's refund branch opens: a client pays, waits for the LN HTLC to expire
+    /// and return its sats, and *then* claims the on-chain HTLC for free.
+    ///
+    /// The provider must read back the realised expiry and refuse to fund.
+    #[tokio::test]
+    async fn refuses_to_fund_when_the_lightning_leg_expires_first() {
+        let secp = Secp256k1::new();
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+
+        // A node that reports an 80-block expiry whatever delta was requested.
+        let ln = MockLn::new(InvoiceState::Accepted).with_htlc_expiry(MOCK_TIP + 80);
+        let swap = init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            params(),
+        )
+        .await
+        .unwrap();
+
+        let chain = MockChain {
+            tip: MOCK_TIP,
+            funding: None,
+            spend: None,
+            broadcasts: Mutex::new(Vec::new()),
+        };
+        let wallet = NeverFundWallet { refund_spk: dest() };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        match final_state {
+            SwapState::Failed(reason) => assert!(
+                reason.contains("timelock violation"),
+                "expected a timelock refusal, got: {reason}"
+            ),
+            other => panic!("expected the swap to be refused, got {other:?}"),
+        }
+        assert!(
+            *ln.cancelled.lock().unwrap(),
+            "the hold invoice must be cancelled so the client's payment is returned in full"
+        );
+        assert!(ln.settled_preimage.lock().unwrap().is_none());
+        assert!(chain.broadcasts.lock().unwrap().is_empty());
+    }
+
+    /// The hold invoice must carry an explicit final CLTV delta that outlives the on-chain
+    /// timeout, rather than letting the node substitute its own default.
+    #[tokio::test]
+    async fn hold_invoice_carries_a_cltv_delta_that_outlives_the_onchain_timeout() {
+        let secp = Secp256k1::new();
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+
+        let ln = MockLn::new(InvoiceState::Open);
+        let p = params();
+        init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            p,
+        )
+        .await
+        .unwrap();
+
+        let delta = ln
+            .requested_cltv_delta
+            .lock()
+            .unwrap()
+            .expect("a delta must be requested");
+        assert_eq!(delta, 144 + 18 + 24 + 30);
+        assert!(
+            delta > p.htlc_timeout_blocks + p.refund_confirm_blocks,
+            "the lightning leg must outlive the on-chain refund window"
+        );
+    }
+
+    /// An HTLC that is already funded must still be driven to a refund, even when the remaining
+    /// window is too short to have started one. Refusing there would strand the coins.
+    #[tokio::test]
+    async fn an_already_funded_htlc_is_still_driven_to_refund() {
+        let secp = Secp256k1::new();
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+
+        // A node reporting an unsafe expiry: it is too late for that to matter, the coins are
+        // already committed.
+        let ln = MockLn::new(InvoiceState::Accepted).with_htlc_expiry(MOCK_TIP + 1);
+        let swap = init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            params(),
+        )
+        .await
+        .unwrap();
+
+        let outpoint = funding_outpoint();
+        let chain = MockChain {
+            tip: TIMEOUT,
+            funding: Some(FundingUtxo {
+                outpoint,
+                value_sat: AMOUNT,
+                confirmations: 3,
+            }),
+            spend: None,
+            broadcasts: Mutex::new(Vec::new()),
+        };
+        let wallet = MockWallet {
+            funding_outpoint: outpoint,
+            refund_spk: dest(),
+        };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(final_state, SwapState::Refunded);
+        assert_eq!(chain.broadcasts.lock().unwrap().len(), 1);
+    }
+
     /// A wallet that must never be asked to fund — used to prove a resumed driver does not
     /// re-fund an already-funded HTLC.
     struct PanicFundWallet {
@@ -570,6 +884,7 @@ mod tests {
             TIMEOUT,
             3600,
             Network::Regtest,
+            params(),
         )
         .await
         .unwrap();
@@ -589,7 +904,7 @@ mod tests {
         // The funding UTXO is gone (already spent by the client's claim), so a fresh driver
         // would try to fund again — but on resume with a known outpoint it must not.
         let chain = MockChain {
-            tip: 700_000,
+            tip: MOCK_TIP,
             funding: None,
             spend: Some(claim_tx),
             broadcasts: Mutex::new(Vec::new()),
