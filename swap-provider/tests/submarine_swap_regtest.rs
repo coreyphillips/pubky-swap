@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use swap_client::submarine::{execute_submarine_swap, SubmarineFunding};
 use swap_common::chain::{ChainWatcher, ElectrumWatcher};
+use swap_common::timelock::TimelockParams;
 use swap_common::wallet::{BdkWallet, OnchainWallet};
 use swap_common::{random_keypair, SwapState};
 use swap_provider::submarine::{drive_submarine_swap, init_submarine_swap};
@@ -146,7 +147,12 @@ async fn full_submarine_swap_two_nodes() {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let (provider_claim_sk, provider_claim_pk) = random_keypair(&secp);
     let (client_refund_sk, client_refund_pk) = random_keypair(&secp);
-    let timeout = chain_p.tip_height().unwrap() + 200;
+    let timelock = TimelockParams {
+        htlc_timeout_blocks: 200,
+        required_confirmations: 1,
+        ..TimelockParams::default()
+    };
+    let timeout = chain_p.tip_height().unwrap() + timelock.htlc_timeout_blocks;
 
     // Provider: decode the invoice and build the HTLC the client must fund.
     let swap = init_submarine_swap(
@@ -160,6 +166,7 @@ async fn full_submarine_swap_two_nodes() {
         100_000,
         timeout,
         Network::Regtest,
+        timelock,
     )
     .await
     .expect("init submarine swap");

@@ -129,9 +129,7 @@ mod tests {
     use super::*;
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::{Network, OutPoint, Transaction, Txid as BTxid};
-    use lightning_backend::{
-        DecodedInvoice, HoldInvoice, InvoiceState, LightningError, NodeInfo, PaymentResult,
-    };
+    use lightning_backend::{DecodedInvoice, HoldInvoice, LightningError, NodeInfo, PaymentResult};
     use std::str::FromStr;
     use std::sync::Mutex;
     use swap_common::chain::{ChainWatcher, FundingUtxo};
@@ -153,10 +151,7 @@ mod tests {
         }
         async fn create_hold_invoice(
             &self,
-            _: [u8; 32],
-            _: u64,
-            _: u64,
-            _: &str,
+            _req: lightning_backend::HoldInvoiceRequest,
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
@@ -168,7 +163,10 @@ mod tests {
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
-        async fn invoice_state(&self, _: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
+        async fn invoice_status(
+            &self,
+            _: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::InvoiceStatus> {
             Err(LightningError::NotImplemented("mock".into()))
         }
         async fn settle_hold_invoice(&self, _: [u8; 32]) -> lightning_backend::Result<()> {

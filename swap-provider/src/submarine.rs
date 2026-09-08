@@ -27,6 +27,7 @@ use swap_common::onchain::{
     build_claim_tx, estimate_spend_fee, extract_preimage, CLAIM_FEE_TARGET_BLOCKS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
+use swap_common::timelock::{self, TimelockParams};
 use swap_common::SwapState;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -46,6 +47,9 @@ pub struct SubmarineSwap {
     pub invoice: String,
     /// Routing-fee cap (msat) for paying the invoice.
     pub max_routing_fee_msat: u64,
+    /// The timelock model this swap runs under. Re-checked immediately before the invoice is
+    /// paid, because paying is the irreversible step.
+    pub timelock: TimelockParams,
 }
 
 /// Create the submarine swap: decode the client's invoice and build the on-chain HTLC the
@@ -62,14 +66,33 @@ pub async fn init_submarine_swap(
     max_routing_fee_msat: u64,
     timeout_height: u32,
     network: Network,
+    timelock: TimelockParams,
 ) -> Result<SubmarineSwap> {
     let decoded = ln
         .decode_invoice(invoice)
         .await
         .map_err(|e| anyhow!("decode invoice: {e}"))?;
     let payment_hash = decoded.payment_hash;
+    // An amountless invoice lets the payer choose what to send, which is not a swap. Reject it
+    // rather than deriving an on-chain amount from a zero.
+    if !decoded.amount_is_explicit {
+        return Err(anyhow!(
+            "the client's invoice carries no amount; a swap needs an amount-bearing invoice"
+        ));
+    }
+    // A sub-satoshi remainder would be paid over Lightning but never charged on-chain.
+    if decoded.amount_msat % 1000 != 0 {
+        return Err(anyhow!(
+            "invoice amount {} msat is not a whole number of satoshis",
+            decoded.amount_msat
+        ));
+    }
     let invoice_amount_sat = decoded.amount_msat / 1000;
-    let onchain_amount_sat = invoice_amount_sat + provider_fee_sat;
+    let onchain_amount_sat = invoice_amount_sat
+        .checked_add(provider_fee_sat)
+        .ok_or_else(|| {
+            anyhow!("on-chain amount overflows: {invoice_amount_sat} + {provider_fee_sat} sat")
+        })?;
 
     // Claim branch = provider (who learns the preimage by paying the invoice); refund branch
     // = client (who reclaims on-chain if the provider doesn't pay before the timeout).
@@ -91,6 +114,7 @@ pub async fn init_submarine_swap(
         claim_key: provider_claim_key,
         invoice: invoice.to_string(),
         max_routing_fee_msat,
+        timelock,
     })
 }
 
@@ -157,6 +181,24 @@ pub async fn drive_submarine_swap(
                 "funding reorged below required confirmations before payment".into(),
             ));
         }
+    }
+
+    // Claim-window guard: paying is irreversible, but the on-chain claim that recovers the money
+    // is a race against the client's refund branch. A client that funds late -- or a funding that
+    // confirms slowly -- can leave only a block or two before that branch opens, and the client
+    // can fee-bump its refund past our claim. Refusing to pay costs nothing: the client simply
+    // refunds its own funding.
+    let tip = run_blocking(|| chain.tip_height())?;
+    if let Err(violation) =
+        timelock::check_submarine_before_pay(tip, swap.timeout_height, &swap.timelock)
+    {
+        warn!(
+            "Submarine swap: not paying the invoice, {violation}. The client's on-chain funding \
+             is untouched and refunds to them at the timeout."
+        );
+        return Ok(SwapState::Failed(format!(
+            "insufficient claim window: {violation}"
+        )));
     }
 
     // 2. Pay the invoice to learn the preimage. A failure costs nothing on-chain — the
@@ -231,9 +273,7 @@ mod tests {
     use crate::reverse::OnchainWallet;
     use bitcoin::secp256k1::Secp256k1;
     use bitcoin::{OutPoint, Transaction, Txid};
-    use lightning_backend::{
-        DecodedInvoice, HoldInvoice, InvoiceState, LightningError, NodeInfo, PaymentResult,
-    };
+    use lightning_backend::{DecodedInvoice, HoldInvoice, LightningError, NodeInfo, PaymentResult};
     use std::str::FromStr;
     use std::sync::Mutex;
     use swap_common::chain::{ChainWatcher, FundingUtxo};
@@ -243,13 +283,27 @@ mod tests {
 
     const INVOICE_SAT: u64 = 100_000;
     const FEE_SAT: u64 = 1_000;
+    /// Chain tip the mocks report, with the timeout a realistic 144 blocks above it.
+    const MOCK_TIP: u32 = 700_000;
     const ONCHAIN_SAT: u64 = INVOICE_SAT + FEE_SAT;
-    const TIMEOUT: u32 = 800_000;
+    const TIMEOUT: u32 = MOCK_TIP + 144;
 
     // Mock LN that decodes to a fixed payment hash and (optionally) pays back a preimage.
     struct MockLn {
         payment_hash: [u8; 32],
         pay_preimage: Option<[u8; 32]>, // None => payment fails
+        /// Set the moment `pay_invoice` is called, so a test can assert the irreversible
+        /// step was never taken.
+        paid: Mutex<bool>,
+    }
+    impl MockLn {
+        fn new(payment_hash: [u8; 32], pay_preimage: Option<[u8; 32]>) -> Self {
+            Self {
+                payment_hash,
+                pay_preimage,
+                paid: Mutex::new(false),
+            }
+        }
     }
     #[async_trait::async_trait]
     impl LightningBackend for MockLn {
@@ -263,10 +317,7 @@ mod tests {
         }
         async fn create_hold_invoice(
             &self,
-            _ph: [u8; 32],
-            _amt: u64,
-            _e: u64,
-            _m: &str,
+            _req: lightning_backend::HoldInvoiceRequest,
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
@@ -278,7 +329,10 @@ mod tests {
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
-        async fn invoice_state(&self, _ph: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
+        async fn invoice_status(
+            &self,
+            _ph: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::InvoiceStatus> {
             Err(LightningError::NotImplemented("mock".into()))
         }
         async fn settle_hold_invoice(&self, _p: [u8; 32]) -> lightning_backend::Result<()> {
@@ -292,6 +346,7 @@ mod tests {
             _bolt11: &str,
             _max_fee_msat: u64,
         ) -> lightning_backend::Result<PaymentResult> {
+            *self.paid.lock().unwrap() = true;
             match self.pay_preimage {
                 Some(preimage) => Ok(PaymentResult {
                     preimage,
@@ -304,6 +359,8 @@ mod tests {
             Ok(DecodedInvoice {
                 payment_hash: self.payment_hash,
                 amount_msat: INVOICE_SAT * 1000,
+                min_final_cltv_expiry: 80,
+                amount_is_explicit: true,
             })
         }
     }
@@ -351,6 +408,14 @@ mod tests {
         }
     }
 
+    /// The timelock model the tests run under.
+    fn params() -> TimelockParams {
+        TimelockParams {
+            htlc_timeout_blocks: TIMEOUT - MOCK_TIP,
+            ..TimelockParams::default()
+        }
+    }
+
     fn dest() -> ScriptBuf {
         ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap()
     }
@@ -380,6 +445,7 @@ mod tests {
             5_000,
             TIMEOUT,
             Network::Regtest,
+            params(),
         )
         .await
         .unwrap();
@@ -390,14 +456,11 @@ mod tests {
     async fn submarine_swap_happy_path_pays_and_claims() {
         let preimage = generate_preimage();
         let ph = payment_hash(&preimage);
-        let ln = MockLn {
-            payment_hash: ph,
-            pay_preimage: Some(preimage),
-        };
+        let ln = MockLn::new(ph, Some(preimage));
         let (swap, _) = make_swap(&ln).await;
 
         let chain = MockChain {
-            tip: 700_000,
+            tip: MOCK_TIP,
             funding: Some(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: ONCHAIN_SAT,
@@ -434,14 +497,11 @@ mod tests {
     async fn submarine_swap_payment_failure_does_not_claim() {
         let preimage = generate_preimage();
         let ph = payment_hash(&preimage);
-        let ln = MockLn {
-            payment_hash: ph,
-            pay_preimage: None, // payment fails
-        };
+        let ln = MockLn::new(ph, None); // payment fails
         let (swap, _) = make_swap(&ln).await;
 
         let chain = MockChain {
-            tip: 700_000,
+            tip: MOCK_TIP,
             funding: Some(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: ONCHAIN_SAT,
@@ -471,14 +531,65 @@ mod tests {
         );
     }
 
+    /// A client that funds only a block or two before its own refund branch opens must not get
+    /// the provider to pay.
+    ///
+    /// Paying the invoice is irreversible, but recovering the money means winning an on-chain
+    /// race against a refund the client can fee-bump. With no window there is no race to win, so
+    /// the provider refuses and the client simply refunds its own funding.
+    #[tokio::test]
+    async fn refuses_to_pay_when_the_claim_window_is_too_short() {
+        let preimage = generate_preimage();
+        let ln = MockLn::new(payment_hash(&preimage), Some(preimage));
+        let (swap, _) = make_swap(&ln).await;
+
+        // Funding confirms with two blocks left before the client's refund branch opens.
+        let chain = MockChain {
+            tip: TIMEOUT - 2,
+            funding: Some(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat,
+                confirmations: 3,
+            }),
+            broadcasts: Mutex::new(Vec::new()),
+        };
+        let wallet = MockWallet { spk: dest() };
+
+        let final_state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            1,
+            Duration::from_millis(0),
+            None,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        match final_state {
+            SwapState::Failed(reason) => assert!(
+                reason.contains("claim window"),
+                "expected a claim-window refusal, got: {reason}"
+            ),
+            other => panic!("expected the swap to be refused, got {other:?}"),
+        }
+        assert!(
+            !*ln.paid.lock().unwrap(),
+            "the provider must not pay an invoice it cannot then claim against"
+        );
+        assert!(
+            chain.broadcasts.lock().unwrap().is_empty(),
+            "nothing should be broadcast"
+        );
+    }
+
     #[tokio::test]
     async fn submarine_swap_expires_without_funding() {
         let preimage = generate_preimage();
         let ph = payment_hash(&preimage);
-        let ln = MockLn {
-            payment_hash: ph,
-            pay_preimage: Some(preimage),
-        };
+        let ln = MockLn::new(ph, Some(preimage));
         let (swap, _) = make_swap(&ln).await;
 
         let chain = MockChain {

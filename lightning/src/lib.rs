@@ -75,6 +75,61 @@ pub struct PaymentResult {
 pub struct DecodedInvoice {
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
+    /// The invoice's `min_final_cltv_expiry` in blocks: how much timelock the payer must leave
+    /// on the final hop. A swap's safety depends on this outliving the on-chain leg, so it is
+    /// part of the decoded surface rather than something callers have to assume.
+    pub min_final_cltv_expiry: u32,
+    /// Whether the invoice carried an explicit amount. A zero-amount invoice is not a
+    /// zero-value one; it means the payer chooses, which a swap must refuse.
+    pub amount_is_explicit: bool,
+}
+
+/// Everything needed to create a hold invoice for a reverse swap.
+///
+/// Grouped into a struct because the CLTV delta is not optional detail: it is the field that
+/// keeps the Lightning leg alive past the on-chain refund height, and a positional argument list
+/// makes it too easy to add a call site that forgets it.
+#[derive(Debug, Clone)]
+pub struct HoldInvoiceRequest {
+    pub payment_hash: [u8; 32],
+    pub amount_msat: u64,
+    pub expiry_secs: u64,
+    /// Minimum final CLTV expiry **delta**, in blocks, that the payer must extend.
+    ///
+    /// Must be non-zero. Left at zero, LND substitutes `--bitcoin.timelockdelta` (80 by
+    /// default), which is far short of a 144-block on-chain timeout: the incoming HTLC would
+    /// expire first, letting the payer reclaim its sats over Lightning and *then* claim the
+    /// on-chain HTLC for free. See [`swap_common::timelock`] for the arithmetic.
+    pub cltv_expiry_delta: u32,
+    pub memo: String,
+}
+
+/// One incoming HTLC held against an invoice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptedHtlc {
+    pub amount_msat: u64,
+    /// The block height at which this HTLC expires, as the node reports it.
+    ///
+    /// This is the **realised** value, not the delta that was requested. Verifying it is the
+    /// point: a node that ignored, clamped, or defaulted the requested delta would otherwise
+    /// leave the swap in exactly the unsafe configuration the delta exists to prevent.
+    pub expiry_height: u32,
+}
+
+/// An invoice's state together with the HTLCs currently held against it.
+#[derive(Debug, Clone)]
+pub struct InvoiceStatus {
+    pub state: InvoiceState,
+    pub amount_paid_msat: u64,
+    pub htlcs: Vec<AcceptedHtlc>,
+}
+
+impl InvoiceStatus {
+    /// The earliest expiry among the held HTLCs: the height by which the whole payment must be
+    /// resolved. `None` when nothing is held.
+    pub fn earliest_htlc_expiry(&self) -> Option<u32> {
+        self.htlcs.iter().map(|h| h.expiry_height).min()
+    }
 }
 
 #[async_trait]
@@ -82,15 +137,12 @@ pub trait LightningBackend: Send + Sync {
     /// Node identity / sync status.
     async fn node_info(&self) -> Result<NodeInfo>;
 
-    /// Create a hold invoice locked to `payment_hash`. The incoming payment will be
+    /// Create a hold invoice locked to `req.payment_hash`. The incoming payment will be
     /// accepted but not settled until [`settle_hold_invoice`](LightningBackend::settle_hold_invoice).
-    async fn create_hold_invoice(
-        &self,
-        payment_hash: [u8; 32],
-        amount_msat: u64,
-        expiry_secs: u64,
-        memo: &str,
-    ) -> Result<HoldInvoice>;
+    ///
+    /// Implementations must apply `req.cltv_expiry_delta` and must reject a zero delta rather
+    /// than silently falling back to a node default.
+    async fn create_hold_invoice(&self, req: HoldInvoiceRequest) -> Result<HoldInvoice>;
 
     /// Create a normal (auto-settling) invoice — the node generates the preimage and settles on
     /// payment. Used by the submarine-swap client: the provider pays this invoice (learning the
@@ -103,8 +155,18 @@ pub trait LightningBackend: Send + Sync {
         memo: &str,
     ) -> Result<HoldInvoice>;
 
+    /// Full status of an invoice: its state plus the HTLCs currently held against it, with
+    /// their realised expiry heights.
+    async fn invoice_status(&self, payment_hash: [u8; 32]) -> Result<InvoiceStatus>;
+
     /// Current state of an invoice identified by its payment hash.
-    async fn invoice_state(&self, payment_hash: [u8; 32]) -> Result<InvoiceState>;
+    ///
+    /// A projection of [`invoice_status`](LightningBackend::invoice_status); it carries no
+    /// safety-relevant information on its own, which is why the timelock checks read the full
+    /// status instead.
+    async fn invoice_state(&self, payment_hash: [u8; 32]) -> Result<InvoiceState> {
+        Ok(self.invoice_status(payment_hash).await?.state)
+    }
 
     /// Settle a held invoice by revealing the preimage (`sha256(preimage) == payment_hash`).
     async fn settle_hold_invoice(&self, preimage: [u8; 32]) -> Result<()>;
@@ -149,13 +211,7 @@ impl LightningBackend for StubBackend {
     async fn node_info(&self) -> Result<NodeInfo> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
-    async fn create_hold_invoice(
-        &self,
-        _payment_hash: [u8; 32],
-        _amount_msat: u64,
-        _expiry_secs: u64,
-        _memo: &str,
-    ) -> Result<HoldInvoice> {
+    async fn create_hold_invoice(&self, _req: HoldInvoiceRequest) -> Result<HoldInvoice> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
     async fn create_invoice(
@@ -166,7 +222,7 @@ impl LightningBackend for StubBackend {
     ) -> Result<HoldInvoice> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
-    async fn invoice_state(&self, _payment_hash: [u8; 32]) -> Result<InvoiceState> {
+    async fn invoice_status(&self, _payment_hash: [u8; 32]) -> Result<InvoiceStatus> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
     async fn settle_hold_invoice(&self, _preimage: [u8; 32]) -> Result<()> {

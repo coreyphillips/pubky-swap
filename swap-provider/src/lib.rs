@@ -36,6 +36,7 @@ use crate::reverse::{
 };
 use crate::store::{JsonFileSwapStore, SwapRecord, SwapStore};
 use crate::submarine::{drive_submarine_swap, init_submarine_swap, SubmarineSwap};
+use swap_common::timelock::{self, TimelockParams};
 
 /// Provider configuration (typically populated from the CLI).
 #[derive(Debug, Clone)]
@@ -51,6 +52,10 @@ pub struct ProviderConfig {
     pub fee_ppm: u64,
     pub required_confirmations: u32,
     pub htlc_timeout_blocks: u32,
+    /// Minimum blocks that must remain before the on-chain timeout for the provider to take
+    /// an irreversible step (paying a submarine invoice, or committing funds to a reverse
+    /// HTLC). Guards the race where a counterparty times its move so our sweep cannot land.
+    pub min_claim_window_blocks: u32,
     pub directions: Vec<SwapDirection>,
     /// Push the offer to all discovered followers on startup.
     pub broadcast_offer: bool,
@@ -101,6 +106,7 @@ impl Default for ProviderConfig {
             fee_ppm: 2_000,
             required_confirmations: 1,
             htlc_timeout_blocks: 144,
+            min_claim_window_blocks: swap_common::timelock::PROVIDER_MIN_CLAIM_WINDOW,
             directions: vec![SwapDirection::Submarine, SwapDirection::Reverse],
             broadcast_offer: false,
             lnd_address: "https://127.0.0.1:10009".to_string(),
@@ -160,6 +166,42 @@ const MIN_MAINNET_CONFIRMATIONS: u32 = 2;
 /// The dynamic estimator (see `onchain::resolve_fee_rate`) can raise the effective rate above
 /// this; the floor only guards the fallback used when estimation is unavailable.
 const MIN_MAINNET_FEE_FLOOR_SAT_VB: u64 = 5;
+
+/// The timelock model derived from the operator's configuration.
+fn timelock_params(c: &ProviderConfig) -> TimelockParams {
+    TimelockParams {
+        htlc_timeout_blocks: c.htlc_timeout_blocks,
+        required_confirmations: c.required_confirmations,
+        min_claim_window_blocks: c.min_claim_window_blocks,
+        ..TimelockParams::default()
+    }
+}
+
+/// Reject a timelock configuration that cannot satisfy the cross-leg invariants at any height.
+///
+/// Checked on every network, not just mainnet: a configuration that cannot order the two legs
+/// correctly is broken everywhere, and finding out at the first swap means finding out with a
+/// counterparty's payment already held.
+fn validate_timelocks(c: &ProviderConfig) -> Result<()> {
+    let p = timelock_params(c);
+    timelock::validate_params(&p).map_err(|e| {
+        anyhow!(
+            "unusable timelock configuration: {e} (htlc_timeout_blocks={}, \
+             required_confirmations={}, min_claim_window_blocks={})",
+            c.htlc_timeout_blocks,
+            c.required_confirmations,
+            c.min_claim_window_blocks
+        )
+    })?;
+    let delta = timelock::reverse_invoice_cltv_delta(&p)
+        .map_err(|e| anyhow!("hold invoice CLTV delta: {e}"))?;
+    tracing::debug!(
+        "timelocks: on-chain refund opens {} blocks after accept; hold invoices carry a \
+         {delta}-block final CLTV so the lightning leg outlives it",
+        c.htlc_timeout_blocks
+    );
+    Ok(())
+}
 
 /// Reject obviously-unsafe parameters on mainnet unless the operator opts in via `allow_unsafe`.
 /// A no-op on non-mainnet networks.
@@ -237,6 +279,7 @@ struct ExecCtx {
     network: Network,
     required_confirmations: u32,
     htlc_timeout_blocks: u32,
+    timelock: TimelockParams,
     onchain_fee_rate_sat_vb: u64,
     invoice_expiry_secs: u64,
     max_routing_fee_msat: u64,
@@ -273,6 +316,7 @@ impl ProgressSink for StoreProgress {
 pub async fn run(config: ProviderConfig) -> Result<()> {
     let network = parse_network(&config.network)?;
     // Refuse to start with unsafe mainnet parameters (guards programmatic callers too).
+    validate_timelocks(&config)?;
     validate_mainnet_safety(&config, network)?;
 
     let transport = match config.recovery_method.as_str() {
@@ -347,6 +391,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         network,
         required_confirmations: config.required_confirmations,
         htlc_timeout_blocks: config.htlc_timeout_blocks,
+        timelock: timelock_params(&config),
         onchain_fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
         invoice_expiry_secs: config.invoice_expiry_secs,
         max_routing_fee_msat: config.max_routing_fee_msat,
@@ -642,6 +687,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         timeout_height,
         ctx.invoice_expiry_secs,
         ctx.network,
+        ctx.timelock,
     )
     .await?;
 
@@ -768,6 +814,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         ctx.max_routing_fee_msat,
         timeout_height,
         ctx.network,
+        ctx.timelock,
     )
     .await?;
 
@@ -856,7 +903,7 @@ fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord
 }
 
 /// Reconstruct a [`ReverseSwap`] from a persisted record (resume path).
-fn reverse_swap_from_record(rec: &SwapRecord) -> Result<ReverseSwap> {
+fn reverse_swap_from_record(rec: &SwapRecord, timelock: TimelockParams) -> Result<ReverseSwap> {
     Ok(ReverseSwap {
         payment_hash: rec.payment_hash()?,
         onchain_amount_sat: rec.onchain_amount_sat,
@@ -866,11 +913,12 @@ fn reverse_swap_from_record(rec: &SwapRecord) -> Result<ReverseSwap> {
         timeout_height: rec.timeout_height,
         refund_key: rec.secret_key()?,
         invoice: rec.invoice.clone(),
+        timelock,
     })
 }
 
 /// Reconstruct a [`SubmarineSwap`] from a persisted record (resume path).
-fn submarine_swap_from_record(rec: &SwapRecord) -> Result<SubmarineSwap> {
+fn submarine_swap_from_record(rec: &SwapRecord, timelock: TimelockParams) -> Result<SubmarineSwap> {
     Ok(SubmarineSwap {
         payment_hash: rec.payment_hash()?,
         onchain_amount_sat: rec.onchain_amount_sat,
@@ -881,6 +929,7 @@ fn submarine_swap_from_record(rec: &SwapRecord) -> Result<SubmarineSwap> {
         claim_key: rec.secret_key()?,
         invoice: rec.invoice.clone(),
         max_routing_fee_msat: rec.max_routing_fee_msat,
+        timelock,
     })
 }
 
@@ -953,11 +1002,11 @@ fn resume_swaps(ctx: &ExecCtx) {
     for rec in records {
         let swap_id = rec.swap_id;
         match rec.direction {
-            SwapDirection::Reverse => match reverse_swap_from_record(&rec) {
+            SwapDirection::Reverse => match reverse_swap_from_record(&rec, ctx.timelock) {
                 Ok(swap) => spawn_reverse_driver(ctx, swap, rec),
                 Err(e) => warn!("cannot resume reverse swap {swap_id}: {e}"),
             },
-            SwapDirection::Submarine => match submarine_swap_from_record(&rec) {
+            SwapDirection::Submarine => match submarine_swap_from_record(&rec, ctx.timelock) {
                 Ok(swap) => spawn_submarine_driver(ctx, swap, rec),
                 Err(e) => warn!("cannot resume submarine swap {swap_id}: {e}"),
             },

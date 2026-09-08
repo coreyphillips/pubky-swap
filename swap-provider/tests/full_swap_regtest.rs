@@ -22,6 +22,7 @@ use std::time::Duration;
 use swap_client::reverse::{execute_reverse_swap, ReverseClaim};
 use swap_common::chain::{ChainWatcher, ElectrumWatcher};
 use swap_common::htlc::{generate_preimage, payment_hash};
+use swap_common::timelock::TimelockParams;
 use swap_common::{random_keypair, SwapState};
 use swap_provider::reverse::{drive_reverse_swap, init_reverse_swap, OnchainWallet};
 use swap_provider::wallet::BdkWallet;
@@ -136,7 +137,14 @@ async fn full_reverse_swap_two_nodes() {
     let (refund_sk, refund_pk) = random_keypair(&secp);
     let preimage = generate_preimage();
     let ph = payment_hash(&preimage);
-    let timeout = chain_p.tip_height().unwrap() + 200;
+    // A 200-block window, and the timelock model derived from it. The hold invoice's final
+    // CLTV is computed from this, so the lightning leg outlives the on-chain refund height.
+    let timelock = TimelockParams {
+        htlc_timeout_blocks: 200,
+        required_confirmations: 1,
+        ..TimelockParams::default()
+    };
+    let timeout = chain_p.tip_height().unwrap() + timelock.htlc_timeout_blocks;
 
     // Provider: create the hold invoice + HTLC.
     let swap = init_reverse_swap(
@@ -151,6 +159,7 @@ async fn full_reverse_swap_two_nodes() {
         timeout,
         3600,
         Network::Regtest,
+        timelock,
     )
     .await
     .expect("init reverse swap");

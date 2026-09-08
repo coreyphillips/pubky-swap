@@ -153,10 +153,7 @@ mod tests {
         }
         async fn create_hold_invoice(
             &self,
-            _: [u8; 32],
-            _: u64,
-            _: u64,
-            _: &str,
+            _req: lightning_backend::HoldInvoiceRequest,
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
@@ -168,8 +165,15 @@ mod tests {
         ) -> lightning_backend::Result<HoldInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }
-        async fn invoice_state(&self, _: [u8; 32]) -> lightning_backend::Result<InvoiceState> {
-            Ok(self.state)
+        async fn invoice_status(
+            &self,
+            _: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::InvoiceStatus> {
+            Ok(lightning_backend::InvoiceStatus {
+                state: self.state,
+                amount_paid_msat: 0,
+                htlcs: Vec::new(),
+            })
         }
         async fn settle_hold_invoice(&self, _: [u8; 32]) -> lightning_backend::Result<()> {
             Err(LightningError::NotImplemented("mock".into()))
