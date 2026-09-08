@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
+use swap_common::timelock::TimelockParams;
+use swap_common::validate::{self, ClientPolicy, DecodedHoldInvoice};
 use swap_common::wallet::OnchainWallet;
 use swap_common::{messages::*, SwapDirection};
 use tokio::time::sleep;
@@ -58,6 +60,40 @@ pub struct ClientConfig {
     /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating, so a provider that
     /// isn't already following us starts polling us for the swap DM. Requires the `iroh` feature.
     pub rendezvous_iroh: bool,
+    /// Confirmations this client requires before acting, whatever the provider quotes. `0` means
+    /// "use the network default" (2 on mainnet, 1 elsewhere).
+    ///
+    /// This is the floor that stops a provider quoting zero confirmations to get us to reveal a
+    /// preimage against a funding it can still replace.
+    pub min_confirmations: u32,
+    /// Most this client will pay in total fees, in basis points of the swap amount.
+    pub max_fee_bps: u16,
+    /// Hard ceiling on anything this client will lock on-chain or pay over Lightning. `0` means
+    /// no ceiling beyond the amount it asked to swap.
+    pub max_total_sat: u64,
+}
+
+/// The policy this client holds providers to.
+fn client_policy(config: &ClientConfig, network: Network) -> ClientPolicy {
+    let mut policy = ClientPolicy::for_network(network, TimelockParams::default());
+    if config.min_confirmations > 0 {
+        policy.min_required_confirmations = config.min_confirmations;
+    }
+    if config.max_fee_bps > 0 {
+        policy.max_fee_bps = config.max_fee_bps;
+    }
+    if config.max_total_sat > 0 {
+        policy.max_total_sat = config.max_total_sat;
+    }
+    policy
+}
+
+/// Seconds since the Unix epoch, for quote and invoice expiry checks.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn parse_network(s: &str) -> Result<Network> {
@@ -104,7 +140,10 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         amount_sat: config.amount_sat,
     };
     transport
-        .send(&config.provider_pkarr, &SwapMessage::QuoteRequest(qreq))
+        .send(
+            &config.provider_pkarr,
+            &SwapMessage::QuoteRequest(qreq.clone()),
+        )
         .await?;
     info!(
         "Requested {:?} quote for {} sat",
@@ -122,6 +161,17 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         quote.quote_id, quote.amount_sat, quote.fee_sat, quote.total_sat, quote.htlc_timeout_blocks
     );
 
+    // Check the quote against what we asked for and against our own policy, before it is used to
+    // derive anything. In particular this is where a provider quoting zero confirmations is
+    // refused: acting on a mempool-only funding would let it read our preimage and then replace
+    // the funding transaction out from under us.
+    let policy = client_policy(&config, network);
+    if let Err(e) = validate::validate_quote(&quote, &qreq, now_unix(), &policy) {
+        return Err(anyhow!("refusing the provider's quote: {e}"));
+    }
+    // Never act on fewer confirmations than our own floor, whatever the quote said.
+    let required_confirmations = policy.effective_confirmations(quote.required_confirmations);
+
     // A receiving a quote confirms the peer is a live provider that serves this direction. In
     // quote-only mode, print a machine-readable line and stop (no funds move).
     if config.quote_only {
@@ -133,13 +183,13 @@ pub async fn run(config: ClientConfig) -> Result<()> {
             quote.fee_sat,
             quote.total_sat,
             quote.htlc_timeout_blocks,
-            quote.required_confirmations
+            required_confirmations
         );
         return Ok(());
     }
 
     if config.direction == SwapDirection::Submarine {
-        return run_submarine(&config, &transport, network, &quote, &client_pkarr).await;
+        return run_submarine(&config, &transport, network, &quote, &client_pkarr, &policy).await;
     }
 
     // 3) Commit to the swap (reverse).
@@ -165,7 +215,19 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     .await?;
     info!("Provider locked HTLC at {}", accept.htlc_address);
 
-    // 5) Independently verify the HTLC the provider built actually pays OUR claim key under OUR
+    // 5a) Check the numbers the provider chose against the quote we agreed to. The script check
+    //     below binds the payment hash, both pubkeys, and the timeout height, but it cannot bind
+    //     *value*: a well-formed script can pay out far less than was quoted. Amounts are checked
+    //     here, and the height-relative checks run once we have a chain tip (5c).
+    let chain_for_checks = build_chain(&config).ok();
+    let tip = chain_for_checks
+        .as_ref()
+        .and_then(|c| swap_common::chain::run_blocking(|| c.tip_height()).ok());
+    if let Err(e) = validate::validate_accept(&accept, &quote, tip, &policy) {
+        return Err(anyhow!("refusing the provider's swap acceptance: {e}"));
+    }
+
+    // 5b) Independently verify the HTLC the provider built actually pays OUR claim key under OUR
     //    payment hash before we pay anything. Rebuild the expected redeem script and compare.
     let provider_refund_pk = parse_pubkey(&accept.provider_pubkey_hex)?;
     let expected_script = build_htlc_script(
@@ -213,10 +275,39 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     let ln = make_backend(&config).await?;
     let chain = build_chain(&config)?;
 
+    // 5c) The hold invoice is the client's entire exposure in a reverse swap, and until now it
+    //     was paid unread. Decode it and bind every field to the quote: our payment hash, the
+    //     exact amount we agreed, and an expiry that outlives the on-chain leg.
+    let decoded = ln
+        .decode_invoice(&invoice)
+        .await
+        .map_err(|e| anyhow!("decode the provider's hold invoice: {e}"))?;
+    if let Err(e) = validate::validate_hold_invoice(
+        &DecodedHoldInvoice {
+            payment_hash: decoded.payment_hash,
+            amount_msat: decoded.amount_msat,
+            amount_is_explicit: decoded.amount_is_explicit,
+            // The backend does not surface an absolute expiry; the quote's own expiry and the
+            // timeout checks above already bound how long this swap may take.
+            expires_at_unix: 0,
+        },
+        &quote,
+        &ph,
+        now_unix(),
+        &policy,
+    ) {
+        return Err(anyhow!("refusing the provider's hold invoice: {e}"));
+    }
+    info!(
+        "Verified the hold invoice pays {} sat against our payment hash",
+        decoded.amount_msat / 1000
+    );
+
     let claim = ReverseClaim {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
-        onchain_amount_sat: accept.onchain_amount_sat,
+        // Checked equal to `quote.amount_sat` above; use our own number regardless.
+        onchain_amount_sat: quote.amount_sat,
         invoice,
         preimage,
         claim_key: claim_sk,
@@ -229,7 +320,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         chain,
         claim,
         config.max_routing_fee_msat,
-        quote.required_confirmations,
+        required_confirmations,
         Duration::from_secs(2),
     )
     .await?;
@@ -246,6 +337,7 @@ async fn run_submarine(
     network: Network,
     quote: &Quote,
     client_pkarr: &str,
+    policy: &ClientPolicy,
 ) -> Result<()> {
     // Execution needs our own LN node (to issue + watch the invoice), Electrum, and a funding
     // wallet (LND's own with `--wallet lnd`, or a BDK wallet from `--wallet-mnemonic`).
@@ -297,8 +389,19 @@ async fn run_submarine(
     })
     .await?;
 
-    // 5) Verify the HTLC pays the provider's claim key under OUR payment hash and is refundable by
-    //    OUR key, before funding anything.
+    // 5a) Check the numbers against the quote before anything is funded. This is the direction
+    //     where the client locks the coins, so an inflated `onchain_amount_sat` is a direct
+    //     transfer of the client's money: a provider could quote 100k sat and then ask for 10M.
+    //     The script check below cannot see it, because the script would be perfectly valid.
+    let chain = build_chain(config)?;
+    let tip = swap_common::chain::run_blocking(|| chain.tip_height())
+        .map_err(|e| anyhow!("tip height: {e}"))?;
+    if let Err(e) = validate::validate_accept(&accept, quote, Some(tip), policy) {
+        return Err(anyhow!("refusing the provider's swap acceptance: {e}"));
+    }
+
+    // 5b) Verify the HTLC pays the provider's claim key under OUR payment hash and is refundable
+    //    by OUR key, before funding anything.
     let provider_claim_pk = parse_pubkey(&accept.provider_pubkey_hex)?;
     let expected_script = build_htlc_script(
         &ph,
@@ -320,16 +423,17 @@ async fn run_submarine(
     }
     info!(
         "Verified submarine HTLC; funding {} sat on-chain",
-        accept.onchain_amount_sat
+        quote.total_sat
     );
 
     // 6) Fund the HTLC and wait for settlement (or refund at timeout).
-    let chain = build_chain(config)?;
     let wallet = build_wallet(config, network).await?;
     let funding = SubmarineFunding {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
-        onchain_amount_sat: accept.onchain_amount_sat,
+        // Checked equal to `accept.onchain_amount_sat` above. Funding our own number rather than
+        // the provider's echo means a provider-supplied amount can never reach the wallet.
+        onchain_amount_sat: quote.total_sat,
         payment_hash: ph,
         refund_key: refund_sk,
         timeout_height: accept.timeout_block_height,

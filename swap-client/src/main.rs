@@ -57,6 +57,22 @@ struct Cli {
     /// Routing-fee cap (msat) when paying the hold invoice.
     #[arg(long, default_value_t = 10_000)]
     max_routing_fee_msat: u64,
+    /// Confirmations to require before acting on a provider's funding, whatever it quotes.
+    /// 0 uses the network default (2 on mainnet, 1 elsewhere). Raising it is safer; lowering it
+    /// below the default lets a provider get you to reveal a preimage against a funding it can
+    /// still replace.
+    #[arg(long, default_value_t = 0)]
+    min_confirmations: u32,
+
+    /// Most to pay in total fees, in basis points of the swap amount (500 = 5%).
+    #[arg(long, default_value_t = 500)]
+    max_fee_bps: u16,
+
+    /// Hard ceiling on what this client will lock on-chain or pay over Lightning, in satoshis.
+    /// 0 means no ceiling beyond the amount you asked to swap.
+    #[arg(long, default_value_t = 0)]
+    max_total_sat: u64,
+
     /// Only check the provider (request a quote and print its rates), then exit without swapping.
     #[arg(long)]
     quote_only: bool,
@@ -114,6 +130,9 @@ async fn main() -> anyhow::Result<()> {
         onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
         max_routing_fee_msat: cli.max_routing_fee_msat,
         quote_only: cli.quote_only,
+        min_confirmations: cli.min_confirmations,
+        max_fee_bps: cli.max_fee_bps,
+        max_total_sat: cli.max_total_sat,
         rendezvous_iroh: cli.rendezvous_iroh,
     };
 
