@@ -63,6 +63,11 @@ pub struct ProviderConfig {
     pub lnd_address: String,
     pub lnd_cert_path: String,
     pub lnd_macaroon_path: String,
+    /// SOCKS5 proxy for Electrum, e.g. `127.0.0.1:9050`. Required to reach a `.onion`
+    /// server; empty means a direct connection.
+    pub electrum_socks5: String,
+    /// Per-call Electrum socket timeout, in seconds.
+    pub electrum_timeout_secs: u8,
     /// Electrum server URL for the chain watcher (e.g. `tcp://127.0.0.1:60001`).
     pub electrum_url: String,
     /// BIP39 mnemonic for the on-chain funding wallet.
@@ -113,6 +118,8 @@ impl Default for ProviderConfig {
             lnd_address: "https://127.0.0.1:10009".to_string(),
             lnd_cert_path: String::new(),
             lnd_macaroon_path: String::new(),
+            electrum_socks5: String::new(),
+            electrum_timeout_secs: 30,
             electrum_url: String::new(),
             wallet_mnemonic: String::new(),
             onchain_fee_rate_sat_vb: 2,
@@ -660,7 +667,12 @@ fn build_chain(config: &ProviderConfig) -> Option<Arc<dyn ChainWatcher>> {
     if config.electrum_url.is_empty() {
         return None;
     }
-    match swap_common::chain::ElectrumWatcher::new(&config.electrum_url) {
+    let mut electrum = swap_common::chain::ElectrumConfig::new(&config.electrum_url);
+    electrum.timeout_secs = config.electrum_timeout_secs;
+    if !config.electrum_socks5.is_empty() {
+        electrum.socks5 = Some(config.electrum_socks5.clone());
+    }
+    match swap_common::chain::ElectrumWatcher::connect(electrum) {
         Ok(w) => Some(Arc::new(w)),
         Err(e) => {
             warn!("chain watcher unavailable: {e}");

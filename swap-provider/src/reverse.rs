@@ -419,11 +419,12 @@ pub async fn drive_reverse_swap(
 mod tests {
     use super::*;
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::{ScriptBuf, Transaction, Txid};
+    use bitcoin::{ScriptBuf, Txid};
     use lightning_backend::{DecodedInvoice, HoldInvoice, LightningError, NodeInfo, PaymentResult};
     use std::str::FromStr;
     use std::sync::Mutex;
-    use swap_common::chain::{ChainWatcher, FundingUtxo};
+    use swap_common::chain::mock::MockChain;
+    use swap_common::chain::FundingUtxo;
     use swap_common::htlc::{generate_preimage, payment_hash};
     use swap_common::onchain::build_claim_tx;
     use swap_common::random_keypair;
@@ -545,36 +546,6 @@ mod tests {
         }
     }
 
-    struct MockChain {
-        tip: u32,
-        funding: Option<FundingUtxo>,
-        spend: Option<Transaction>,
-        broadcasts: Mutex<Vec<Transaction>>,
-    }
-    impl ChainWatcher for MockChain {
-        fn tip_height(&self) -> swap_common::Result<u32> {
-            Ok(self.tip)
-        }
-        fn find_funding(
-            &self,
-            _spk: &bitcoin::Script,
-            _amount: u64,
-        ) -> swap_common::Result<Option<FundingUtxo>> {
-            Ok(self.funding.clone())
-        }
-        fn find_spend(
-            &self,
-            _spk: &bitcoin::Script,
-            _outpoint: &OutPoint,
-        ) -> swap_common::Result<Option<Transaction>> {
-            Ok(self.spend.clone())
-        }
-        fn broadcast(&self, tx: &Transaction) -> swap_common::Result<Txid> {
-            self.broadcasts.lock().unwrap().push(tx.clone());
-            Ok(tx.txid())
-        }
-    }
-
     struct MockWallet {
         funding_outpoint: OutPoint,
         refund_spk: ScriptBuf,
@@ -654,16 +625,15 @@ mod tests {
         )
         .unwrap();
 
-        let chain = MockChain {
-            tip: MOCK_TIP, // below timeout
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
                 outpoint,
                 value_sat: AMOUNT,
                 confirmations: 3,
-            }),
-            spend: Some(claim_tx),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .with_spend(claim_tx)
+            .always_final();
         let wallet = MockWallet {
             funding_outpoint: outpoint,
             refund_spk: dest(),
@@ -688,7 +658,7 @@ mod tests {
             Some(preimage),
             "provider must settle the invoice with the preimage recovered from the claim"
         );
-        assert!(chain.broadcasts.lock().unwrap().is_empty());
+        assert!(chain.broadcasts().is_empty());
     }
 
     #[tokio::test]
@@ -718,16 +688,14 @@ mod tests {
         .unwrap();
 
         let outpoint = funding_outpoint();
-        let chain = MockChain {
-            tip: TIMEOUT, // at/after timeout, and the client never claimed
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT)
+            .with_funding(FundingUtxo {
                 outpoint,
                 value_sat: AMOUNT,
                 confirmations: 3,
-            }),
-            spend: None,
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet {
             funding_outpoint: outpoint,
             refund_spk: dest(),
@@ -748,7 +716,7 @@ mod tests {
 
         assert_eq!(final_state, SwapState::Refunded);
         assert_eq!(
-            chain.broadcasts.lock().unwrap().len(),
+            chain.broadcast_count(),
             1,
             "a refund transaction must be broadcast"
         );
@@ -811,12 +779,7 @@ mod tests {
         .await
         .unwrap();
 
-        let chain = MockChain {
-            tip: MOCK_TIP,
-            funding: None,
-            spend: None,
-            broadcasts: Mutex::new(Vec::new()),
-        };
+        let chain = MockChain::new().always_final().with_tip(MOCK_TIP);
         let wallet = NeverFundWallet { refund_spk: dest() };
 
         let final_state = drive_reverse_swap(
@@ -844,7 +807,7 @@ mod tests {
             "the hold invoice must be cancelled so the client's payment is returned in full"
         );
         assert!(ln.settled_preimage.lock().unwrap().is_none());
-        assert!(chain.broadcasts.lock().unwrap().is_empty());
+        assert!(chain.broadcasts().is_empty());
     }
 
     /// The hold invoice must carry an explicit final CLTV delta that outlives the on-chain
@@ -917,16 +880,14 @@ mod tests {
         .unwrap();
 
         let outpoint = funding_outpoint();
-        let chain = MockChain {
-            tip: TIMEOUT,
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT)
+            .with_funding(FundingUtxo {
                 outpoint,
                 value_sat: AMOUNT,
                 confirmations: 3,
-            }),
-            spend: None,
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet {
             funding_outpoint: outpoint,
             refund_spk: dest(),
@@ -945,7 +906,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(final_state, SwapState::Refunded);
-        assert_eq!(chain.broadcasts.lock().unwrap().len(), 1);
+        assert_eq!(chain.broadcast_count(), 1);
     }
 
     /// A wallet that must never be asked to fund — used to prove a resumed driver does not
@@ -1006,12 +967,10 @@ mod tests {
 
         // The funding UTXO is gone (already spent by the client's claim), so a fresh driver
         // would try to fund again — but on resume with a known outpoint it must not.
-        let chain = MockChain {
-            tip: MOCK_TIP,
-            funding: None,
-            spend: Some(claim_tx),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spend(claim_tx);
         let wallet = PanicFundWallet { refund_spk: dest() };
 
         let final_state = drive_reverse_swap(
@@ -1029,7 +988,7 @@ mod tests {
 
         assert_eq!(final_state, SwapState::Claimed);
         assert!(
-            chain.broadcasts.lock().unwrap().is_empty(),
+            chain.broadcasts().is_empty(),
             "resumed claim path broadcasts nothing (no refund)"
         );
     }

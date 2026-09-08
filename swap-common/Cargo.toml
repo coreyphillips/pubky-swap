@@ -35,4 +35,6 @@ tokio = { version = "1", features = ["macros", "rt", "time"] }
 [features]
 default = []
 electrum = ["dep:electrum-client"]
+# A scriptable ChainWatcher for downstream crates' tests. Always on in this crate's own tests.
+test-util = []
 bdk-wallet = ["dep:bdk"]

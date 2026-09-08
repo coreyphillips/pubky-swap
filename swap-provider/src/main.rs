@@ -54,6 +54,14 @@ struct Cli {
     #[arg(long, default_value = "")]
     lnd_macaroon: String,
 
+    /// SOCKS5 proxy for Electrum, e.g. 127.0.0.1:9050. Required to reach a .onion server.
+    #[arg(long, default_value = "")]
+    electrum_socks5: String,
+
+    /// Per-call Electrum socket timeout, in seconds.
+    #[arg(long, default_value_t = 30)]
+    electrum_timeout_secs: u8,
+
     /// Electrum server URL for the chain watcher / funding wallet (e.g. tcp://127.0.0.1:60001).
     #[arg(long, default_value = "")]
     electrum_url: String,
@@ -139,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
         lnd_cert_path: cli.lnd_cert,
         lnd_macaroon_path: cli.lnd_macaroon,
         electrum_url: cli.electrum_url,
+        electrum_socks5: cli.electrum_socks5,
+        electrum_timeout_secs: cli.electrum_timeout_secs,
         wallet_mnemonic: cli.wallet_mnemonic,
         onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
         invoice_expiry_secs: cli.invoice_expiry,

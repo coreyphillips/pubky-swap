@@ -183,11 +183,12 @@ pub async fn execute_submarine_swap(
 mod tests {
     use super::*;
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::{OutPoint, Transaction, Txid};
+    use bitcoin::{OutPoint, Txid};
     use lightning_backend::{DecodedInvoice, HoldInvoice, LightningError, NodeInfo, PaymentResult};
     use std::str::FromStr;
-    use std::sync::Mutex;
-    use swap_common::chain::{ChainWatcher, FundingUtxo};
+
+    use swap_common::chain::mock::MockChain;
+
     use swap_common::htlc::{
         build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash,
     };
@@ -248,35 +249,6 @@ mod tests {
         }
     }
 
-    struct MockChain {
-        tip: u32,
-        spend: Option<Transaction>,
-        broadcasts: Mutex<Vec<Transaction>>,
-    }
-    impl ChainWatcher for MockChain {
-        fn tip_height(&self) -> swap_common::Result<u32> {
-            Ok(self.tip)
-        }
-        fn find_funding(
-            &self,
-            _: &bitcoin::Script,
-            _: u64,
-        ) -> swap_common::Result<Option<FundingUtxo>> {
-            Ok(None)
-        }
-        fn find_spend(
-            &self,
-            _: &bitcoin::Script,
-            _: &OutPoint,
-        ) -> swap_common::Result<Option<Transaction>> {
-            Ok(self.spend.clone())
-        }
-        fn broadcast(&self, tx: &Transaction) -> swap_common::Result<Txid> {
-            self.broadcasts.lock().unwrap().push(tx.clone());
-            Ok(tx.txid())
-        }
-    }
-
     struct MockWallet {
         outpoint: OutPoint,
         dest: ScriptBuf,
@@ -328,11 +300,7 @@ mod tests {
         let ln: Arc<dyn LightningBackend> = Arc::new(MockLn {
             state: InvoiceState::Settled,
         });
-        let chain: Arc<dyn ChainWatcher> = Arc::new(MockChain {
-            tip: 100,
-            spend: None,
-            broadcasts: Mutex::new(Vec::new()),
-        });
+        let chain: Arc<dyn ChainWatcher> = Arc::new(MockChain::new().with_tip(100).always_final());
         let wallet: Arc<dyn OnchainWallet> = Arc::new(MockWallet {
             outpoint: outpoint(),
             dest: dest(),
@@ -362,11 +330,7 @@ mod tests {
         let ln: Arc<dyn LightningBackend> = Arc::new(MockLn {
             state: InvoiceState::Open, // never settles
         });
-        let chain_mock = Arc::new(MockChain {
-            tip: TIMEOUT, // at timeout, HTLC unspent
-            spend: None,
-            broadcasts: Mutex::new(Vec::new()),
-        });
+        let chain_mock = Arc::new(MockChain::new().with_tip(TIMEOUT).always_final());
         let chain: Arc<dyn ChainWatcher> = chain_mock.clone();
         let wallet: Arc<dyn OnchainWallet> = Arc::new(MockWallet {
             outpoint: outpoint(),
@@ -385,7 +349,7 @@ mod tests {
         .unwrap();
         assert_eq!(state, SwapState::Refunded);
         assert_eq!(
-            chain_mock.broadcasts.lock().unwrap().len(),
+            chain_mock.broadcasts().len(),
             1,
             "a refund tx must be broadcast"
         );

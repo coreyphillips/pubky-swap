@@ -20,7 +20,9 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
 use lightning_backend::{LightningBackend, PaymentStatus};
 use std::time::Duration;
-use swap_common::chain::{run_blocking, ChainWatcher};
+use swap_common::chain::{
+    run_blocking, select_funding, ChainWatcher, FundingSelection, DEFAULT_MAX_OVERPAY_SAT,
+};
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, PaymentHash};
 use swap_common::onchain::{
@@ -153,13 +155,62 @@ pub async fn drive_submarine_swap(
             op
         }
         None => loop {
-            if let Some(utxo) =
-                run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))?
-            {
-                if utxo.confirmations >= required_confirmations {
-                    progress.funded(utxo.outpoint);
-                    break utxo.outpoint;
+            // Classify what is actually paying the address rather than asking "is there an
+            // output worth exactly X". The HTLC address is public from the moment it is in the
+            // `SwapAccept`, so an underpayment, an overpayment, and a double payment are all
+            // things that happen; a single "not funded yet" answer for all of them means waiting
+            // out the whole timeout instead of saying what is wrong.
+            let outputs = run_blocking(|| chain.find_outputs(&swap.htlc_spk))?;
+            match select_funding(&outputs, swap.onchain_amount_sat, DEFAULT_MAX_OVERPAY_SAT) {
+                FundingSelection::Exact(utxo) => {
+                    if utxo.confirmations >= required_confirmations {
+                        progress.funded(utxo.outpoint);
+                        break utxo.outpoint;
+                    }
                 }
+                FundingSelection::Overpaid { utxo, excess_sat } => {
+                    if utxo.confirmations >= required_confirmations {
+                        info!(
+                            "Submarine swap: the client overpaid by {excess_sat} sat; sweeping \
+                             the whole output"
+                        );
+                        progress.funded(utxo.outpoint);
+                        break utxo.outpoint;
+                    }
+                }
+                FundingSelection::Underpaid { got_sat } => {
+                    warn!(
+                        "Submarine swap: the HTLC holds {got_sat} sat but the swap is priced on \
+                         {}. Not proceeding; the client refunds at the timeout.",
+                        swap.onchain_amount_sat
+                    );
+                    return Ok(SwapState::Failed(format!(
+                        "funding is short: {got_sat} of {} sat",
+                        swap.onchain_amount_sat
+                    )));
+                }
+                FundingSelection::ExcessiveOverpay { got_sat } => {
+                    warn!(
+                        "Submarine swap: the HTLC holds {got_sat} sat against an expected {}, \
+                         far beyond tolerance. Not proceeding; the client refunds at the timeout.",
+                        swap.onchain_amount_sat
+                    );
+                    return Ok(SwapState::Failed(format!(
+                        "funding of {got_sat} sat is implausible for a {} sat swap",
+                        swap.onchain_amount_sat
+                    )));
+                }
+                FundingSelection::Multiple(utxos) => {
+                    warn!(
+                        "Submarine swap: {} separate outputs pay the HTLC address. The spend \
+                         builders take a single input, so this is left for the client's refund.",
+                        utxos.len()
+                    );
+                    return Ok(SwapState::Failed(
+                        "several outputs pay the HTLC address".into(),
+                    ));
+                }
+                FundingSelection::None => {}
             }
             if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
                 return Ok(SwapState::Expired);
@@ -173,7 +224,7 @@ pub async fn drive_submarine_swap(
     // to the required depth right before paying. A reorg that dropped it below that depth (or
     // orphaned it entirely) means we must not pay — otherwise we'd pay Lightning for an HTLC that
     // no longer exists. (If it was instead spent by our own earlier claim on resume, finish.)
-    match run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))? {
+    match run_blocking(|| chain.outpoint_status(&swap.htlc_spk, &funding_outpoint))? {
         Some(utxo) if utxo.confirmations >= required_confirmations => {}
         _ => {
             if run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))?.is_some() {
@@ -369,11 +420,12 @@ mod tests {
     use super::*;
     use crate::reverse::OnchainWallet;
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::{OutPoint, Transaction, Txid};
+    use bitcoin::{OutPoint, Txid};
     use lightning_backend::{DecodedInvoice, HoldInvoice, LightningError, NodeInfo, PaymentResult};
     use std::str::FromStr;
     use std::sync::Mutex;
-    use swap_common::chain::{ChainWatcher, FundingUtxo};
+    use swap_common::chain::mock::MockChain;
+    use swap_common::chain::FundingUtxo;
     use swap_common::htlc::{generate_preimage, payment_hash};
     use swap_common::onchain::extract_preimage;
     use swap_common::random_keypair;
@@ -476,35 +528,6 @@ mod tests {
         }
     }
 
-    struct MockChain {
-        tip: u32,
-        funding: Option<FundingUtxo>,
-        broadcasts: Mutex<Vec<Transaction>>,
-    }
-    impl ChainWatcher for MockChain {
-        fn tip_height(&self) -> swap_common::Result<u32> {
-            Ok(self.tip)
-        }
-        fn find_funding(
-            &self,
-            _spk: &bitcoin::Script,
-            _amount: u64,
-        ) -> swap_common::Result<Option<FundingUtxo>> {
-            Ok(self.funding.clone())
-        }
-        fn find_spend(
-            &self,
-            _spk: &bitcoin::Script,
-            _o: &OutPoint,
-        ) -> swap_common::Result<Option<Transaction>> {
-            Ok(None)
-        }
-        fn broadcast(&self, tx: &Transaction) -> swap_common::Result<Txid> {
-            self.broadcasts.lock().unwrap().push(tx.clone());
-            Ok(tx.txid())
-        }
-    }
-
     struct MockWallet {
         spk: ScriptBuf,
     }
@@ -570,15 +593,14 @@ mod tests {
         let ln = MockLn::new(ph, Some(preimage));
         let (swap, _) = make_swap(&ln).await;
 
-        let chain = MockChain {
-            tip: MOCK_TIP,
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: ONCHAIN_SAT,
                 confirmations: 3,
-            }),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet { spk: dest() };
 
         let state = drive_submarine_swap(
@@ -596,7 +618,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(state, SwapState::Claimed);
-        let broadcasts = chain.broadcasts.lock().unwrap();
+        let broadcasts = chain.broadcasts();
         assert_eq!(broadcasts.len(), 1, "one claim tx must be broadcast");
         // The broadcast claim must carry the preimage that matches the hashlock.
         assert_eq!(
@@ -612,15 +634,14 @@ mod tests {
         let ln = MockLn::new(ph, None); // payment fails
         let (swap, _) = make_swap(&ln).await;
 
-        let chain = MockChain {
-            tip: MOCK_TIP,
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: ONCHAIN_SAT,
                 confirmations: 3,
-            }),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet { spk: dest() };
 
         let state = drive_submarine_swap(
@@ -639,7 +660,7 @@ mod tests {
 
         assert!(matches!(state, SwapState::Failed(_)));
         assert!(
-            chain.broadcasts.lock().unwrap().is_empty(),
+            chain.broadcasts().is_empty(),
             "no on-chain claim when the invoice payment fails"
         );
     }
@@ -665,15 +686,14 @@ mod tests {
             }),
         );
         let (swap, _) = make_swap(&ln).await;
-        let chain = MockChain {
-            tip: MOCK_TIP,
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: swap.onchain_amount_sat,
                 confirmations: 3,
-            }),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet { spk: dest() };
 
         let state = drive_submarine_swap(
@@ -696,7 +716,7 @@ mod tests {
             "a settled payment must be adopted, not repeated"
         );
         assert_eq!(
-            chain.broadcasts.lock().unwrap().len(),
+            chain.broadcasts().len(),
             1,
             "the claim must still be broadcast against the HTLC we already bought"
         );
@@ -709,15 +729,14 @@ mod tests {
         let preimage = generate_preimage();
         let ln = MockLn::new(payment_hash(&preimage), Some(preimage));
         let (swap, _) = make_swap(&ln).await;
-        let chain = MockChain {
-            tip: MOCK_TIP,
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: swap.onchain_amount_sat,
                 confirmations: 3,
-            }),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet { spk: dest() };
 
         let state = drive_submarine_swap(
@@ -740,7 +759,87 @@ mod tests {
             "must hand back, not decide"
         );
         assert!(!*ln.paid.lock().unwrap(), "must not pay a second time");
-        assert!(chain.broadcasts.lock().unwrap().is_empty());
+        assert!(chain.broadcasts().is_empty());
+    }
+
+    /// A client that funds the HTLC short must not get the provider to pay the full invoice.
+    ///
+    /// This used to be invisible: the exact-value lookup answered "nothing here" for a short
+    /// funding exactly as it did for an empty address, so the provider waited out the whole
+    /// timeout without ever saying what was wrong.
+    #[tokio::test]
+    async fn refuses_to_pay_against_an_underfunded_htlc() {
+        let preimage = generate_preimage();
+        let ln = MockLn::new(payment_hash(&preimage), Some(preimage));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat - 1,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            1,
+            Duration::from_millis(0),
+            None,
+            false,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        match state {
+            SwapState::Failed(reason) => assert!(
+                reason.contains("short"),
+                "expected a short-funding refusal, got: {reason}"
+            ),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            !*ln.paid.lock().unwrap(),
+            "must not pay against a short HTLC"
+        );
+    }
+
+    /// A small overpayment is accepted and swept whole: refusing would strand the surplus.
+    #[tokio::test]
+    async fn a_small_overpayment_is_accepted() {
+        let preimage = generate_preimage();
+        let ln = MockLn::new(payment_hash(&preimage), Some(preimage));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat + 500,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            1,
+            Duration::from_millis(0),
+            None,
+            false,
+            &(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, SwapState::Claimed);
+        assert!(*ln.paid.lock().unwrap());
     }
 
     #[tokio::test]
@@ -750,15 +849,14 @@ mod tests {
         let (swap, _) = make_swap(&ln).await;
 
         // Funding confirms with two blocks left before the client's refund branch opens.
-        let chain = MockChain {
-            tip: TIMEOUT - 2,
-            funding: Some(FundingUtxo {
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT - 2)
+            .with_funding(FundingUtxo {
                 outpoint: funding_outpoint(),
                 value_sat: swap.onchain_amount_sat,
                 confirmations: 3,
-            }),
-            broadcasts: Mutex::new(Vec::new()),
-        };
+            })
+            .always_final();
         let wallet = MockWallet { spk: dest() };
 
         let final_state = drive_submarine_swap(
@@ -786,10 +884,7 @@ mod tests {
             !*ln.paid.lock().unwrap(),
             "the provider must not pay an invoice it cannot then claim against"
         );
-        assert!(
-            chain.broadcasts.lock().unwrap().is_empty(),
-            "nothing should be broadcast"
-        );
+        assert!(chain.broadcasts().is_empty(), "nothing should be broadcast");
     }
 
     #[tokio::test]
@@ -799,11 +894,7 @@ mod tests {
         let ln = MockLn::new(ph, Some(preimage));
         let (swap, _) = make_swap(&ln).await;
 
-        let chain = MockChain {
-            tip: TIMEOUT, // reached the timeout with no funding
-            funding: None,
-            broadcasts: Mutex::new(Vec::new()),
-        };
+        let chain = MockChain::new().with_tip(TIMEOUT).always_final();
         let wallet = MockWallet { spk: dest() };
 
         let state = drive_submarine_swap(
@@ -821,6 +912,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(state, SwapState::Expired);
-        assert!(chain.broadcasts.lock().unwrap().is_empty());
+        assert!(chain.broadcasts().is_empty());
     }
 }

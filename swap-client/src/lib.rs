@@ -44,6 +44,10 @@ pub struct ClientConfig {
     pub lnd_address: String,
     pub lnd_cert_path: String,
     pub lnd_macaroon_path: String,
+    /// SOCKS5 proxy for Electrum, e.g. `127.0.0.1:9050`. Required to reach a `.onion` server.
+    pub electrum_socks5: String,
+    /// Per-call Electrum socket timeout, in seconds.
+    pub electrum_timeout_secs: u8,
     /// Electrum server URL for watching/claiming the on-chain HTLC.
     pub electrum_url: String,
     /// Address that receives the swept on-chain funds (reverse-swap claim destination).
@@ -712,7 +716,12 @@ async fn make_backend(config: &ClientConfig) -> Result<Arc<dyn LightningBackend>
 /// Build the Electrum chain watcher used to watch/claim the HTLC. Requires the `chain` feature.
 #[cfg(feature = "chain")]
 fn build_chain(config: &ClientConfig) -> Result<Arc<dyn ChainWatcher>> {
-    let watcher = swap_common::chain::ElectrumWatcher::new(&config.electrum_url)
+    let mut electrum = swap_common::chain::ElectrumConfig::new(&config.electrum_url);
+    electrum.timeout_secs = config.electrum_timeout_secs;
+    if !config.electrum_socks5.is_empty() {
+        electrum.socks5 = Some(config.electrum_socks5.clone());
+    }
+    let watcher = swap_common::chain::ElectrumWatcher::connect(electrum)
         .map_err(|e| anyhow!("electrum connect: {e}"))?;
     Ok(Arc::new(watcher))
 }
