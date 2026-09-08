@@ -21,7 +21,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 tracing = { workspace = true, optional = true }
 # For the LND-backed OnchainWallet (feature `lnd`).
 swap-common = { workspace = true, optional = true }
-bitcoin = { workspace = true, optional = true }
+# Unconditional: `discover` needs Network, and it works without the lnd feature.
+bitcoin.workspace = true
 
 [features]
 default = []
@@ -31,7 +32,6 @@ lnd = [
     "dep:hex",
     "dep:rustls",
     "dep:swap-common",
-    "dep:bitcoin",
     "dep:tracing",
 ]
 

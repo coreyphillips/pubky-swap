@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "beignet-backend",
+    "swap-config",
     "pubky-transport",
     "swap-common",
     "lightning",
@@ -43,6 +44,10 @@ rand = "0.8"
 thiserror = "1.0"
 anyhow = "1.0"
 
+# Layered configuration: CLI over environment over file over defaults.
+figment = { version = "0.10", features = ["toml", "env"] }
+toml = "0.8"
+
 # CLI / logging
 clap = { version = "4.0", features = ["derive", "env"] }
 tracing = "0.1"
@@ -54,3 +59,4 @@ swap-common = { path = "swap-common" }
 lightning-backend = { path = "lightning" }
 beignet-backend = { path = "beignet-backend" }
 swap-client = { path = "swap-client" }
+swap-config = { path = "swap-config" }
