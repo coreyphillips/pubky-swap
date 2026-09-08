@@ -8,7 +8,9 @@
 //! sending the client a final `SwapStatusUpdate`. Without those pieces it stays
 //! negotiation-only and rejects `SwapRequest`s.
 
+pub mod pricing;
 pub mod reverse;
+pub mod risk;
 /// Re-exported from `swap-common`, where the store now lives so the client can use it too.
 pub use swap_common::store;
 pub mod submarine;
@@ -27,7 +29,7 @@ use std::sync::Arc;
 use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
 use swap_common::{messages::*, NetworkSpec, SwapDirection, SwapState};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -57,6 +59,19 @@ pub struct ProviderConfig {
     /// an irreversible step (paying a submarine invoice, or committing funds to a reverse
     /// HTLC). Guards the race where a counterparty times its move so our sweep cannot land.
     pub min_claim_window_blocks: u32,
+    /// Swaps this provider will drive at once.
+    pub max_concurrent_swaps: usize,
+    /// Swaps one counterparty may have in flight at once.
+    pub max_concurrent_per_peer: usize,
+    /// Most this provider will have committed on chain across all live swaps.
+    pub max_total_exposure_sat: u64,
+    /// Most this provider will have committed to any one counterparty.
+    pub max_exposure_per_peer_sat: u64,
+    /// On-chain balance kept back, so committing to a swap never leaves the wallet unable to
+    /// pay for a refund it may owe.
+    pub min_onchain_reserve_sat: u64,
+    /// New swaps one counterparty may start per hour.
+    pub max_new_swaps_per_peer_per_hour: u32,
     pub directions: Vec<SwapDirection>,
     /// Push the offer to all discovered followers on startup.
     pub broadcast_offer: bool,
@@ -113,6 +128,12 @@ impl Default for ProviderConfig {
             required_confirmations: 1,
             htlc_timeout_blocks: 144,
             min_claim_window_blocks: swap_common::timelock::PROVIDER_MIN_CLAIM_WINDOW,
+            max_concurrent_swaps: 25,
+            max_concurrent_per_peer: 2,
+            max_total_exposure_sat: 5_000_000,
+            max_exposure_per_peer_sat: 1_000_000,
+            min_onchain_reserve_sat: 100_000,
+            max_new_swaps_per_peer_per_hour: 6,
             directions: vec![SwapDirection::Submarine, SwapDirection::Reverse],
             broadcast_offer: false,
             lnd_address: "https://127.0.0.1:10009".to_string(),
@@ -174,6 +195,18 @@ const MIN_MAINNET_CONFIRMATIONS: u32 = 2;
 /// The dynamic estimator (see `onchain::resolve_fee_rate`) can raise the effective rate above
 /// this; the floor only guards the fallback used when estimation is unavailable.
 const MIN_MAINNET_FEE_FLOOR_SAT_VB: u64 = 5;
+
+/// The risk limits derived from the operator's configuration.
+fn risk_limits(c: &ProviderConfig) -> risk::RiskLimits {
+    risk::RiskLimits {
+        max_concurrent_swaps: c.max_concurrent_swaps,
+        max_concurrent_per_peer: c.max_concurrent_per_peer,
+        max_total_exposure_sat: c.max_total_exposure_sat,
+        max_exposure_per_peer_sat: c.max_exposure_per_peer_sat,
+        min_onchain_reserve_sat: c.min_onchain_reserve_sat,
+        max_new_swaps_per_peer_per_hour: c.max_new_swaps_per_peer_per_hour,
+    }
+}
 
 /// The timelock model derived from the operator's configuration.
 fn timelock_params(c: &ProviderConfig) -> TimelockParams {
@@ -286,7 +319,6 @@ struct ExecCtx {
     wallet: Option<Arc<dyn OnchainWallet>>,
     network: Network,
     required_confirmations: u32,
-    htlc_timeout_blocks: u32,
     timelock: TimelockParams,
     onchain_fee_rate_sat_vb: u64,
     invoice_expiry_secs: u64,
@@ -294,6 +326,8 @@ struct ExecCtx {
     quote_ttl_secs: u64,
     quotes: Arc<Mutex<HashMap<Uuid, IssuedQuote>>>,
     store: Arc<dyn SwapStore>,
+    risk: Arc<risk::RiskManager>,
+    min_onchain_reserve_sat: u64,
     /// True when the provider can execute swaps (real LN + chain + wallet present).
     capable: bool,
 }
@@ -489,6 +523,52 @@ async fn finish_driver_run(
     }
 }
 
+/// Keep the advertised offer current.
+///
+/// An offer carries an expiry and a fee estimate, and both go stale. Built once at startup it
+/// advertised an expired validity window for the life of the process and a fee environment from
+/// whenever the daemon happened to boot.
+fn spawn_offer_refresher(
+    ctx: &ExecCtx,
+    config: &ProviderConfig,
+    provider_pkarr: &str,
+    network: Network,
+    lightning_node_id: Option<String>,
+    offer: Arc<RwLock<SwapOffer>>,
+) {
+    let ctx = ctx.clone();
+    let config = config.clone();
+    let provider_pkarr = provider_pkarr.to_string();
+    // Refresh well inside the validity window so it never lapses between rebuilds.
+    let period = Duration::from_secs((config.quote_ttl_secs / 2).max(30));
+    tokio::spawn(async move {
+        loop {
+            sleep(period).await;
+            let rate = offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb);
+            let fresh = build_offer(
+                &config,
+                &provider_pkarr,
+                network,
+                lightning_node_id.clone(),
+                rate,
+            );
+            let changed = {
+                let current = offer.read().await;
+                current.onchain_fee_sat != fresh.onchain_fee_sat
+            };
+            if changed {
+                info!(
+                    "repriced the offer: on-chain cost now {} sat at {rate} sat/vB (effective \
+                     minimum {} sat)",
+                    fresh.onchain_fee_sat,
+                    fresh.effective_min_amount_sat()
+                );
+            }
+            *offer.write().await = fresh;
+        }
+    });
+}
+
 /// Sweep terminal swap records that are old enough to drop.
 fn spawn_record_pruner(ctx: &ExecCtx) {
     let store = ctx.store.clone();
@@ -524,8 +604,11 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
 
     // Lightning backend (real with `--features lnd`, else a stub).
     let ln = make_backend(&config).await;
+    let mut lightning_node_id: Option<String> = None;
     let ln_ready = match ln.node_info().await {
         Ok(info) => {
+            // Advertise the node id so a client can see who it would be paying, and route to it.
+            lightning_node_id = Some(info.pubkey.clone());
             info!(
                 "Connected to LND node {} (alias {})",
                 info.pubkey, info.alias
@@ -582,7 +665,6 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         wallet,
         network,
         required_confirmations: config.required_confirmations,
-        htlc_timeout_blocks: config.htlc_timeout_blocks,
         timelock: timelock_params(&config),
         onchain_fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
         invoice_expiry_secs: config.invoice_expiry_secs,
@@ -590,6 +672,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         quote_ttl_secs: config.quote_ttl_secs,
         quotes: Arc::new(Mutex::new(HashMap::new())),
         store,
+        risk: risk::RiskManager::new(risk_limits(&config)),
+        min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
     };
 
@@ -605,10 +689,39 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     // Accept iroh rendezvous connections (the doorbell), if enabled and built with `--features iroh`.
     maybe_spawn_iroh_rendezvous(&ctx, &config);
 
-    let offer = build_offer(&config, &provider_pkarr, network);
-    info!(
-        "Advertising offer {} ({}..{} sat, dirs: {:?})",
-        offer.offer_id, offer.min_amount_sat, offer.max_amount_sat, offer.directions
+    // The offer is rebuilt periodically rather than once at startup.
+    //
+    // It carries `valid_until_unix`, computed from the quote TTL, so an offer built once went
+    // stale after `quote_ttl_secs` and stayed that way for the life of the process. It also
+    // carries a fee estimate, which is only meaningful if it tracks the mempool.
+    let offer = Arc::new(RwLock::new(build_offer(
+        &config,
+        &provider_pkarr,
+        network,
+        lightning_node_id.clone(),
+        offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb),
+    )));
+    {
+        let o = offer.read().await;
+        info!(
+            "Advertising offer {} ({}..{} sat, dirs: {:?}); on-chain cost priced at {} sat at \
+             {} sat/vB, so the effective minimum is {} sat",
+            o.offer_id,
+            o.min_amount_sat,
+            o.max_amount_sat,
+            o.directions,
+            o.onchain_fee_sat,
+            o.fee_rate_sat_vb,
+            o.effective_min_amount_sat()
+        );
+    }
+    spawn_offer_refresher(
+        &ctx,
+        &config,
+        &provider_pkarr,
+        network,
+        lightning_node_id,
+        offer.clone(),
     );
 
     if let Err(e) = transport.discover_peers().await {
@@ -616,10 +729,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     }
     if config.broadcast_offer {
         for peer in transport.get_known_peers() {
-            if let Err(e) = transport
-                .send(&peer, &SwapMessage::Offer(offer.clone()))
-                .await
-            {
+            let current = offer.read().await.clone();
+            if let Err(e) = transport.send(&peer, &SwapMessage::Offer(current)).await {
                 debug!("failed to send offer to {peer}: {e}");
             }
         }
@@ -632,7 +743,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             .await
             .unwrap_or_default();
         for (sender, msg) in messages {
-            if let Err(e) = handle_message(&ctx, &offer, &sender, msg).await {
+            let current = offer.read().await.clone();
+            if let Err(e) = handle_message(&ctx, &current, &sender, msg).await {
                 warn!("error handling message from {sender}: {e}");
             }
         }
@@ -740,7 +852,39 @@ fn build_bdk_wallet(_config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> 
     None
 }
 
-fn build_offer(config: &ProviderConfig, provider_pkarr: &str, network: Network) -> SwapOffer {
+/// The chain fee rate to price an offer at: a live estimate, clamped to the operator's floor.
+fn offer_fee_rate(ctx_chain: Option<&Arc<dyn ChainWatcher>>, floor: u64) -> u64 {
+    let estimate = ctx_chain
+        .and_then(|c| run_blocking(|| c.estimate_fee_rate(FUNDING_FEE_TARGET_BLOCKS)).ok())
+        .flatten();
+    swap_common::onchain::resolve_fee_rate(
+        estimate,
+        floor,
+        swap_common::onchain::ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+    )
+}
+
+/// Confirmation target for pricing an offer's on-chain component.
+const FUNDING_FEE_TARGET_BLOCKS: u16 = 3;
+
+fn build_offer(
+    config: &ProviderConfig,
+    provider_pkarr: &str,
+    network: Network,
+    lightning_node_id: Option<String>,
+    fee_rate_sat_vb: u64,
+) -> SwapOffer {
+    // Price the on-chain component from the direction that costs the most, so a single advertised
+    // figure covers whichever direction a client picks.
+    let script = pricing::representative_htlc_script();
+    let dest = pricing::representative_dest_spk();
+    let onchain_fee_sat = config
+        .directions
+        .iter()
+        .map(|d| pricing::expected_onchain_cost_sat(*d, fee_rate_sat_vb, &script, &dest))
+        .max()
+        .unwrap_or(0);
+
     SwapOffer {
         offer_id: Uuid::new_v4(),
         provider_pkarr: provider_pkarr.to_string(),
@@ -752,10 +896,12 @@ fn build_offer(config: &ProviderConfig, provider_pkarr: &str, network: Network) 
         fee_ppm: config.fee_ppm,
         required_confirmations: config.required_confirmations,
         htlc_timeout_blocks: config.htlc_timeout_blocks,
-        lightning_node_id: None,
+        lightning_node_id,
         // Advisory: clients should always request a fresh Quote (which carries the firm,
         // enforced expiry) before committing.
         valid_until_unix: now_unix().saturating_add(config.quote_ttl_secs),
+        onchain_fee_sat,
+        fee_rate_sat_vb,
     }
 }
 
@@ -784,8 +930,11 @@ async fn handle_message(
                 offer_id: offer.offer_id,
                 direction: req.direction,
                 amount_sat: req.amount_sat,
-                fee_sat: fee,
-                total_sat: req.amount_sat.saturating_add(fee),
+                fee_sat: fee.total_fee_sat,
+                service_fee_sat: fee.service_fee_sat,
+                onchain_fee_sat: fee.onchain_fee_sat,
+                fee_rate_sat_vb: offer.fee_rate_sat_vb,
+                total_sat: req.amount_sat.saturating_add(fee.total_fee_sat),
                 htlc_timeout_blocks: offer.htlc_timeout_blocks,
                 required_confirmations: offer.required_confirmations,
                 valid_until_unix: expires_at_unix,
@@ -805,7 +954,7 @@ async fn handle_message(
                     IssuedQuote {
                         direction: req.direction,
                         amount_sat: req.amount_sat,
-                        fee_sat: fee,
+                        fee_sat: fee.total_fee_sat,
                         expires_at_unix,
                     },
                 );
@@ -851,6 +1000,52 @@ async fn handle_message(
     Ok(())
 }
 
+/// Reserve capacity and check the wallet can actually fund this swap, before anything is
+/// promised to the counterparty.
+///
+/// Ordering is the point. A reverse swap creates a hold invoice, takes the client's Lightning
+/// payment, and only then tries to fund the HTLC. Discovering there is nothing to fund with at
+/// that moment is the worst possible time, because the counterparty's money is already held and
+/// the only way out is cancelling an invoice they have already paid.
+async fn reserve_for_swap(
+    ctx: &ExecCtx,
+    peer: &str,
+    swap_id: Uuid,
+    direction: SwapDirection,
+    onchain_amount_sat: u64,
+) -> Result<risk::ReservationGuard> {
+    let guard = ctx
+        .risk
+        .reserve(peer, swap_id, onchain_amount_sat)
+        .map_err(|reason| anyhow!("{reason}"))?;
+
+    // Only a reverse swap spends the provider's own coins on chain; in a submarine swap the
+    // client funds and we claim.
+    if direction == SwapDirection::Reverse {
+        if let Some(wallet) = ctx.wallet.as_ref() {
+            let balance = run_blocking(|| wallet.spendable_balance_sat())
+                .map_err(|e| anyhow!("wallet balance: {e}"))?;
+            if let Some(available) = balance {
+                let needed = onchain_amount_sat
+                    .saturating_add(ctx.min_onchain_reserve_sat)
+                    .saturating_add(
+                        ctx.onchain_fee_rate_sat_vb
+                            .saturating_mul(pricing::FUNDING_VSIZE),
+                    );
+                if available < needed {
+                    return Err(anyhow!(
+                        "insufficient on-chain balance: {available} sat available, {needed} sat \
+                         needed for a {onchain_amount_sat} sat swap plus fees and the \
+                         {} sat reserve",
+                        ctx.min_onchain_reserve_sat
+                    ));
+                }
+            }
+        }
+    }
+    Ok(guard)
+}
+
 /// Start a reverse swap: create the hold invoice + HTLC, reply with `SwapAccept`, and spawn
 /// the driver.
 async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<()> {
@@ -870,10 +1065,23 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     )?;
     let payment_hash = parse_hash32(&req.payment_hash_hex)?;
 
+    // Reserve capacity and check the wallet before the hold invoice exists. Creating the
+    // invoice first would mean discovering we cannot fund only after the client has paid it.
+    let swap_id = Uuid::new_v4();
+    let reservation = reserve_for_swap(
+        ctx,
+        sender,
+        swap_id,
+        SwapDirection::Reverse,
+        quote.amount_sat,
+    )
+    .await?;
+
     let secp = Secp256k1::new();
     let (refund_sk, refund_pk) = swap_common::random_keypair(&secp);
     let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip height: {e}"))?;
-    let timeout_height = tip + ctx.htlc_timeout_blocks;
+    let timeout_height = timelock::onchain_timeout(tip, &ctx.timelock)
+        .map_err(|e| anyhow!("timeout height: {e}"))?;
 
     let swap = init_reverse_swap(
         ctx.ln.as_ref(),
@@ -891,7 +1099,6 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     )
     .await?;
 
-    let swap_id = Uuid::new_v4();
     let accept = SwapAccept {
         quote_id: req.quote_id,
         swap_id,
@@ -930,13 +1137,20 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     if let Err(e) = ctx.store.put(&record) {
         warn!("failed to persist reverse swap {swap_id}: {e}");
     }
-    spawn_reverse_driver(ctx, swap, record);
+    spawn_reverse_driver(ctx, swap, record, Some(reservation));
     Ok(())
 }
 
 /// Spawn the per-swap reverse driver task (shared by fresh starts and restart-resume), persisting
 /// progress and cleaning up the store + sending a final status on completion.
-fn spawn_reverse_driver(ctx: &ExecCtx, swap: ReverseSwap, record: SwapRecord) {
+fn spawn_reverse_driver(
+    ctx: &ExecCtx,
+    swap: ReverseSwap,
+    record: SwapRecord,
+    // Held for the driver's lifetime, so exposure is released when the task ends however it
+    // ends. A driver that panics or is cancelled cannot leave capacity counted forever.
+    reservation: Option<risk::ReservationGuard>,
+) {
     let chain = match ctx.chain.clone() {
         Some(c) => c,
         None => return,
@@ -955,6 +1169,7 @@ fn spawn_reverse_driver(ctx: &ExecCtx, swap: ReverseSwap, record: SwapRecord) {
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
+        let _reservation = reservation;
         let result = drive_reverse_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -968,7 +1183,7 @@ fn spawn_reverse_driver(ctx: &ExecCtx, swap: ReverseSwap, record: SwapRecord) {
         .await;
         finish_driver_run(&ctx2, &progress, &peer, swap_id, result, |ctx, rec| {
             match reverse_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_reverse_driver(ctx, swap, rec),
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, None),
                 Err(e) => error!("cannot re-enter reverse swap {swap_id}: {e}"),
             }
         })
@@ -1001,10 +1216,24 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
             .ok_or_else(|| anyhow!("submarine swap requires client_refund_pubkey"))?,
     )?;
 
+    // Reserve before anything is promised. A submarine swap does not spend our coins on chain,
+    // but it does commit our Lightning liquidity and a driver slot, and one counterparty should
+    // not be able to take all of either.
+    let swap_id = Uuid::new_v4();
+    let reservation = reserve_for_swap(
+        ctx,
+        sender,
+        swap_id,
+        SwapDirection::Submarine,
+        quote.amount_sat.saturating_add(quote.fee_sat),
+    )
+    .await?;
+
     let secp = Secp256k1::new();
     let (claim_sk, claim_pk) = swap_common::random_keypair(&secp);
     let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip height: {e}"))?;
-    let timeout_height = tip + ctx.htlc_timeout_blocks;
+    let timeout_height = timelock::onchain_timeout(tip, &ctx.timelock)
+        .map_err(|e| anyhow!("timeout height: {e}"))?;
 
     let swap = init_submarine_swap(
         ctx.ln.as_ref(),
@@ -1021,7 +1250,6 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
     )
     .await?;
 
-    let swap_id = Uuid::new_v4();
     let accept = SwapAccept {
         quote_id: req.quote_id,
         swap_id,
@@ -1063,12 +1291,19 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
     if let Err(e) = ctx.store.put(&record) {
         warn!("failed to persist submarine swap {swap_id}: {e}");
     }
-    spawn_submarine_driver(ctx, swap, record);
+    spawn_submarine_driver(ctx, swap, record, Some(reservation));
     Ok(())
 }
 
 /// Spawn the per-swap submarine driver task (shared by fresh starts and restart-resume).
-fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord) {
+fn spawn_submarine_driver(
+    ctx: &ExecCtx,
+    swap: SubmarineSwap,
+    record: SwapRecord,
+    // Held for the driver's lifetime, so exposure is released when the task ends however it
+    // ends. A driver that panics or is cancelled cannot leave capacity counted forever.
+    reservation: Option<risk::ReservationGuard>,
+) {
     let chain = match ctx.chain.clone() {
         Some(c) => c,
         None => return,
@@ -1088,6 +1323,7 @@ fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
+        let _reservation = reservation;
         let result = drive_submarine_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -1102,7 +1338,7 @@ fn spawn_submarine_driver(ctx: &ExecCtx, swap: SubmarineSwap, record: SwapRecord
         .await;
         finish_driver_run(&ctx2, &progress, &peer, swap_id, result, |ctx, rec| {
             match submarine_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_submarine_driver(ctx, swap, rec),
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, None),
                 Err(e) => error!("cannot re-enter submarine swap {swap_id}: {e}"),
             }
         })
@@ -1213,16 +1449,27 @@ fn resume_swaps(ctx: &ExecCtx) {
         );
         std::process::exit(1);
     }
+    // Re-establish exposure accounting before spawning anything: the money committed by these
+    // swaps is committed whether or not this process has been up, and starting from zero would
+    // let the provider commit its whole ceiling again on top of them.
+    let mut guards: std::collections::HashMap<Uuid, risk::ReservationGuard> = ctx
+        .risk
+        .restore(&records)
+        .into_iter()
+        .zip(records.iter().map(|r| r.swap_id))
+        .map(|(g, id)| (id, g))
+        .collect();
     info!("Resuming {} persisted swap(s)", records.len());
     for rec in records {
         let swap_id = rec.swap_id;
+        let guard = guards.remove(&swap_id);
         match rec.direction {
             SwapDirection::Reverse => match reverse_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_reverse_driver(ctx, swap, rec),
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, guard),
                 Err(e) => warn!("cannot resume reverse swap {swap_id}: {e}"),
             },
             SwapDirection::Submarine => match submarine_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_submarine_driver(ctx, swap, rec),
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, guard),
                 Err(e) => warn!("cannot resume submarine swap {swap_id}: {e}"),
             },
         }

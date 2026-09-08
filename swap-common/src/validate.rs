@@ -74,25 +74,71 @@ impl ClientPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     QuoteIdMissing,
-    OfferMismatch { got: String, want: String },
+    OfferMismatch {
+        got: String,
+        want: String,
+    },
     DirectionMismatch,
-    AmountMismatch { got: u64, want: u64 },
-    QuoteExpired { now_unix: u64, valid_until: u64 },
+    AmountMismatch {
+        got: u64,
+        want: u64,
+    },
+    QuoteExpired {
+        now_unix: u64,
+        valid_until: u64,
+    },
     QuoteNeverExpires,
-    QuoteValidTooLong { valid_for_secs: u64, max: u64 },
-    TotalNotAmountPlusFee { total: u64, amount: u64, fee: u64 },
-    FeeTooHigh { fee_sat: u64, max_sat: u64 },
-    TotalTooLarge { total_sat: u64, max_sat: u64 },
-    ConfirmationsTooLow { got: u32, min: u32 },
-    ConfirmationsTooHigh { got: u32, max: u32 },
+    QuoteValidTooLong {
+        valid_for_secs: u64,
+        max: u64,
+    },
+    TotalNotAmountPlusFee {
+        total: u64,
+        amount: u64,
+        fee: u64,
+    },
+    FeeTooHigh {
+        fee_sat: u64,
+        max_sat: u64,
+    },
+    FeeItemisationMismatch {
+        service_sat: u64,
+        onchain_sat: u64,
+        total_sat: u64,
+    },
+    TotalTooLarge {
+        total_sat: u64,
+        max_sat: u64,
+    },
+    ConfirmationsTooLow {
+        got: u32,
+        min: u32,
+    },
+    ConfirmationsTooHigh {
+        got: u32,
+        max: u32,
+    },
     SwapIdMissing,
-    OnchainAmountMismatch { got: u64, want: u64 },
-    TimeoutMismatch { got: u32, want: u32, slack: u32 },
+    OnchainAmountMismatch {
+        got: u64,
+        want: u64,
+    },
+    TimeoutMismatch {
+        got: u32,
+        want: u32,
+        slack: u32,
+    },
     Timelock(TimelockViolation),
     PaymentHashMismatch,
-    InvoiceAmountMismatch { got_msat: u64, want_msat: u64 },
+    InvoiceAmountMismatch {
+        got_msat: u64,
+        want_msat: u64,
+    },
     InvoiceHasNoAmount,
-    InvoiceExpiresTooSoon { expires_at_unix: u64, need: u64 },
+    InvoiceExpiresTooSoon {
+        expires_at_unix: u64,
+        need: u64,
+    },
     MissingInvoice,
     Overflow,
 }
@@ -130,6 +176,14 @@ impl fmt::Display for ValidationError {
             Self::FeeTooHigh { fee_sat, max_sat } => {
                 write!(f, "fee {fee_sat} sat exceeds our ceiling of {max_sat} sat")
             }
+            Self::FeeItemisationMismatch {
+                service_sat,
+                onchain_sat,
+                total_sat,
+            } => write!(
+                f,
+                "quoted fee {total_sat} sat is not its parts: {service_sat} service +                  {onchain_sat} on-chain"
+            ),
             Self::TotalTooLarge { total_sat, max_sat } => {
                 write!(
                     f,
@@ -248,6 +302,23 @@ pub fn validate_quote(
             fee: quote.fee_sat,
         });
     }
+    // The itemisation has to be self-consistent, or the split is decoration rather than
+    // something a client can reason about. A v0 provider sends neither part, which is why this
+    // only binds when at least one is present.
+    if quote.service_fee_sat != 0 || quote.onchain_fee_sat != 0 {
+        let itemised = quote
+            .service_fee_sat
+            .checked_add(quote.onchain_fee_sat)
+            .ok_or(ValidationError::Overflow)?;
+        if itemised != quote.fee_sat {
+            return Err(ValidationError::FeeItemisationMismatch {
+                service_sat: quote.service_fee_sat,
+                onchain_sat: quote.onchain_fee_sat,
+                total_sat: quote.fee_sat,
+            });
+        }
+    }
+
     let max_fee = (u128::from(quote.amount_sat) * u128::from(policy.max_fee_bps) / 10_000) as u64;
     if quote.fee_sat > max_fee {
         return Err(ValidationError::FeeTooHigh {
@@ -441,6 +512,9 @@ mod tests {
             direction,
             amount_sat: AMOUNT,
             fee_sat: FEE,
+            service_fee_sat: FEE / 2,
+            onchain_fee_sat: FEE - FEE / 2,
+            fee_rate_sat_vb: 5,
             total_sat: AMOUNT + FEE,
             htlc_timeout_blocks: 144,
             required_confirmations: 2,
@@ -557,11 +631,35 @@ mod tests {
     fn rejects_an_extortionate_fee() {
         let mut q = quote(SwapDirection::Reverse);
         q.fee_sat = AMOUNT / 2;
+        // Keep the itemisation consistent so this isolates the ceiling rather than the split.
+        q.service_fee_sat = q.fee_sat;
+        q.onchain_fee_sat = 0;
         q.total_sat = q.amount_sat + q.fee_sat;
         assert!(matches!(
             validate_quote(&q, &request(SwapDirection::Reverse), NOW, &policy()),
             Err(ValidationError::FeeTooHigh { .. })
         ));
+    }
+
+    /// A split that does not add up is decoration rather than something the client can reason
+    /// about, so it is refused outright.
+    #[test]
+    fn rejects_a_fee_split_that_does_not_add_up() {
+        let mut q = quote(SwapDirection::Reverse);
+        q.service_fee_sat = 100;
+        q.onchain_fee_sat = 100;
+        // ...but fee_sat says something else.
+        assert_ne!(q.service_fee_sat + q.onchain_fee_sat, q.fee_sat);
+        assert!(matches!(
+            validate_quote(&q, &request(SwapDirection::Reverse), NOW, &policy()),
+            Err(ValidationError::FeeItemisationMismatch { .. })
+        ));
+
+        // A provider that sends no itemisation at all is not held to it.
+        let mut q = quote(SwapDirection::Reverse);
+        q.service_fee_sat = 0;
+        q.onchain_fee_sat = 0;
+        validate_quote(&q, &request(SwapDirection::Reverse), NOW, &policy()).unwrap();
     }
 
     #[test]
