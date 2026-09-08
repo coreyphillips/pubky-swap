@@ -9,6 +9,8 @@ description = "Generic, message-type-agnostic transport over pubky-messenger (en
 [features]
 # DHT-based provider rendezvous (announce/lookup by topic) over the mainline BitTorrent DHT.
 dht = ["dep:mainline"]
+# Direct P2P rendezvous over iroh (NAT-holepunched QUIC, discovery via pkarr/mainline).
+iroh = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
 pubky-messenger.workspace = true
@@ -20,3 +22,5 @@ thiserror.workspace = true
 futures.workspace = true
 tracing.workspace = true
 mainline = { workspace = true, optional = true }
+iroh = { version = "1.0.1", optional = true }
+tokio = { workspace = true, optional = true }

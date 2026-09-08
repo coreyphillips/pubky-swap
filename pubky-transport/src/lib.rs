@@ -19,6 +19,9 @@ use tracing::{debug, warn};
 #[cfg(feature = "dht")]
 pub mod rendezvous;
 
+#[cfg(feature = "iroh")]
+pub mod p2p;
+
 #[derive(Error, Debug)]
 pub enum TransportError {
     #[error("transport error: {0}")]
@@ -32,6 +35,9 @@ pub enum TransportError {
     /// DHT rendezvous error (feature `dht`; see [`rendezvous`]).
     #[error("dht error: {0}")]
     Dht(String),
+    /// iroh P2P rendezvous error (feature `iroh`; see [`p2p`]).
+    #[error("iroh error: {0}")]
+    Iroh(String),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
