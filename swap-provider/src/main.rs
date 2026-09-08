@@ -87,6 +87,11 @@ struct Cli {
     /// immediately on swap completion regardless of this value.
     #[arg(long, default_value_t = 3600)]
     peer_idle_ttl: u64,
+
+    /// Accept iroh P2P rendezvous connections (the "doorbell") so clients that know our pubky can
+    /// reach us without a pre-existing follow. Requires a build with `--features iroh`.
+    #[arg(long)]
+    rendezvous_iroh: bool,
 }
 
 #[tokio::main]
@@ -136,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         data_dir: cli.data_dir,
         wallet_backend: cli.wallet,
         peer_idle_ttl_secs: cli.peer_idle_ttl,
+        rendezvous_iroh: cli.rendezvous_iroh,
     };
 
     run(config).await

@@ -3578,6 +3578,7 @@ dependencies = [
 name = "pubky-transport"
 version = "0.1.0"
 dependencies = [
+ "bip39",
  "blake3",
  "futures",
  "iroh",
