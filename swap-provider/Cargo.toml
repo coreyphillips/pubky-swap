@@ -37,11 +37,12 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The scriptable ChainWatcher used by the unit tests.
+swap-common = { workspace = true, features = ["test-util"] }
 # Needed to implement the async LightningBackend trait for test mocks.
 async-trait.workspace = true
 # Needed by integration tests to name these crates directly.
 bitcoin.workspace = true
-swap-common.workspace = true
 lightning-backend.workspace = true
 swap-client.workspace = true
 tokio.workspace = true

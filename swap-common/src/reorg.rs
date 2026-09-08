@@ -91,78 +91,40 @@ impl ReorgMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::FundingUtxo;
     use bitcoin::hashes::Hash;
-    use bitcoin::{OutPoint, Script, Transaction, Txid};
-    use std::sync::Mutex;
 
-    /// A chain whose tip height and per-height block hashes are scriptable, to simulate reorgs.
-    struct FakeChain {
-        tip: Mutex<u32>,
-        // height -> hash byte (so we can flip a height's hash to simulate a reorg)
-        hashes: Mutex<std::collections::HashMap<u32, u8>>,
-    }
-    impl FakeChain {
-        fn new() -> Self {
-            Self {
-                tip: Mutex::new(0),
-                hashes: Mutex::new(std::collections::HashMap::new()),
-            }
-        }
-        fn set_tip(&self, h: u32) {
-            *self.tip.lock().unwrap() = h;
-        }
-        fn set_hash(&self, height: u32, byte: u8) {
-            self.hashes.lock().unwrap().insert(height, byte);
-        }
-    }
-    impl ChainWatcher for FakeChain {
-        fn tip_height(&self) -> Result<u32> {
-            Ok(*self.tip.lock().unwrap())
-        }
-        fn find_funding(&self, _: &Script, _: u64) -> Result<Option<FundingUtxo>> {
-            Ok(None)
-        }
-        fn find_spend(&self, _: &Script, _: &OutPoint) -> Result<Option<Transaction>> {
-            Ok(None)
-        }
-        fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-            Ok(tx.txid())
-        }
-        fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
-            if height > *self.tip.lock().unwrap() {
-                return Ok(None);
-            }
-            let byte = *self.hashes.lock().unwrap().get(&height).unwrap_or(&0);
-            let mut bytes = [0u8; 32];
-            bytes[0] = byte;
-            bytes[1] = height as u8;
-            Ok(Some(BlockHash::from_byte_array(bytes)))
-        }
+    use crate::chain::mock::MockChain;
+
+    /// A distinct block hash per (height, generation), so a test can flip a height's hash.
+    fn hash(height: u32, generation: u8) -> BlockHash {
+        let mut bytes = [0u8; 32];
+        bytes[0] = generation;
+        bytes[1..5].copy_from_slice(&height.to_le_bytes());
+        BlockHash::from_byte_array(bytes)
     }
 
     #[test]
     fn no_reorg_when_hashes_are_stable() {
-        let chain = FakeChain::new();
+        let chain = MockChain::new();
         let mut mon = ReorgMonitor::new(10);
         chain.set_tip(100);
-        chain.set_hash(100, 1);
+        chain.set_block_hash(100, hash(100, 1));
         assert_eq!(mon.observe(&chain).unwrap(), None);
         chain.set_tip(101);
-        chain.set_hash(101, 1);
+        chain.set_block_hash(101, hash(101, 1));
         assert_eq!(mon.observe(&chain).unwrap(), None);
     }
 
     #[test]
     fn detects_hash_change_at_a_seen_height() {
-        let chain = FakeChain::new();
+        let chain = MockChain::new();
         let mut mon = ReorgMonitor::new(10);
         chain.set_tip(100);
-        chain.set_hash(100, 1);
+        chain.set_block_hash(100, hash(100, 1));
         assert_eq!(mon.observe(&chain).unwrap(), None);
 
-        // Same height, different hash → a reorg replaced block 100.
-        chain.set_hash(100, 2);
+        // Same height, different hash: a reorg replaced block 100.
+        chain.set_block_hash(100, hash(100, 2));
         assert_eq!(mon.observe(&chain).unwrap(), Some(100));
         // The same reorg isn't reported again.
         assert_eq!(mon.observe(&chain).unwrap(), None);
@@ -170,38 +132,26 @@ mod tests {
 
     #[test]
     fn detects_tip_rollback() {
-        let chain = FakeChain::new();
+        let chain = MockChain::new();
         let mut mon = ReorgMonitor::new(10);
         chain.set_tip(105);
-        chain.set_hash(105, 1);
+        chain.set_block_hash(105, hash(105, 1));
         assert_eq!(mon.observe(&chain).unwrap(), None);
 
-        // Tip drops below a recorded checkpoint → rollback.
+        // Tip drops below a recorded checkpoint: a rollback.
         chain.set_tip(103);
-        chain.set_hash(103, 1);
+        chain.set_block_hash(103, hash(103, 1));
         assert_eq!(mon.observe(&chain).unwrap(), Some(105));
     }
 
     #[test]
-    fn opts_out_when_no_block_hashes() {
-        // A watcher returning None for block_hash_at never reports a reorg.
-        struct NoHashes;
-        impl ChainWatcher for NoHashes {
-            fn tip_height(&self) -> Result<u32> {
-                Ok(10)
-            }
-            fn find_funding(&self, _: &Script, _: u64) -> Result<Option<FundingUtxo>> {
-                Ok(None)
-            }
-            fn find_spend(&self, _: &Script, _: &OutPoint) -> Result<Option<Transaction>> {
-                Ok(None)
-            }
-            fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-                Ok(tx.txid())
-            }
-        }
+    fn a_watcher_without_block_hashes_records_nothing() {
+        // A watcher that cannot answer `block_hash_at` cannot detect reorgs. That used to be the
+        // trait's default, so a production watcher could arrive here by forgetting a method;
+        // now it takes saying so.
+        let chain = MockChain::new().with_tip(10);
         let mut mon = ReorgMonitor::new(10);
-        assert_eq!(mon.observe(&NoHashes).unwrap(), None);
+        assert_eq!(mon.observe(&chain).unwrap(), None);
         assert_eq!(mon.checkpoint_count(), 0);
     }
 }

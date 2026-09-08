@@ -172,11 +172,12 @@ pub async fn execute_reverse_swap(
 mod tests {
     use super::*;
     use bitcoin::secp256k1::Secp256k1;
-    use bitcoin::{Network, OutPoint, Transaction, Txid as BTxid};
+    use bitcoin::{Network, OutPoint, Txid as BTxid};
     use lightning_backend::{DecodedInvoice, HoldInvoice, LightningError, NodeInfo, PaymentResult};
     use std::str::FromStr;
-    use std::sync::Mutex;
-    use swap_common::chain::{ChainWatcher, FundingUtxo};
+
+    use swap_common::chain::mock::MockChain;
+    use swap_common::chain::FundingUtxo;
     use swap_common::htlc::{
         build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash,
     };
@@ -239,34 +240,6 @@ mod tests {
         }
     }
 
-    struct MockChain {
-        funding: Option<FundingUtxo>,
-        broadcasts: Mutex<Vec<Transaction>>,
-    }
-    impl ChainWatcher for MockChain {
-        fn tip_height(&self) -> swap_common::Result<u32> {
-            Ok(MOCK_TIP)
-        }
-        fn find_funding(
-            &self,
-            _: &bitcoin::Script,
-            _: u64,
-        ) -> swap_common::Result<Option<FundingUtxo>> {
-            Ok(self.funding.clone())
-        }
-        fn find_spend(
-            &self,
-            _: &bitcoin::Script,
-            _: &OutPoint,
-        ) -> swap_common::Result<Option<Transaction>> {
-            Ok(None)
-        }
-        fn broadcast(&self, tx: &Transaction) -> swap_common::Result<BTxid> {
-            self.broadcasts.lock().unwrap().push(tx.clone());
-            Ok(tx.txid())
-        }
-    }
-
     #[tokio::test]
     async fn client_pays_and_claims() {
         let secp = Secp256k1::new();
@@ -286,14 +259,15 @@ mod tests {
         let dest = ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap();
 
         let ln: Arc<dyn LightningBackend> = Arc::new(MockLn { preimage });
-        let mc = Arc::new(MockChain {
-            funding: Some(FundingUtxo {
-                outpoint,
-                value_sat: AMOUNT,
-                confirmations: 2,
-            }),
-            broadcasts: Mutex::new(Vec::new()),
-        });
+        let mc = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
         let chain: Arc<dyn ChainWatcher> = mc.clone();
 
         let claim = ReverseClaim {
@@ -313,7 +287,7 @@ mod tests {
             .unwrap();
 
         // A claim carrying the preimage was broadcast at the funding outpoint.
-        let broadcasts = mc.broadcasts.lock().unwrap();
+        let broadcasts = mc.broadcasts();
         assert_eq!(broadcasts.len(), 1);
         assert_eq!(
             extract_preimage(&broadcasts[0], &outpoint, &ph),

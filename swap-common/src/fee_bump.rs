@@ -274,10 +274,9 @@ pub async fn confirm_or_bump(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chain::FundingUtxo;
+    use crate::chain::mock::MockChain;
     use bitcoin::absolute::LockTime;
     use bitcoin::{OutPoint, TxOut};
-    use std::sync::Mutex;
 
     fn spk() -> bitcoin::ScriptBuf {
         bitcoin::ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap()
@@ -302,6 +301,10 @@ mod tests {
         }
     }
 
+    fn chain(confs: Vec<Option<u32>>) -> MockChain {
+        MockChain::new().with_tip(800_000).with_confirmations(confs)
+    }
+
     fn cfg(deadline: Option<u32>) -> SpendWatchConfig {
         SpendWatchConfig {
             fee_target_blocks: 3,
@@ -315,78 +318,9 @@ mod tests {
         }
     }
 
-    /// A chain whose answers are scripted per call, so a test can walk a spend through a
-    /// specific sequence of states.
-    struct ScriptedChain {
-        tip: Mutex<u32>,
-        confs: Vec<Option<u32>>,
-        conf_idx: Mutex<usize>,
-        /// Returned by `find_spend`, to model a rival (or our own replacement) taking the output.
-        spend: Mutex<Option<Transaction>>,
-        broadcasts: Mutex<Vec<Txid>>,
-        estimate: Option<u64>,
-        reject_after_first: bool,
-    }
-
-    impl ScriptedChain {
-        fn new(confs: Vec<Option<u32>>) -> Self {
-            Self {
-                tip: Mutex::new(800_000),
-                confs,
-                conf_idx: Mutex::new(0),
-                spend: Mutex::new(None),
-                broadcasts: Mutex::new(Vec::new()),
-                estimate: None,
-                reject_after_first: false,
-            }
-        }
-        fn with_spend(self, tx: Transaction) -> Self {
-            *self.spend.lock().unwrap() = Some(tx);
-            self
-        }
-        fn rejecting_replacements(mut self) -> Self {
-            self.reject_after_first = true;
-            self
-        }
-        fn broadcast_count(&self) -> usize {
-            self.broadcasts.lock().unwrap().len()
-        }
-    }
-
-    impl ChainWatcher for ScriptedChain {
-        fn tip_height(&self) -> Result<u32> {
-            Ok(*self.tip.lock().unwrap())
-        }
-        fn find_funding(&self, _: &Script, _: u64) -> Result<Option<FundingUtxo>> {
-            Ok(None)
-        }
-        fn find_spend(&self, _: &Script, _: &OutPoint) -> Result<Option<Transaction>> {
-            Ok(self.spend.lock().unwrap().clone())
-        }
-        fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
-            let mut b = self.broadcasts.lock().unwrap();
-            b.push(tx.txid());
-            if self.reject_after_first && b.len() > 1 {
-                return Err(crate::error::SwapError::Other(
-                    "replacement rejected".into(),
-                ));
-            }
-            Ok(tx.txid())
-        }
-        fn estimate_fee_rate(&self, _t: u16) -> Result<Option<u64>> {
-            Ok(self.estimate)
-        }
-        fn tx_confirmations(&self, _: &Script, _: &Txid) -> Result<Option<u32>> {
-            let mut i = self.conf_idx.lock().unwrap();
-            let v = *self.confs.get(*i).unwrap_or(self.confs.last().unwrap());
-            *i += 1;
-            Ok(v)
-        }
-    }
-
     #[tokio::test]
     async fn confirms_once_buried() {
-        let chain = ScriptedChain::new(vec![Some(0), Some(1), Some(2)]);
+        let chain = chain(vec![Some(0), Some(1), Some(2)]);
         let out = confirm_or_bump(
             &chain,
             spk().as_script(),
@@ -414,7 +348,7 @@ mod tests {
         let rival = tx_paying(42);
         let rival_txid = rival.txid();
         // `None` forever: our transaction is nowhere to be found, exactly as when a rival wins.
-        let chain = ScriptedChain::new(vec![None]).with_spend(rival);
+        let chain = chain(vec![None]).with_spend(rival);
 
         let out = tokio::time::timeout(
             Duration::from_secs(5),
@@ -446,7 +380,7 @@ mod tests {
     async fn our_own_replacement_is_not_mistaken_for_a_rival() {
         // The first build (at the floor rate) is what `find_spend` will report.
         let ours = tx_paying(100_000 - 5);
-        let chain = ScriptedChain::new(vec![Some(0), Some(3)]).with_spend(ours);
+        let chain = chain(vec![Some(0), Some(3)]).with_spend(ours);
         let out = confirm_or_bump(
             &chain,
             spk().as_script(),
@@ -466,8 +400,8 @@ mod tests {
     /// A claim that never confirms must give up at its deadline rather than spinning.
     #[tokio::test]
     async fn a_claim_gives_up_at_its_deadline() {
-        let chain = ScriptedChain::new(vec![Some(0)]);
-        *chain.tip.lock().unwrap() = 800_000;
+        let chain = chain(vec![Some(0)]);
+        chain.set_tip(800_000);
         let out = tokio::time::timeout(
             Duration::from_secs(5),
             confirm_or_bump(
@@ -489,7 +423,7 @@ mod tests {
     /// ever against a stalled backend.
     #[tokio::test]
     async fn a_refund_without_a_deadline_still_terminates() {
-        let chain = ScriptedChain::new(vec![Some(0)]);
+        let chain = chain(vec![Some(0)]);
         let mut c = cfg(None);
         c.max_iterations = 5;
         let out = tokio::time::timeout(
@@ -512,7 +446,7 @@ mod tests {
     #[tokio::test]
     async fn a_reorged_out_spend_is_rebroadcast() {
         // Confirms, then vanishes (reorged out), then confirms again.
-        let chain = ScriptedChain::new(vec![Some(1), None, Some(2)]);
+        let chain = chain(vec![Some(1), None, Some(2)]);
         confirm_or_bump(
             &chain,
             spk().as_script(),
@@ -532,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn cpfp_is_tried_when_a_replacement_is_rejected() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let chain = ScriptedChain::new(vec![Some(0), Some(2)]).rejecting_replacements();
+        let chain = chain(vec![Some(0), Some(2)]).rejecting_replacements();
         let called = AtomicBool::new(false);
         let cpfp = |_parent: Txid, _rate: u64| -> Option<Txid> {
             called.store(true, Ordering::SeqCst);
@@ -553,7 +487,7 @@ mod tests {
 
     #[tokio::test]
     async fn already_final_returns_without_bumping() {
-        let chain = ScriptedChain::new(vec![Some(6)]);
+        let chain = chain(vec![Some(6)]);
         confirm_or_bump(
             &chain,
             spk().as_script(),

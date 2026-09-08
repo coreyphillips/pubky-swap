@@ -34,4 +34,6 @@ hex.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+# The scriptable ChainWatcher used by the unit tests.
+swap-common = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
