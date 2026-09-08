@@ -228,6 +228,7 @@ async fn full_submarine_swap_two_nodes() {
         client_wallet.clone(),
         funding,
         Duration::from_secs(1),
+        &(),
     ));
 
     let provider_result = tokio::time::timeout(Duration::from_secs(90), provider_task)

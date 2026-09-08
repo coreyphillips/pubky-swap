@@ -6,6 +6,7 @@
 //! with the preimage) lives in [`reverse`].
 
 pub mod reverse;
+pub mod store;
 pub mod submarine;
 
 use anyhow::{anyhow, Result};
@@ -18,10 +19,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
+use swap_common::store::JsonFileSwapStore;
 use swap_common::timelock::TimelockParams;
 use swap_common::validate::{self, ClientPolicy, DecodedHoldInvoice};
 use swap_common::wallet::OnchainWallet;
-use swap_common::{messages::*, SwapDirection};
+use swap_common::{messages::*, SwapDirection, SwapState};
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -71,6 +73,11 @@ pub struct ClientConfig {
     /// Hard ceiling on anything this client will lock on-chain or pay over Lightning. `0` means
     /// no ceiling beyond the amount it asked to swap.
     pub max_total_sat: u64,
+    /// Directory for persisted in-flight swap state.
+    ///
+    /// A submarine swap's refund key is generated here and exists nowhere else. Losing it does
+    /// not fail the swap, it makes the on-chain output unspendable by anyone, forever.
+    pub data_dir: String,
 }
 
 /// The policy this client holds providers to.
@@ -86,6 +93,39 @@ fn client_policy(config: &ClientConfig, network: Network) -> ClientPolicy {
         policy.max_total_sat = config.max_total_sat;
     }
     policy
+}
+
+/// Tell the operator about swaps this client left in flight.
+///
+/// A record here is not an inconvenience, it is money: each one holds the only key that can move
+/// the funds on this side's branch of an HTLC. Reporting them loudly is the difference between an
+/// operator recovering coins and never knowing they were at risk.
+fn report_unfinished_swaps(store: &dyn swap_common::store::SwapStore) {
+    match store::unfinished(store) {
+        Ok(records) if records.is_empty() => {}
+        Ok(records) => {
+            warn!(
+                "{} swap(s) from a previous run are still unfinished. Their branch keys are in \
+                 the data directory and are the only way to recover any committed funds; do not \
+                 delete them.",
+                records.len()
+            );
+            for rec in records {
+                warn!(
+                    "  swap {} ({:?}) with {}: state {:?}, timeout height {}, funding {}",
+                    rec.swap_id,
+                    rec.direction,
+                    rec.peer,
+                    rec.state,
+                    rec.timeout_height,
+                    rec.funding_outpoint()
+                        .map(|o| o.to_string())
+                        .unwrap_or_else(|| "none recorded".into()),
+                );
+            }
+        }
+        Err(e) => warn!("could not read persisted swaps: {e}"),
+    }
 }
 
 /// Seconds since the Unix epoch, for quote and invoice expiry checks.
@@ -119,6 +159,9 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     };
     let client_pkarr = transport.public_key_string();
     info!("Client pubky: {client_pkarr}");
+
+    let store = store::open(&config.data_dir)?;
+    report_unfinished_swaps(&store);
     transport.add_known_peer(config.provider_pkarr.clone());
 
     // Optionally ring the provider's iroh doorbell so a provider that isn't already following us
@@ -189,8 +232,42 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     }
 
     if config.direction == SwapDirection::Submarine {
-        return run_submarine(&config, &transport, network, &quote, &client_pkarr, &policy).await;
+        return run_submarine(
+            &config,
+            &transport,
+            network,
+            &quote,
+            &client_pkarr,
+            &policy,
+            &store,
+        )
+        .await;
     }
+
+    // Persist the preimage and claim key before committing to the swap.
+    //
+    // Unlike the provider, a reverse-swap client cannot recover its preimage from anywhere: it
+    // generated it, and nothing else has a copy. Losing it after paying the hold invoice means
+    // paying for coins it can no longer claim, and being made whole only if the provider
+    // correctly refunds and cancels. Relying on a counterparty's correctness for your own safety
+    // is not a design, so it goes on disk first.
+    let client_swap_id = Uuid::new_v4();
+    store::record_intent(
+        &store,
+        &store::NewClientSwap {
+            swap_id: client_swap_id,
+            direction: SwapDirection::Reverse,
+            peer: config.provider_pkarr.clone(),
+            network: swap_common::NetworkSpec::from_bitcoin_network(network),
+            payment_hash: ph,
+            branch_key: claim_sk.secret_bytes(),
+            preimage: Some(preimage),
+            invoice: String::new(),
+            quote_total_sat: quote.total_sat,
+            required_confirmations,
+            fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
+        },
+    )?;
 
     // 3) Commit to the swap (reverse).
     let sreq = SwapRequest {
@@ -303,6 +380,15 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         decoded.amount_msat / 1000
     );
 
+    store::record_accept(
+        &store,
+        client_swap_id,
+        hex::encode(expected_script.as_bytes()),
+        accept.timeout_block_height,
+        quote.amount_sat,
+        hex::encode(dest_spk.as_bytes()),
+    )?;
+
     let claim = ReverseClaim {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
@@ -324,8 +410,21 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         required_confirmations,
         Duration::from_secs(2),
     )
-    .await?;
-    info!("Reverse swap complete; claim broadcast as {txid}");
+    .await;
+    match &txid {
+        Ok(id) => {
+            info!("Reverse swap complete; claim broadcast as {id}");
+            if let Err(e) = store::record_terminal(&store, client_swap_id, SwapState::Claimed) {
+                warn!("could not record the swap outcome: {e}");
+            }
+        }
+        Err(e) => {
+            // The record stays active on purpose. It holds the preimage and claim key, which are
+            // the only way to recover anything if the HTLC is still claimable.
+            warn!("Reverse swap did not complete: {e}. The swap record is retained.");
+        }
+    }
+    txid?;
 
     Ok(())
 }
@@ -339,6 +438,7 @@ async fn run_submarine(
     quote: &Quote,
     client_pkarr: &str,
     policy: &ClientPolicy,
+    store: &JsonFileSwapStore,
 ) -> Result<()> {
     // Execution needs our own LN node (to issue + watch the invoice), Electrum, and a funding
     // wallet (LND's own with `--wallet lnd`, or a BDK wallet from `--wallet-mnemonic`).
@@ -367,6 +467,30 @@ async fn run_submarine(
     // Our HTLC refund key (refund branch of the HTLC the provider claims).
     let secp = Secp256k1::new();
     let (refund_sk, refund_pk) = swap_common::random_keypair(&secp);
+
+    // Persist the key before telling anyone the swap exists.
+    //
+    // This key is the only thing that can ever move the funds on the refund branch of the HTLC
+    // we are about to fund. It is generated here and exists nowhere else in the world. Writing it
+    // after the counterparty replies would leave a window in which a crash loses it, and losing
+    // it does not fail the swap: it makes the output unspendable by anyone, forever.
+    let client_swap_id = Uuid::new_v4();
+    store::record_intent(
+        store,
+        &store::NewClientSwap {
+            swap_id: client_swap_id,
+            direction: SwapDirection::Submarine,
+            peer: config.provider_pkarr.clone(),
+            network: swap_common::NetworkSpec::from_bitcoin_network(network),
+            payment_hash: ph,
+            branch_key: refund_sk.secret_bytes(),
+            preimage: None,
+            invoice: invoice.bolt11.clone(),
+            quote_total_sat: quote.total_sat,
+            required_confirmations: policy.effective_confirmations(quote.required_confirmations),
+            fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
+        },
+    )?;
 
     // 3) Commit to the swap, carrying our invoice + refund pubkey.
     let sreq = SwapRequest {
@@ -429,6 +553,18 @@ async fn run_submarine(
 
     // 6) Fund the HTLC and wait for settlement (or refund at timeout).
     let wallet = build_wallet(config, network).await?;
+    let dest_spk = wallet.receive_destination();
+    store::record_accept(
+        store,
+        client_swap_id,
+        hex::encode(expected_script.as_bytes()),
+        accept.timeout_block_height,
+        quote.total_sat,
+        hex::encode(dest_spk.as_bytes()),
+    )?;
+    // The intent marker goes down before the transaction goes out, so a crash in that gap leaves
+    // something pointing at the coins rather than nothing.
+    store::record_funding_intent(store, client_swap_id, tip)?;
     let funding = SubmarineFunding {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
@@ -440,8 +576,30 @@ async fn run_submarine(
         timeout_height: accept.timeout_block_height,
         fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
     };
-    let state = execute_submarine_swap(ln, chain, wallet, funding, Duration::from_secs(2)).await?;
+    // Record where the coins land as soon as the funding transaction exists.
+    struct RecordFunding<'a> {
+        store: &'a JsonFileSwapStore,
+        swap_id: Uuid,
+    }
+    impl crate::submarine::FundingSink for RecordFunding<'_> {
+        fn funded(&self, outpoint: bitcoin::OutPoint) {
+            if let Err(e) = store::record_funded(self.store, self.swap_id, outpoint) {
+                // Loud, because a funding whose outpoint never reached disk is exactly the case
+                // a resumed client has to go hunting for.
+                tracing::error!("FAILED TO PERSIST the funding outpoint {outpoint}: {e}");
+            }
+        }
+    }
+    let sink = RecordFunding {
+        store,
+        swap_id: client_swap_id,
+    };
+    let state =
+        execute_submarine_swap(ln, chain, wallet, funding, Duration::from_secs(2), &sink).await?;
     info!("Submarine swap finished: {state:?}");
+    if let Err(e) = store::record_terminal(store, client_swap_id, state.clone()) {
+        warn!("could not record the swap outcome: {e}");
+    }
     Ok(())
 }
 

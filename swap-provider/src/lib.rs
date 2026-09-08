@@ -9,7 +9,8 @@
 //! negotiation-only and rejects `SwapRequest`s.
 
 pub mod reverse;
-pub mod store;
+/// Re-exported from `swap-common`, where the store now lives so the client can use it too.
+pub use swap_common::store;
 pub mod submarine;
 #[cfg(feature = "bdk-wallet")]
 pub mod wallet;

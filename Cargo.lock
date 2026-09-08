@@ -4549,6 +4549,7 @@ dependencies = [
 name = "swap-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bdk",
  "bitcoin",
  "electrum-client",

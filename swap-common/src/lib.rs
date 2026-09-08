@@ -8,6 +8,7 @@
 //! - [`chain`] — chain observation (`ChainWatcher`; Electrum impl behind feature `electrum`).
 //! - [`timelock`] — cross-leg timelock invariants (the ordering that makes a swap atomic).
 //! - [`validate`] — client-side checks on a provider's quote, acceptance, and invoice.
+//! - [`store`] — crash-safe persistence of in-flight swaps, shared by both sides.
 //! - [`keys`] — key helpers.
 
 pub mod chain;
@@ -18,6 +19,7 @@ pub mod keys;
 pub mod messages;
 pub mod onchain;
 pub mod reorg;
+pub mod store;
 pub mod swap;
 pub mod timelock;
 pub mod validate;

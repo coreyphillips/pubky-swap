@@ -14,6 +14,7 @@ uuid.workspace = true
 hex.workspace = true
 rand.workspace = true
 thiserror.workspace = true
+anyhow.workspace = true
 tracing.workspace = true
 # `time` for the fee-bump loop; `rt`/`rt-multi-thread` for `chain::blocking` (block_in_place).
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread"] }
