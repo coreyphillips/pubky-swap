@@ -15,6 +15,9 @@ use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tracing::{debug, warn};
 
+#[cfg(feature = "dht")]
+pub mod rendezvous;
+
 #[derive(Error, Debug)]
 pub enum TransportError {
     #[error("transport error: {0}")]
@@ -25,6 +28,9 @@ pub enum TransportError {
     InvalidPubkey(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// DHT rendezvous error (feature `dht`; see [`rendezvous`]).
+    #[error("dht error: {0}")]
+    Dht(String),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
@@ -94,17 +100,22 @@ impl Transport {
             .unwrap_or_default()
     }
 
-    /// Discover peers (users who follow us) from the Pubky follow graph.
+    /// Discover peers (users *we* follow) from the Pubky follow graph.
+    ///
+    /// This reads our own outbound follow list (`pubky://<self>/pub/pubky.app/follows/`), i.e.
+    /// the accounts we have chosen to follow — not our followers. Pubky stores each follow
+    /// record under the follower's own homeserver, so there is no reverse "who follows me"
+    /// lookup here; finding inbound followers needs an external indexer (e.g. Nexus).
     pub async fn discover_peers(&self) -> Result<Vec<String>> {
-        let followers = self
+        let followed = self
             .messenger
             .get_followed_users()
             .await
-            .map_err(|e| TransportError::Messenger(format!("get followers: {e}")))?;
+            .map_err(|e| TransportError::Messenger(format!("get followed users: {e}")))?;
         let mut discovered = Vec::new();
-        for follower in followers {
-            self.add_known_peer(follower.pubky.clone());
-            discovered.push(follower.pubky);
+        for user in followed {
+            self.add_known_peer(user.pubky.clone());
+            discovered.push(user.pubky);
         }
         Ok(discovered)
     }
@@ -247,5 +258,57 @@ impl Transport {
             processed.clear();
         }
         Ok(())
+    }
+}
+
+/// The messaging surface the swap protocol needs from a transport.
+///
+/// [`Transport`] (encrypted Pubky DMs) is the implementation used today. Naming the surface as a
+/// trait is the seam that lets the same `swap-provider` / `swap-client` protocol run over an
+/// alternative transport later, e.g. an authenticated, holepunched P2P stream located via the
+/// [`rendezvous`] module on the mainline DHT, without touching the swap state machine, HTLC
+/// scripting, or persisted store.
+///
+/// Discovery and execution have different needs: discovery wants to be real-time (a client
+/// walking up to a listening provider), while execution spans blocks/hours and must survive
+/// disconnects and restarts. A DHT stream suits the former; the durable store-and-forward DMs
+/// modelled here remain the safer choice for the latter, so a deployment may use both.
+///
+/// The trait is intentionally not object-safe (the message type is generic per call, matching
+/// [`Transport`]); it is a static seam for generic code, not a `dyn` boundary.
+#[allow(async_fn_in_trait)]
+pub trait SwapTransport {
+    /// This transport's own public key (pkarr) string.
+    fn public_key_string(&self) -> String;
+    /// Track a peer so it is polled by [`receive_all`](Self::receive_all).
+    fn add_known_peer(&self, peer_pkarr: String);
+    /// Snapshot of currently known peers.
+    fn get_known_peers(&self) -> Vec<String>;
+    /// Send a serializable message to a peer.
+    async fn send<M: Serialize>(&self, peer_pkarr: &str, msg: &M) -> Result<()>;
+    /// Receive new (non-duplicate) messages from a specific peer.
+    async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>>;
+    /// Receive new messages from all known peers.
+    async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>>;
+}
+
+impl SwapTransport for Transport {
+    fn public_key_string(&self) -> String {
+        Transport::public_key_string(self)
+    }
+    fn add_known_peer(&self, peer_pkarr: String) {
+        Transport::add_known_peer(self, peer_pkarr)
+    }
+    fn get_known_peers(&self) -> Vec<String> {
+        Transport::get_known_peers(self)
+    }
+    async fn send<M: Serialize>(&self, peer_pkarr: &str, msg: &M) -> Result<()> {
+        Transport::send(self, peer_pkarr, msg).await
+    }
+    async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
+        Transport::receive_from(self, peer_pkarr).await
+    }
+    async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
+        Transport::receive_all(self).await
     }
 }

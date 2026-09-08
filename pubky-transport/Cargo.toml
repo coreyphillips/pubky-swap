@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "Generic, message-type-agnostic transport over pubky-messenger (encrypted DMs + follow-graph peer discovery)"
 
+[features]
+# DHT-based provider rendezvous (announce/lookup by topic) over the mainline BitTorrent DHT.
+dht = ["dep:mainline"]
+
 [dependencies]
 pubky-messenger.workspace = true
 pkarr.workspace = true
@@ -15,3 +19,4 @@ blake3.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 tracing.workspace = true
+mainline = { workspace = true, optional = true }
