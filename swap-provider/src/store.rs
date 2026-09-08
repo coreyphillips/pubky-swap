@@ -12,8 +12,10 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{OutPoint, ScriptBuf, Txid};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
 use swap_common::{NetworkSpec, SwapDirection, SwapState};
 use uuid::Uuid;
@@ -48,9 +50,73 @@ pub struct SwapRecord {
     pub funding_txid_hex: Option<String>,
     pub funding_vout: Option<u32>,
     pub state: SwapState,
+
+    // --- intent markers ---
+    //
+    // Each of these is written *before* the act it names. A crash in the gap then leaves a
+    // marker saying "this may have happened, go and check" rather than nothing, which is the
+    // difference between a resumed driver finding an existing funding and funding a second one.
+    /// Set immediately before a funding transaction is broadcast, cleared once its outpoint is
+    /// known. Present with no outpoint means a funding may exist that we never recorded.
+    #[serde(default)]
+    pub funding_intent_at_height: Option<u32>,
+    /// How many funding attempts have been started, so a resume loop cannot fund repeatedly.
+    #[serde(default)]
+    pub funding_attempts: u32,
+    /// Set immediately before an invoice payment is attempted. Present means a payment may be in
+    /// flight, so a resumed driver asks the node rather than paying again.
+    #[serde(default)]
+    pub invoice_pay_started_at_unix: Option<u64>,
+    /// The counterparty spend that revealed the preimage, if one has been seen. The preimage is
+    /// never persisted; it is re-extracted from this transaction on chain.
+    #[serde(default)]
+    pub claim_observed_txid_hex: Option<String>,
+    /// Our own claim or refund, once broadcast.
+    #[serde(default)]
+    pub spend_txid_hex: Option<String>,
+
+    // --- diagnostics ---
+    /// The most recent driver failure, for the operator.
+    #[serde(default)]
+    pub last_error: Option<String>,
+    /// Consecutive transient failures, bounding the retry loop.
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub updated_at_unix: u64,
 }
 
 impl SwapRecord {
+    /// Zeroed progress/diagnostic fields, so a constructor can name only the swap's own details.
+    pub fn new_progress() -> Self {
+        Self {
+            swap_id: Uuid::nil(),
+            direction: SwapDirection::Reverse,
+            peer: String::new(),
+            network: NetworkSpec::Regtest,
+            payment_hash_hex: String::new(),
+            onchain_amount_sat: 0,
+            fee_rate_sat_vb: 0,
+            htlc_script_hex: String::new(),
+            timeout_height: 0,
+            secret_key_hex: String::new(),
+            invoice: String::new(),
+            max_routing_fee_msat: 0,
+            required_confirmations: 0,
+            funding_txid_hex: None,
+            funding_vout: None,
+            state: SwapState::Created,
+            funding_intent_at_height: None,
+            funding_attempts: 0,
+            invoice_pay_started_at_unix: None,
+            claim_observed_txid_hex: None,
+            spend_txid_hex: None,
+            last_error: None,
+            retry_count: 0,
+            updated_at_unix: 0,
+        }
+    }
+
     /// Reconstruct the branch secret key.
     pub fn secret_key(&self) -> Result<SecretKey> {
         let bytes = hex::decode(&self.secret_key_hex).context("decode secret_key_hex")?;
@@ -88,13 +154,26 @@ impl SwapRecord {
 }
 
 /// Persistent store of in-flight swaps.
+///
+/// There is deliberately no `remove`. A record is the only thing standing between a funded HTLC
+/// and funds nobody is watching, so deleting one is never the right reaction to a failure --
+/// and when `remove` existed, the driver called it on *every* return, including errors. One
+/// momentary Electrum failure on a funded swap deleted the record, so the refund was never
+/// attempted and the coins sat until someone reconstructed the key by hand.
+///
+/// Terminal records are written, not deleted, and cleaned up later by [`SwapStore::prune_terminal`].
 pub trait SwapStore: Send + Sync {
     /// Insert or overwrite a record (called on swap start and on each transition).
     fn put(&self, rec: &SwapRecord) -> Result<()>;
+    /// One record by id, if it exists.
+    fn get(&self, swap_id: Uuid) -> Result<Option<SwapRecord>>;
     /// All non-terminal records, used on startup to resume.
     fn load_active(&self) -> Result<Vec<SwapRecord>>;
-    /// Drop a record once its swap reaches a terminal state.
-    fn remove(&self, swap_id: Uuid) -> Result<()>;
+    /// Record a swap's terminal state. Keeps the record for audit rather than deleting it.
+    fn mark_terminal(&self, rec: &SwapRecord) -> Result<()>;
+    /// Delete terminal records older than `retain`, returning how many were removed. Called only
+    /// by a background sweeper, never by a driver.
+    fn prune_terminal(&self, retain: Duration) -> Result<usize>;
 }
 
 /// A directory-of-JSON-files [`SwapStore`]: one `<dir>/<swap_id>.json` per swap.
@@ -107,6 +186,14 @@ impl JsonFileSwapStore {
     pub fn new(dir: impl AsRef<Path>) -> Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir).with_context(|| format!("create swap store dir {dir:?}"))?;
+        // The directory holds branch secret keys, so keep it to the owner.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)) {
+                tracing::warn!("could not restrict permissions on {dir:?}: {e}");
+            }
+        }
         Ok(Self { dir })
     }
 
@@ -120,10 +207,77 @@ impl SwapStore for JsonFileSwapStore {
         let path = self.path_for(rec.swap_id);
         let tmp = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(rec).context("serialize swap record")?;
-        // Write to a temp file then rename, so a crash mid-write can't corrupt the record.
-        fs::write(&tmp, &bytes).with_context(|| format!("write {tmp:?}"))?;
+
+        // Write to a temp file, fsync it, then rename. The rename is what makes the update
+        // atomic against a crash; the fsync is what makes it durable against power loss. Without
+        // the fsync the rename can land while the data behind it has not, which is the one case
+        // where a "crash-safe" write leaves an empty record for a funded HTLC.
+        //
+        // 0600 because the record carries the branch secret key: whoever holds it can move the
+        // HTLC funds on the branch this swap owns.
+        {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp).with_context(|| format!("open {tmp:?}"))?;
+            f.write_all(&bytes)
+                .with_context(|| format!("write {tmp:?}"))?;
+            f.sync_all().with_context(|| format!("fsync {tmp:?}"))?;
+        }
         fs::rename(&tmp, &path).with_context(|| format!("rename into {path:?}"))?;
+        // Make the rename itself durable, so the record survives power loss and not merely a
+        // process crash.
+        if let Ok(dir) = fs::File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
+    }
+
+    fn get(&self, swap_id: Uuid) -> Result<Option<SwapRecord>> {
+        let path = self.path_for(swap_id);
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).with_context(|| format!("parse {path:?}"))?,
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow!("read {path:?}: {e}")),
+        }
+    }
+
+    fn mark_terminal(&self, rec: &SwapRecord) -> Result<()> {
+        debug_assert!(rec.state.is_terminal(), "mark_terminal on a live swap");
+        self.put(rec)
+    }
+
+    fn prune_terminal(&self, retain: Duration) -> Result<usize> {
+        let mut removed = 0;
+        for entry in fs::read_dir(&self.dir).with_context(|| format!("read dir {:?}", self.dir))? {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else { continue };
+            let Ok(rec) = serde_json::from_slice::<SwapRecord>(&bytes) else {
+                // Unparsable records are never pruned: a record we cannot read may still be a
+                // live swap, and deleting it would strand whatever it was watching.
+                continue;
+            };
+            if !rec.state.is_terminal() {
+                continue;
+            }
+            let age = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok());
+            if age.is_some_and(|a| a >= retain) && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     fn load_active(&self) -> Result<Vec<SwapRecord>> {
@@ -147,15 +301,6 @@ impl SwapStore for JsonFileSwapStore {
             }
         }
         Ok(out)
-    }
-
-    fn remove(&self, swap_id: Uuid) -> Result<()> {
-        let path = self.path_for(swap_id);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(anyhow!("remove {path:?}: {e}")),
-        }
     }
 }
 
@@ -207,6 +352,7 @@ mod tests {
             funding_txid_hex: Some(outpoint.txid.to_string()),
             funding_vout: Some(outpoint.vout),
             state: SwapState::LockupConfirmed,
+            ..SwapRecord::new_progress()
         };
 
         let dir = temp_dir();
@@ -225,15 +371,64 @@ mod tests {
         assert_eq!(got.funding_outpoint(), Some(outpoint));
         assert_eq!(got.payment_hash().unwrap(), ph);
 
-        // Terminal records are not returned as active.
+        // Fetching one by id round-trips too.
+        assert_eq!(
+            store.get(rec.swap_id).unwrap().unwrap().swap_id,
+            rec.swap_id
+        );
+        assert!(store.get(Uuid::new_v4()).unwrap().is_none());
+
+        // Terminal records are not returned as active, but are retained.
         let mut done = rec.clone();
         done.state = SwapState::Claimed;
-        store.put(&done).unwrap();
+        store.mark_terminal(&done).unwrap();
         assert!(store.load_active().unwrap().is_empty());
+        assert!(store.get(rec.swap_id).unwrap().is_some());
 
-        // Removal is idempotent.
-        store.remove(rec.swap_id).unwrap();
-        store.remove(rec.swap_id).unwrap();
+        // A terminal record younger than the retention window is kept, not pruned.
+        assert_eq!(store.prune_terminal(Duration::from_secs(3600)).unwrap(), 0);
+        assert!(store.get(rec.swap_id).unwrap().is_some());
+
+        // Past the window it is swept.
+        assert_eq!(store.prune_terminal(Duration::ZERO).unwrap(), 1);
+        assert!(store.get(rec.swap_id).unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A live record must never be pruned, however old it is. Pruning one would strand whatever
+    /// it was watching.
+    #[test]
+    fn pruning_never_touches_a_live_record() {
+        let dir = temp_dir();
+        let store = JsonFileSwapStore::new(&dir).unwrap();
+        let mut rec = SwapRecord::new_progress();
+        rec.swap_id = Uuid::new_v4();
+        rec.state = SwapState::LockupConfirmed;
+        store.put(&rec).unwrap();
+
+        assert_eq!(store.prune_terminal(Duration::ZERO).unwrap(), 0);
+        assert_eq!(store.load_active().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The record carries a branch secret key, so it must not be world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn records_are_written_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir();
+        let store = JsonFileSwapStore::new(&dir).unwrap();
+        let mut rec = SwapRecord::new_progress();
+        rec.swap_id = Uuid::new_v4();
+        store.put(&rec).unwrap();
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "the store directory must be owner-only");
+
+        let path = dir.join(format!("{}.json", rec.swap_id));
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "records hold key material");
         let _ = fs::remove_dir_all(&dir);
     }
 }

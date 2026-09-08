@@ -5,14 +5,14 @@
 
 use crate::{
     AcceptedHtlc, DecodedInvoice, HoldInvoice, HoldInvoiceRequest, InvoiceState, InvoiceStatus,
-    LightningBackend, LightningError, LndConfig, NodeInfo, PaymentResult, Result,
+    LightningBackend, LightningError, LndConfig, NodeInfo, PaymentResult, PaymentStatus, Result,
 };
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use fedimint_tonic_lnd::invoicesrpc::{AddHoldInvoiceRequest, CancelInvoiceMsg, SettleInvoiceMsg};
 use fedimint_tonic_lnd::lnrpc::{GetInfoRequest, NewAddressRequest, PayReqString, PaymentHash};
-use fedimint_tonic_lnd::routerrpc::SendPaymentRequest;
+use fedimint_tonic_lnd::routerrpc::{SendPaymentRequest, TrackPaymentRequest};
 use fedimint_tonic_lnd::signrpc::TxOut;
 use fedimint_tonic_lnd::walletrpc::SendOutputsRequest;
 
@@ -298,6 +298,47 @@ impl LightningBackend for LndBackend {
                 _ => continue, // UNKNOWN / IN_FLIGHT: keep waiting for a terminal update
             }
         }
+    }
+
+    async fn payment_status(&self, payment_hash: [u8; 32]) -> Result<PaymentStatus> {
+        let mut client = self.client.lock().await;
+        let mut stream = match client
+            .router()
+            .track_payment_v2(TrackPaymentRequest {
+                payment_hash: payment_hash.to_vec(),
+                no_inflight_updates: true,
+            })
+            .await
+        {
+            Ok(s) => s.into_inner(),
+            // LND answers NotFound when it has never seen the hash.
+            Err(s) if s.code() == fedimint_tonic_lnd::tonic::Code::NotFound => {
+                return Ok(PaymentStatus::Unknown)
+            }
+            Err(s) => return Err(LightningError::Backend(s.to_string())),
+        };
+        let payment = match stream
+            .message()
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?
+        {
+            Some(p) => p,
+            None => return Ok(PaymentStatus::Unknown),
+        };
+        // lnrpc.Payment.PaymentStatus: UNKNOWN=0, IN_FLIGHT=1, SUCCEEDED=2, FAILED=3
+        Ok(match payment.status {
+            2 => {
+                let bytes = hex::decode(&payment.payment_preimage)
+                    .map_err(|e| LightningError::Backend(format!("decode preimage: {e}")))?;
+                PaymentStatus::Succeeded(PaymentResult {
+                    preimage: to_32(&bytes, "preimage")?,
+                    fee_msat: u64::try_from(payment.fee_msat).unwrap_or(0),
+                })
+            }
+            3 => PaymentStatus::Failed(format!("reason {}", payment.failure_reason)),
+            1 => PaymentStatus::InFlight,
+            _ => PaymentStatus::Unknown,
+        })
     }
 
     async fn decode_invoice(&self, bolt11: &str) -> Result<DecodedInvoice> {

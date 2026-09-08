@@ -228,6 +228,12 @@ mod tests {
                 fee_msat: 0,
             })
         }
+        async fn payment_status(
+            &self,
+            _ph: [u8; 32],
+        ) -> lightning_backend::Result<lightning_backend::PaymentStatus> {
+            Ok(lightning_backend::PaymentStatus::Unknown)
+        }
         async fn decode_invoice(&self, _: &str) -> lightning_backend::Result<DecodedInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
         }

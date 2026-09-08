@@ -216,6 +216,7 @@ async fn full_submarine_swap_two_nodes() {
                 1,
                 Duration::from_secs(1),
                 None,
+                false,
                 &(),
             )
             .await
