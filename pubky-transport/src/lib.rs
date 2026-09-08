@@ -16,9 +16,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-#[cfg(feature = "dht")]
-pub mod rendezvous;
-
 #[cfg(feature = "iroh")]
 pub mod p2p;
 
@@ -35,9 +32,6 @@ pub enum TransportError {
     InvalidPubkey(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// DHT rendezvous error (feature `dht`; see [`rendezvous`]).
-    #[error("dht error: {0}")]
-    Dht(String),
     /// iroh P2P rendezvous error (feature `iroh`; see [`p2p`]).
     #[error("iroh error: {0}")]
     Iroh(String),
@@ -361,14 +355,14 @@ impl Transport {
 ///
 /// [`Transport`] (encrypted Pubky DMs) is the implementation used today. Naming the surface as a
 /// trait is the seam that lets the same `swap-provider` / `swap-client` protocol run over an
-/// alternative transport later, e.g. an authenticated, holepunched P2P stream located via the
-/// [`rendezvous`] module on the mainline DHT, without touching the swap state machine, HTLC
-/// scripting, or persisted store.
+/// alternative transport later, e.g. the authenticated, holepunched iroh QUIC stream in the
+/// [`p2p`] module, without touching the swap state machine, HTLC scripting, or persisted store.
 ///
 /// Discovery and execution have different needs: discovery wants to be real-time (a client
 /// walking up to a listening provider), while execution spans blocks/hours and must survive
-/// disconnects and restarts. A DHT stream suits the former; the durable store-and-forward DMs
-/// modelled here remain the safer choice for the latter, so a deployment may use both.
+/// disconnects and restarts. A holepunched stream suits the former; the durable
+/// store-and-forward DMs modelled here remain the safer choice for the latter, so a deployment
+/// may use both.
 ///
 /// The trait is intentionally not object-safe (the message type is generic per call, matching
 /// [`Transport`]); it is a static seam for generic code, not a `dyn` boundary.

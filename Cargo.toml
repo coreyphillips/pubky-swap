@@ -21,9 +21,6 @@ bitcoin = "0.30"
 # Pubky & Pkarr (same versions proven in bitcoin-batch-coordinator)
 pubky-messenger = { version = "0.3.0" }
 pkarr = "3.10"
-# Mainline BitTorrent DHT: the same DHT pkarr already resolves identities over. Reused here for
-# provider rendezvous (announce/lookup by topic) behind the `dht` feature.
-mainline = "5.4.0"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
