@@ -7,6 +7,7 @@
 //! - [`fee_bump`] — replace-by-fee bumping for claim/refund spends.
 //! - [`chain`] — chain observation (`ChainWatcher`; Electrum impl behind feature `electrum`).
 //! - [`timelock`] — cross-leg timelock invariants (the ordering that makes a swap atomic).
+//! - [`validate`] — client-side checks on a provider's quote, acceptance, and invoice.
 //! - [`keys`] — key helpers.
 
 pub mod chain;
@@ -19,6 +20,7 @@ pub mod onchain;
 pub mod reorg;
 pub mod swap;
 pub mod timelock;
+pub mod validate;
 pub mod wallet;
 
 pub use error::{Result, SwapError};
