@@ -21,10 +21,11 @@ use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
 use lightning_backend::{HoldInvoiceRequest, InvoiceState, LightningBackend};
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
-use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
+use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
 use swap_common::onchain::{
-    build_refund_tx, estimate_spend_fee, extract_preimage, REFUND_FEE_TARGET_BLOCKS,
+    build_refund_tx, estimate_spend_fee, extract_preimage, fee_rate_cap, spend_vsize,
+    ABSOLUTE_MAX_FEE_RATE_SAT_VB, DEFAULT_MAX_FEE_BPS, REFUND_FEE_TARGET_BLOCKS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::timelock::{self, TimelockParams};
@@ -254,65 +255,138 @@ pub async fn drive_reverse_swap(
     // refund at the timeout. `required_confirmations` is enforced client-side before claiming.
     let _ = required_confirmations;
 
-    // 3. Wait for the client to claim (revealing the preimage), else refund at timeout.
+    // 3. Watch for the client's claim (which reveals the preimage), and refund at the timeout.
+    //
+    // Settling and finishing are deliberately separate. Recovering a preimage from an
+    // unconfirmed claim and settling on it is free money for us, so it is done as soon as the
+    // preimage is visible. But an unconfirmed claim can still be replaced or reorged out, and if
+    // we treated settling as the end of the swap we would stop watching an HTLC that is once
+    // again claimable, and lose the on-chain leg without ever noticing. So the swap only finishes
+    // once the claim is buried, and until then the refund path stays live.
+    let dest = wallet.receive_destination();
+    let refund_vsize = spend_vsize(&swap.htlc_script, &dest, false);
+    let build = |rate: u64| {
+        build_refund_tx(
+            funding_outpoint,
+            swap.onchain_amount_sat,
+            &swap.htlc_script,
+            dest.clone(),
+            estimate_spend_fee(rate, refund_vsize),
+            swap.timeout_height,
+            &swap.refund_key,
+        )
+    };
+    // The refund sweeps to our own wallet, so CPFP can pull it in when an RBF replacement is
+    // rejected.
+    let cpfp = |parent: Txid, rate: u64| {
+        run_blocking(|| {
+            wallet.cpfp_bump(
+                OutPoint {
+                    txid: parent,
+                    vout: 0,
+                },
+                rate,
+            )
+        })
+        .ok()
+        .flatten()
+    };
+    let cap = fee_rate_cap(
+        swap.onchain_amount_sat,
+        refund_vsize,
+        DEFAULT_MAX_FEE_BPS,
+        ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+        swap.fee_rate_sat_vb,
+    );
+
+    let mut settled = false;
     loop {
+        // Any spend of the HTLC, ours or theirs.
         if let Some(spend) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))? {
+            let spend_txid = spend.txid();
             if let Some(preimage) = extract_preimage(&spend, &funding_outpoint, &swap.payment_hash)
             {
-                ln.settle_hold_invoice(preimage)
-                    .await
-                    .map_err(|e| anyhow!("settle invoice: {e}"))?;
-                info!("Reverse swap: client claimed; hold invoice settled");
-                return Ok(SwapState::Claimed);
+                if !settled {
+                    match ln.settle_hold_invoice(preimage).await {
+                        Ok(()) => {
+                            info!("Reverse swap: client claimed; hold invoice settled");
+                            settled = true;
+                        }
+                        Err(e) => {
+                            // A settle that fails because it already happened is success. Any
+                            // other failure is worth retrying: the preimage is public now, so
+                            // there is no secret left to protect and nothing to lose by asking
+                            // again on the next poll.
+                            warn!("Reverse swap: settling the hold invoice failed: {e}");
+                        }
+                    }
+                }
+                if settled {
+                    match run_blocking(|| chain.tx_confirmations(&swap.htlc_spk, &spend_txid))? {
+                        Some(c) if c >= FINALITY_DEPTH => return Ok(SwapState::Claimed),
+                        _ => {
+                            // Settled but the claim is not yet buried. Keep watching: if it is
+                            // replaced or reorged out, the loop falls back to refunding.
+                        }
+                    }
+                }
             }
         }
+
         if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
-            warn!("Reverse swap: timeout reached without claim; refunding HTLC");
-            // Broadcast the refund and keep it confirming under fee pressure (RBF): the initial
-            // fee uses a live estimate clamped to the floor, and is bumped if it doesn't confirm.
-            let dest = wallet.receive_destination();
-            let build = |rate: u64| {
-                build_refund_tx(
-                    funding_outpoint,
-                    swap.onchain_amount_sat,
-                    &swap.htlc_script,
-                    dest.clone(),
-                    estimate_spend_fee(rate, false),
-                    swap.timeout_height,
-                    &swap.refund_key,
-                )
-            };
-            // The refund sweeps to our wallet, so CPFP can bump it if an RBF replacement is rejected.
-            let cpfp = |parent: Txid, rate: u64| {
-                run_blocking(|| {
-                    wallet.cpfp_bump(
-                        OutPoint {
-                            txid: parent,
-                            vout: 0,
-                        },
-                        rate,
-                    )
-                })
-                .ok()
-                .flatten()
-            };
-            confirm_or_bump(
-                chain,
-                &swap.htlc_spk,
+            if settled {
+                // We already hold the Lightning money and the claim has not buried. Nothing
+                // useful is left to do on-chain: our refund would conflict with a claim that
+                // paid us. Wait for the claim to bury rather than fighting it.
+                sleep(poll).await;
+                continue;
+            }
+            warn!("Reverse swap: timeout reached without a claim; refunding the HTLC");
+            let cfg = SpendWatchConfig::refund(
                 REFUND_FEE_TARGET_BLOCKS,
                 swap.fee_rate_sat_vb,
+                cap,
                 poll,
-                MAX_FEE_BUMPS,
                 FINALITY_DEPTH,
+            );
+            match confirm_or_bump(
+                chain,
+                &swap.htlc_spk,
+                funding_outpoint,
+                &cfg,
                 Some(&cpfp),
                 build,
             )
             .await
-            .map_err(|e| anyhow!("refund broadcast/bump: {e}"))?;
-            if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
-                warn!("Reverse swap: failed to cancel hold invoice after refund: {e}");
+            .map_err(|e| anyhow!("refund broadcast/bump: {e}"))?
+            {
+                SpendOutcome::Confirmed { .. } => {
+                    if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
+                        warn!("Reverse swap: failed to cancel hold invoice after refund: {e}");
+                    }
+                    return Ok(SwapState::Refunded);
+                }
+                // The client claimed while we were refunding. This is the case that used to
+                // spin forever: our refund left the HTLC's history, so it read as "dropped" and
+                // was re-broadcast against an already-spent output every two seconds, while the
+                // preimage sat unclaimed in the winning transaction and the hold invoice was
+                // never settled. We lost both legs. Now the outer loop settles from it instead.
+                SpendOutcome::ConflictingSpend { tx } => {
+                    info!(
+                        "Reverse swap: the client's claim {} beat our refund; recovering the \
+                         preimage from it",
+                        tx.txid()
+                    );
+                    continue;
+                }
+                SpendOutcome::DeadlineExceeded { last_txid, tip } => {
+                    warn!(
+                        "Reverse swap: refund {last_txid} still unconfirmed at height {tip}; \
+                         retrying"
+                    );
+                    continue;
+                }
             }
-            return Ok(SwapState::Refunded);
         }
         sleep(poll).await;
     }

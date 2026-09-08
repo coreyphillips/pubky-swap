@@ -13,9 +13,12 @@ use lightning_backend::{InvoiceState, LightningBackend};
 use std::sync::Arc;
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
-use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
+use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::PaymentHash;
-use swap_common::onchain::{build_refund_tx, estimate_spend_fee, REFUND_FEE_TARGET_BLOCKS};
+use swap_common::onchain::{
+    build_refund_tx, estimate_spend_fee, fee_rate_cap, spend_vsize, ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+    DEFAULT_MAX_FEE_BPS, REFUND_FEE_TARGET_BLOCKS,
+};
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::wallet::OnchainWallet;
 use swap_common::SwapState;
@@ -82,13 +85,14 @@ pub async fn execute_submarine_swap(
 
             warn!("Submarine client: timeout reached without settlement; refunding HTLC");
             let dest = wallet.receive_destination();
+            let refund_vsize = spend_vsize(&funding.htlc_script, &dest, false);
             let build = |rate: u64| {
                 build_refund_tx(
                     outpoint,
                     funding.onchain_amount_sat,
                     &funding.htlc_script,
                     dest.clone(),
-                    estimate_spend_fee(rate, false),
+                    estimate_spend_fee(rate, refund_vsize),
                     funding.timeout_height,
                     &funding.refund_key,
                 )
@@ -107,20 +111,52 @@ pub async fn execute_submarine_swap(
                 .ok()
                 .flatten()
             };
-            confirm_or_bump(
-                chain.as_ref(),
-                &funding.htlc_spk,
+            // No deadline on a refund: this is our own money, so there is no point at which
+            // giving up is better than continuing.
+            let cfg = SpendWatchConfig::refund(
                 REFUND_FEE_TARGET_BLOCKS,
                 funding.fee_rate_sat_vb,
+                fee_rate_cap(
+                    funding.onchain_amount_sat,
+                    refund_vsize,
+                    DEFAULT_MAX_FEE_BPS,
+                    ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+                    funding.fee_rate_sat_vb,
+                ),
                 poll,
-                MAX_FEE_BUMPS,
                 FINALITY_DEPTH,
+            );
+            match confirm_or_bump(
+                chain.as_ref(),
+                &funding.htlc_spk,
+                outpoint,
+                &cfg,
                 Some(&cpfp),
                 build,
             )
             .await
-            .map_err(|e| anyhow!("refund broadcast/bump: {e}"))?;
-            return Ok(SwapState::Refunded);
+            .map_err(|e| anyhow!("refund broadcast/bump: {e}"))?
+            {
+                SpendOutcome::Confirmed { .. } => return Ok(SwapState::Refunded),
+                // The provider claimed while we were refunding. The preimage is public now, so
+                // our invoice settles and we are paid over Lightning: this is the swap
+                // succeeding, not failing.
+                SpendOutcome::ConflictingSpend { tx } => {
+                    info!(
+                        "Submarine client: the provider claimed the HTLC ({}) as we refunded; \
+                         awaiting Lightning settlement",
+                        tx.txid()
+                    );
+                    return Ok(SwapState::Claimed);
+                }
+                SpendOutcome::DeadlineExceeded { last_txid, tip } => {
+                    warn!(
+                        "Submarine client: refund {last_txid} still unconfirmed at height {tip}; \
+                         retrying"
+                    );
+                    continue;
+                }
+            }
         }
         sleep(poll).await;
     }

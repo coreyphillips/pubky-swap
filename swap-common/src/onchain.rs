@@ -20,7 +20,7 @@ use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-use bitcoin::{ecdsa, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{ecdsa, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 
 const DUST_THRESHOLD: u64 = 546;
 
@@ -33,19 +33,52 @@ pub enum SpendPath {
     Refund,
 }
 
-/// Coarse vsize estimate for a 1-in/1-out P2WSH HTLC spend, used for fee deduction.
-/// Claim witnesses are larger (they carry the 32-byte preimage).
-pub fn estimate_spend_vsize(is_claim: bool) -> u64 {
-    if is_claim {
-        150
+/// The vsize of a 1-in/1-out P2WSH HTLC spend, computed rather than guessed.
+///
+/// A fixed number cannot be right for both branches or for every destination: the claim witness
+/// carries a 32-byte preimage the refund does not, and a P2TR output is twelve bytes wider than a
+/// P2WPKH one. Getting it wrong makes the effective fee rate drift from the target, which matters
+/// most exactly when it must not -- a claim racing a refund window.
+///
+/// This assembles the same transaction `build_htlc_spend` will, with a maximum-length signature,
+/// and asks the `bitcoin` crate for its weight. A unit test asserts it is never below what the
+/// real transaction measures.
+pub fn spend_vsize(redeem_script: &Script, dest_spk: &Script, is_claim: bool) -> u64 {
+    // Non-witness bytes: version(4) + input count(1) + outpoint(36) + scriptSig len(1) +
+    // sequence(4) + output count(1) + value(8) + spk len(1) + spk + locktime(4).
+    let base = 4 + 1 + 36 + 1 + 4 + 1 + 8 + 1 + dest_spk.len() as u64 + 4;
+
+    // Witness bytes: item count, then each item length-prefixed. A DER signature plus sighash
+    // byte is at most 72; using the maximum keeps the estimate conservative.
+    let script_len = redeem_script.len() as u64;
+    let mut witness = 1 // item count
+        + 1 + 72 // signature
+        + varint_len(script_len) + script_len; // witness script
+    witness += if is_claim {
+        1 + 32 // preimage
+        + 1 + 1 // OP_TRUE branch selector
     } else {
-        140
+        1 // empty element, the OP_FALSE branch selector
+    };
+
+    // Weight = base * 4 + witness, plus the 2-byte segwit marker and flag.
+    let weight = base * 4 + witness + 2;
+    weight.div_ceil(4)
+}
+
+fn varint_len(n: u64) -> u64 {
+    match n {
+        0..=0xfc => 1,
+        0xfd..=0xffff => 3,
+        0x10000..=0xffff_ffff => 5,
+        _ => 9,
     }
 }
 
-/// Absolute fee for an HTLC spend at `fee_rate_sat_vb`.
-pub fn estimate_spend_fee(fee_rate_sat_vb: u64, is_claim: bool) -> u64 {
-    estimate_spend_vsize(is_claim) * fee_rate_sat_vb
+/// Absolute fee for an HTLC spend at `fee_rate_sat_vb`, saturating rather than overflowing on a
+/// nonsense rate.
+pub fn estimate_spend_fee(fee_rate_sat_vb: u64, vsize: u64) -> u64 {
+    vsize.saturating_mul(fee_rate_sat_vb)
 }
 
 /// Fee-estimation confirmation target (blocks) for a provider's submarine **claim**. The claim
@@ -65,25 +98,103 @@ pub fn btc_per_kvb_to_sat_per_vb(btc_per_kvb: f64) -> Option<u64> {
     Some(((btc_per_kvb * 100_000.0).ceil() as u64).max(1))
 }
 
-/// Resolve the sat/vB fee rate to use for an HTLC spend. The configured `floor_sat_vb` is both a
-/// fallback (when `estimate` is `None`) and a minimum: a live estimate can raise the rate but
-/// never lower it below the operator's configured floor.
-pub fn resolve_fee_rate(estimate: Option<u64>, floor_sat_vb: u64) -> u64 {
-    estimate.unwrap_or(floor_sat_vb).max(floor_sat_vb)
+/// Resolve the sat/vB fee rate to use for an HTLC spend.
+///
+/// The configured `floor_sat_vb` is both a fallback (when `estimate` is `None`) and a minimum: a
+/// live estimate can raise the rate but never lower it below the operator's configured floor.
+/// `cap_sat_vb` bounds it from above, because an Electrum server reporting a nonsense estimate
+/// would otherwise set the very first broadcast's fee.
+///
+/// The cap never pushes the rate below the floor: for a sweep, paying an uneconomic fee still
+/// beats losing the whole output.
+pub fn resolve_fee_rate(estimate: Option<u64>, floor_sat_vb: u64, cap_sat_vb: u64) -> u64 {
+    estimate
+        .unwrap_or(floor_sat_vb)
+        .max(floor_sat_vb)
+        .min(cap_sat_vb.max(floor_sat_vb))
 }
 
-/// Hard cap on the fee rate (sat/vB) a bump loop will escalate to, so a runaway estimate can't
-/// burn an HTLC output down to dust.
-pub const MAX_FEE_RATE_SAT_VB: u64 = 1_000;
+/// Absolute ceiling on the fee rate (sat/vB) any HTLC spend will escalate to.
+pub const ABSOLUTE_MAX_FEE_RATE_SAT_VB: u64 = 1_000;
 
-/// The next fee rate (sat/vB) for an RBF bump: at least ~25% above the previous rate (BIP125
-/// requires a strictly higher fee), or a higher live `estimate` if one is available. Capped at
-/// [`MAX_FEE_RATE_SAT_VB`].
-pub fn bumped_fee_rate(previous_sat_vb: u64, estimate: Option<u64>) -> u64 {
-    let plus_25 = previous_sat_vb
-        .saturating_add(previous_sat_vb / 4)
-        .saturating_add(1);
-    estimate.unwrap_or(0).max(plus_25).min(MAX_FEE_RATE_SAT_VB)
+/// Share of an HTLC's value, in basis points, that may be spent on the fee to sweep it.
+///
+/// An absolute rate cap alone does not protect a small swap: at 1000 sat/vB a ~150 vB claim costs
+/// 150,000 sat, which is fifteen times the default minimum swap size. The cap has to scale with
+/// what is being swept.
+pub const DEFAULT_MAX_FEE_BPS: u16 = 2_000; // 20%
+
+/// The fee-rate ceiling for sweeping `htlc_value_sat` with a `vsize`-byte transaction.
+///
+/// Never returns below `floor`: an uneconomic sweep is still better than an unspendable output,
+/// and the caller's dust check will refuse the truly impossible cases.
+pub fn fee_rate_cap(
+    htlc_value_sat: u64,
+    vsize: u64,
+    max_fee_bps: u16,
+    absolute_cap_sat_vb: u64,
+    floor_sat_vb: u64,
+) -> u64 {
+    let max_fee = (u128::from(htlc_value_sat) * u128::from(max_fee_bps) / 10_000) as u64;
+    (max_fee / vsize.max(1))
+        .min(absolute_cap_sat_vb)
+        .max(floor_sat_vb)
+}
+
+/// Confirmation target to price a spend at, given how many blocks remain before its deadline.
+///
+/// Fewer blocks left means a tighter target, which means a higher estimate. A spend with a
+/// hundred blocks of room does not need to outbid the next block; one with three does.
+fn target_for_remaining(remaining: u32) -> u16 {
+    match remaining {
+        0..=3 => 1,
+        4..=9 => 2,
+        10..=19 => 3,
+        20..=49 => 6,
+        _ => 12,
+    }
+}
+
+/// The next fee rate for a spend, given the tip and its deadline.
+///
+/// Escalation is driven by the deadline rather than by a bump counter. A fixed number of +25%
+/// bumps tops out wherever it happens to top out -- from a 2 sat/vB floor, ten bumps reach only
+/// about 37 sat/vB -- and then stops escalating entirely no matter how close the deadline gets.
+/// Here the target tightens as the deadline approaches, and inside the final few blocks the rate
+/// ratchets toward the cap, because at that point a fee saved is the whole output lost.
+///
+/// The result is always strictly above `previous` when it changes at all, satisfying BIP125's
+/// requirement that a replacement pay more.
+pub fn deadline_fee_rate(
+    tip: u32,
+    deadline_height: Option<u32>,
+    previous: u64,
+    estimate_for: &dyn Fn(u16) -> Option<u64>,
+    floor_sat_vb: u64,
+    cap_sat_vb: u64,
+) -> u64 {
+    let cap = cap_sat_vb.max(floor_sat_vb);
+    // BIP125 needs a strictly higher fee; ~25% is a comfortable margin over the incremental
+    // relay minimum for transactions of this size.
+    let min_bump = previous
+        .saturating_add(previous / 4)
+        .saturating_add(1)
+        .max(floor_sat_vb);
+
+    let remaining = match deadline_height {
+        Some(deadline) => deadline.saturating_sub(tip),
+        // No deadline: escalate gently on the estimate alone.
+        None => u32::MAX,
+    };
+
+    // Inside the last few blocks there is nothing left to optimise: go to the ceiling.
+    if remaining <= 2 {
+        return cap;
+    }
+
+    let target = target_for_remaining(remaining);
+    let estimated = estimate_for(target).unwrap_or(0);
+    estimated.max(min_bump).min(cap)
 }
 
 /// Build and sign a transaction spending an HTLC P2WSH output.
@@ -443,27 +554,161 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fee_rate_uses_floor_as_fallback_and_minimum() {
-        // No estimate → the configured floor.
-        assert_eq!(resolve_fee_rate(None, 5), 5);
-        // An estimate below the floor is clamped up to the floor.
-        assert_eq!(resolve_fee_rate(Some(3), 5), 5);
+    fn resolve_fee_rate_clamps_at_both_ends() {
+        // No estimate: the configured floor.
+        assert_eq!(resolve_fee_rate(None, 5, 1_000), 5);
+        // An estimate below the floor is clamped up to it.
+        assert_eq!(resolve_fee_rate(Some(3), 5, 1_000), 5);
         // An estimate above the floor is used.
-        assert_eq!(resolve_fee_rate(Some(50), 5), 50);
+        assert_eq!(resolve_fee_rate(Some(50), 5, 1_000), 50);
+        // A nonsense estimate is clamped to the cap rather than setting the very first
+        // broadcast's fee. This path used to be uncapped while only the bump path was capped, so
+        // a bad Electrum answer went straight through into an unchecked multiply.
+        assert_eq!(resolve_fee_rate(Some(u64::MAX), 5, 1_000), 1_000);
+        // The cap never pushes below the floor: an uneconomic sweep still beats losing the
+        // output entirely.
+        assert_eq!(resolve_fee_rate(Some(50), 20, 3), 20);
     }
 
     #[test]
-    fn bumped_fee_rate_escalates_and_caps() {
-        // No estimate → at least +25% (and always strictly higher).
-        assert_eq!(bumped_fee_rate(5, None), 7);
-        assert_eq!(bumped_fee_rate(1, None), 2);
-        // An estimate below the +25% bump still bumps by the minimum.
-        assert_eq!(bumped_fee_rate(5, Some(3)), 7);
-        // A higher estimate is taken directly.
-        assert_eq!(bumped_fee_rate(5, Some(50)), 50);
-        // Capped so a runaway estimate can't burn the output.
-        assert_eq!(bumped_fee_rate(5, Some(10_000)), MAX_FEE_RATE_SAT_VB);
-        assert_eq!(bumped_fee_rate(2_000, None), MAX_FEE_RATE_SAT_VB);
+    fn fee_rate_cap_scales_with_the_output_being_swept() {
+        // A 10k sat swap: 20% of 10_000 over ~150 vB is about 13 sat/vB, nowhere near the
+        // absolute 1000 sat/vB ceiling. An absolute-only cap would have permitted a 150_000 sat
+        // fee on a 10_000 sat output, which is fifteen times the whole swap.
+        let small = fee_rate_cap(10_000, 150, DEFAULT_MAX_FEE_BPS, 1_000, 1);
+        assert_eq!(small, 13);
+        assert!(small * 150 <= 10_000 / 5);
+
+        // A large swap is bounded by the absolute ceiling instead.
+        assert_eq!(
+            fee_rate_cap(10_000_000, 150, DEFAULT_MAX_FEE_BPS, 1_000, 1),
+            1_000
+        );
+
+        // Never below the floor, even for a tiny output.
+        assert_eq!(fee_rate_cap(1_000, 150, DEFAULT_MAX_FEE_BPS, 1_000, 5), 5);
+    }
+
+    #[test]
+    fn deadline_fee_rate_escalates_as_the_deadline_approaches() {
+        let none = |_t: u16| None;
+        let tip = 800_000;
+
+        // Far from the deadline: a modest bump above the previous rate.
+        let far = deadline_fee_rate(tip, Some(tip + 100), 8, &none, 5, 1_000);
+        assert!(far > 8, "a replacement must pay strictly more (BIP125)");
+        assert!(
+            far < 20,
+            "no need to sprint with 100 blocks left, got {far}"
+        );
+
+        // Inside the last couple of blocks: go to the ceiling, because a fee saved there costs
+        // the whole output.
+        assert_eq!(
+            deadline_fee_rate(tip, Some(tip + 2), 8, &none, 5, 1_000),
+            1_000
+        );
+        assert_eq!(deadline_fee_rate(tip, Some(tip), 8, &none, 5, 1_000), 1_000);
+
+        // The cap is always respected.
+        let huge = |_t: u16| Some(u64::MAX);
+        assert_eq!(
+            deadline_fee_rate(tip, Some(tip + 100), 8, &huge, 5, 1_000),
+            1_000
+        );
+
+        // With no deadline the rate still climbs, on the estimate and the minimum bump.
+        assert!(deadline_fee_rate(tip, None, 8, &none, 5, 1_000) > 8);
+    }
+
+    #[test]
+    fn deadline_fee_rate_is_strictly_increasing_up_to_the_cap() {
+        // BIP125 requires each replacement to pay more, so repeated bumps must never plateau
+        // below the cap. A fixed ten bumps at +25% from a 2 sat/vB floor tops out around
+        // 37 sat/vB and then stops escalating no matter how close the deadline gets; the
+        // deadline-driven loop reaches the ceiling instead.
+        let none = |_t: u16| None;
+        let tip = 800_000;
+        let mut rate = 2u64;
+        let mut steps = 0;
+        loop {
+            let next = deadline_fee_rate(tip, Some(tip + 50), rate, &none, 2, 1_000);
+            if next == rate {
+                break;
+            }
+            assert!(next > rate, "{next} must exceed {rate}");
+            rate = next;
+            steps += 1;
+            assert!(steps < 200, "escalation should reach the cap promptly");
+        }
+        assert_eq!(
+            rate, 1_000,
+            "escalation must reach the cap, not stall below it"
+        );
+    }
+
+    #[test]
+    fn estimate_spend_fee_saturates_rather_than_overflowing() {
+        assert_eq!(estimate_spend_fee(u64::MAX, 150), u64::MAX);
+        assert_eq!(estimate_spend_fee(10, 150), 1_500);
+    }
+
+    /// The vsize estimate has to cover the real transaction, or the effective fee rate drifts
+    /// below the target exactly when it must not: a claim racing a refund window.
+    #[test]
+    fn spend_vsize_covers_the_real_transaction() {
+        let s = setup();
+        let p2wsh = ScriptBuf::from_hex(
+            "0020abababababababababababababababababababababababababababababababab",
+        )
+        .unwrap();
+        let p2tr = ScriptBuf::from_hex(
+            "5120abababababababababababababababababababababababababababababababab",
+        )
+        .unwrap();
+        for (is_claim, dest_spk) in [
+            (true, dest()),
+            (false, dest()),
+            (true, p2wsh.clone()),
+            (false, p2wsh),
+            (true, p2tr.clone()),
+            (false, p2tr),
+        ] {
+            let estimated = spend_vsize(&s.redeem, &dest_spk, is_claim);
+            let tx = if is_claim {
+                build_claim_tx(
+                    s.outpoint,
+                    VALUE,
+                    &s.redeem,
+                    dest_spk.clone(),
+                    1000,
+                    s.preimage,
+                    &s.claim_sk,
+                )
+            } else {
+                build_refund_tx(
+                    s.outpoint,
+                    VALUE,
+                    &s.redeem,
+                    dest_spk.clone(),
+                    1000,
+                    TIMEOUT,
+                    &s.refund_sk,
+                )
+            }
+            .unwrap();
+            let actual = tx.vsize() as u64;
+            assert!(
+                estimated >= actual,
+                "estimate {estimated} must cover the real {actual} vB \
+                 (claim={is_claim}, dest={} bytes)",
+                dest_spk.len()
+            );
+            assert!(
+                estimated <= actual + 5,
+                "estimate {estimated} is more than 5 vB above the real {actual}"
+            );
+        }
     }
 
     #[test]

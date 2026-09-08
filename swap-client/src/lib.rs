@@ -308,6 +308,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         htlc_spk: htlc_address.script_pubkey(),
         // Checked equal to `quote.amount_sat` above; use our own number regardless.
         onchain_amount_sat: quote.amount_sat,
+        timeout_height: accept.timeout_block_height,
         invoice,
         preimage,
         claim_key: claim_sk,
