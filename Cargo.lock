@@ -3582,7 +3582,6 @@ dependencies = [
  "blake3",
  "futures",
  "iroh",
- "mainline",
  "pkarr",
  "pubky-messenger",
  "serde",
