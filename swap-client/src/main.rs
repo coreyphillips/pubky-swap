@@ -73,6 +73,11 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     max_total_sat: u64,
 
+    /// Directory for persisted in-flight swap state. A submarine swap's refund key is generated
+    /// here and exists nowhere else: losing it makes the on-chain output unspendable, forever.
+    #[arg(long, default_value = "./pubky-swap-client-data")]
+    data_dir: String,
+
     /// Only check the provider (request a quote and print its rates), then exit without swapping.
     #[arg(long)]
     quote_only: bool,
@@ -133,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         min_confirmations: cli.min_confirmations,
         max_fee_bps: cli.max_fee_bps,
         max_total_sat: cli.max_total_sat,
+        data_dir: cli.data_dir,
         rendezvous_iroh: cli.rendezvous_iroh,
     };
 

@@ -1,12 +1,21 @@
-//! Crash-safe persistence of in-flight swaps so a restarted provider can resume driving them.
+//! Crash-safe persistence of in-flight swaps, so a restart can resume driving them.
 //!
-//! Each non-terminal swap is written to its own JSON file under `<data_dir>/swaps/<id>.json`.
-//! A record holds the minimum needed to rebuild a [`crate::reverse::ReverseSwap`] /
-//! [`crate::submarine::SubmarineSwap`] and re-spawn its driver: the HTLC script, the branch
-//! secret key, the funding outpoint (once known), and routing/counterparty details. The
-//! Lightning **preimage is never persisted** — it is recovered live from the on-chain claim
-//! (reverse) or the invoice payment (submarine).
+//! Both sides need this, and for the same reason: a swap commits funds to a script that only one
+//! key can move on each branch, and that key exists nowhere else. Losing it does not fail the
+//! swap, it destroys the money. The provider holds the refund key for a reverse swap and the
+//! claim key for a submarine one; the client holds the mirror of each.
+//!
+//! Each non-terminal swap is written to its own JSON file under `<data_dir>/swaps/<id>.json`,
+//! holding the minimum needed to rebuild the swap and re-enter its driver: the HTLC script, the
+//! branch secret key, the funding outpoint once known, and routing/counterparty details.
+//!
+//! The Lightning **preimage is not persisted** on the provider side: it is recovered live from
+//! the on-chain claim. A reverse-swap *client* does persist it, because there it is not a secret
+//! recoverable from anywhere else -- it is the client's own, generated before the swap began, and
+//! without it the client cannot claim the coins it has already paid for.
 
+use crate::htlc::{htlc_p2wsh_address, PaymentHash};
+use crate::{NetworkSpec, SwapDirection, SwapState};
 use anyhow::{anyhow, Context, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{OutPoint, ScriptBuf, Txid};
@@ -16,15 +25,29 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
-use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
-use swap_common::{NetworkSpec, SwapDirection, SwapState};
 use uuid::Uuid;
+
+/// Which side of a swap a record belongs to.
+///
+/// The two roles hold opposite branch keys, so a record is only meaningful alongside the role
+/// that wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SwapRole {
+    #[default]
+    Provider,
+    Client,
+}
 
 /// A persisted in-flight swap. Bitcoin types are stored as hex/strings because the `bitcoin`
 /// crate is built without its `serde` feature here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapRecord {
     pub swap_id: Uuid,
+    /// Which side wrote this record. Absent on records written before roles existed, which were
+    /// all the provider's.
+    #[serde(default)]
+    pub role: SwapRole,
     pub direction: SwapDirection,
     /// Counterparty pubky, used to send the final `SwapStatusUpdate` after resume.
     pub peer: String,
@@ -75,6 +98,24 @@ pub struct SwapRecord {
     #[serde(default)]
     pub spend_txid_hex: Option<String>,
 
+    // --- client-side recovery ---
+    /// The client's preimage, for a reverse swap.
+    ///
+    /// Persisted only by the client, and only in that direction, because there it is not
+    /// recoverable from anywhere else: the client generates it before the swap begins, and
+    /// without it the client cannot claim coins it has already paid for. The provider learns its
+    /// preimage from the chain or from its own payment, so it never writes one.
+    #[serde(default)]
+    pub preimage_hex: Option<String>,
+    /// Where swept funds go. Pinned at the start so RBF replacements and resumed drivers all pay
+    /// the same place.
+    #[serde(default)]
+    pub dest_spk_hex: Option<String>,
+    /// The total the client agreed to in the quote, so a resumed driver funds that rather than
+    /// re-reading a number from the counterparty.
+    #[serde(default)]
+    pub quote_total_sat: u64,
+
     // --- diagnostics ---
     /// The most recent driver failure, for the operator.
     #[serde(default)]
@@ -91,6 +132,7 @@ impl SwapRecord {
     pub fn new_progress() -> Self {
         Self {
             swap_id: Uuid::nil(),
+            role: SwapRole::Provider,
             direction: SwapDirection::Reverse,
             peer: String::new(),
             network: NetworkSpec::Regtest,
@@ -111,10 +153,36 @@ impl SwapRecord {
             invoice_pay_started_at_unix: None,
             claim_observed_txid_hex: None,
             spend_txid_hex: None,
+            preimage_hex: None,
+            dest_spk_hex: None,
+            quote_total_sat: 0,
             last_error: None,
             retry_count: 0,
             updated_at_unix: 0,
         }
+    }
+
+    /// Reconstruct the preimage, when this record carries one.
+    pub fn preimage(&self) -> Result<Option<[u8; 32]>> {
+        let Some(hex_str) = self.preimage_hex.as_ref() else {
+            return Ok(None);
+        };
+        let bytes = hex::decode(hex_str).context("decode preimage_hex")?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("preimage must be 32 bytes"))?;
+        Ok(Some(arr))
+    }
+
+    /// Reconstruct the pinned sweep destination, when this record carries one.
+    pub fn dest_spk(&self) -> Result<Option<ScriptBuf>> {
+        let Some(hex_str) = self.dest_spk_hex.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(
+            ScriptBuf::from_hex(hex_str).map_err(|e| anyhow!("parse dest_spk: {e}"))?,
+        ))
     }
 
     /// Reconstruct the branch secret key.
@@ -307,9 +375,9 @@ impl SwapStore for JsonFileSwapStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::htlc::{build_htlc_script, generate_preimage, payment_hash};
+    use crate::random_keypair;
     use bitcoin::secp256k1::Secp256k1;
-    use swap_common::htlc::{build_htlc_script, generate_preimage, payment_hash};
-    use swap_common::random_keypair;
 
     fn temp_dir() -> PathBuf {
         // A unique, isolated directory under the system temp dir (no Math.random needed: the

@@ -44,6 +44,17 @@ pub struct SubmarineFunding {
     pub fee_rate_sat_vb: u64,
 }
 
+/// Notified as the client's swap progresses, so the funding outpoint reaches disk.
+///
+/// The refund key is already persisted before this executor is called; this records where the
+/// coins actually landed, which is what turns a resumed client's recovery from a chain scan into
+/// a lookup.
+pub trait FundingSink: Send + Sync {
+    fn funded(&self, _outpoint: OutPoint) {}
+}
+
+impl FundingSink for () {}
+
 /// Execute the client side of a submarine swap, returning the terminal [`SwapState`]
 /// (`Claimed` once the provider settles the invoice, or `Refunded` on timeout).
 pub async fn execute_submarine_swap(
@@ -52,10 +63,16 @@ pub async fn execute_submarine_swap(
     wallet: Arc<dyn OnchainWallet>,
     funding: SubmarineFunding,
     poll: Duration,
+    progress: &dyn FundingSink,
 ) -> Result<SwapState> {
     // 1. Fund the HTLC on-chain.
+    //
+    // The refund key for this output is already on disk: the caller writes it before the swap is
+    // ever mentioned to the provider, because it is the only key that can move these coins on the
+    // refund branch and it exists nowhere else.
     let outpoint = run_blocking(|| wallet.fund_htlc(&funding.htlc_spk, funding.onchain_amount_sat))
         .map_err(|e| anyhow!("fund HTLC: {e}"))?;
+    progress.funded(outpoint);
     info!("Submarine client: HTLC funded at {outpoint}; awaiting Lightning settlement");
 
     // 2. Wait for the provider to pay (settling our invoice) or refund at the timeout.
@@ -327,6 +344,7 @@ mod tests {
             wallet,
             funding(refund_sk, script, ph),
             Duration::from_millis(0),
+            &(),
         )
         .await
         .unwrap();
@@ -361,6 +379,7 @@ mod tests {
             wallet,
             funding(refund_sk, script, ph),
             Duration::from_millis(0),
+            &(),
         )
         .await
         .unwrap();
