@@ -40,7 +40,7 @@ mod bdk_impl {
     use super::OnchainWallet;
     use crate::error::{Result, SwapError};
     use bdk::blockchain::{Blockchain, ElectrumBlockchain};
-    use bdk::database::MemoryDatabase;
+    use bdk::database::SqliteDatabase;
     use bdk::electrum_client::{Client, ElectrumApi};
     use bdk::keys::bip39::{Language, Mnemonic};
     use bdk::keys::{DerivableKey, ExtendedKey};
@@ -54,14 +54,24 @@ mod bdk_impl {
     const FUNDING_FEE_TARGET_BLOCKS: usize = 3;
 
     /// A BIP84 (P2WPKH) wallet that funds HTLCs over Electrum.
+    ///
+    /// Backed by a SQLite database under the provider's data directory rather than by memory.
+    /// A memory-backed wallet forgets everything on exit, which means rescanning the whole
+    /// descriptor from scratch on every start, losing UTXO metadata, and -- because the address
+    /// index restarts at zero -- handing out the *same* receive address for every swap, on every
+    /// run, linking an operator's entire book on chain to anyone watching.
     pub struct BdkWallet {
-        wallet: Mutex<Wallet<MemoryDatabase>>,
+        wallet: Mutex<Wallet<SqliteDatabase>>,
         blockchain: ElectrumBlockchain,
         /// A separate Electrum client for fee estimation — bdk's `estimate_fee` panics on the `-1`
         /// regtest sentinel, so we query the raw `estimatefee` and guard it ourselves.
         fee_client: Client,
         fee_rate_sat_vb: f32,
-        /// Cached wallet-controlled sweep address (refund/claim destination).
+        /// A sweep destination resolved at construction.
+        ///
+        /// `receive_destination` is infallible, so it cannot derive a fresh address on demand.
+        /// Callers that can take one per swap use [`BdkWallet::fresh_receive_spk`]; this is the
+        /// fallback for the rest.
         receive_spk: ScriptBuf,
     }
 
@@ -73,6 +83,7 @@ mod bdk_impl {
             network: Network,
             electrum_url: &str,
             fee_rate_sat_vb: f32,
+            data_dir: &std::path::Path,
         ) -> Result<Self> {
             let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)
                 .map_err(|e| SwapError::Other(format!("mnemonic: {e}")))?;
@@ -83,11 +94,21 @@ mod bdk_impl {
                 .into_xprv(network)
                 .ok_or_else(|| SwapError::Other("could not derive xprv".into()))?;
 
+            std::fs::create_dir_all(data_dir)
+                .map_err(|e| SwapError::Other(format!("create wallet dir {data_dir:?}: {e}")))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700));
+            }
+            let db_path = data_dir.join("wallet.sqlite");
+            let db = SqliteDatabase::new(&db_path);
+
             let wallet = Wallet::new(
                 Bip84(xprv, KeychainKind::External),
                 Some(Bip84(xprv, KeychainKind::Internal)),
                 network,
-                MemoryDatabase::default(),
+                db,
             )
             .map_err(|e| SwapError::Other(format!("wallet: {e}")))?;
 
@@ -98,7 +119,7 @@ mod bdk_impl {
                 .map_err(|e| SwapError::Other(format!("electrum connect (fee): {e}")))?;
 
             let receive_spk = wallet
-                .get_address(AddressIndex::New)
+                .get_address(AddressIndex::LastUnused)
                 .map_err(|e| SwapError::Other(format!("receive address: {e}")))?
                 .script_pubkey();
 
@@ -112,7 +133,7 @@ mod bdk_impl {
         }
 
         /// Lock the inner wallet, turning a poisoned lock into a clean error instead of a panic.
-        fn locked(&self) -> Result<MutexGuard<'_, Wallet<MemoryDatabase>>> {
+        fn locked(&self) -> Result<MutexGuard<'_, Wallet<SqliteDatabase>>> {
             self.wallet
                 .lock()
                 .map_err(|_| SwapError::Other("wallet lock poisoned".into()))
@@ -145,6 +166,18 @@ mod bdk_impl {
                 .get_balance()
                 .map_err(|e| SwapError::Other(format!("balance: {e}")))?;
             Ok(b.confirmed + b.immature + b.trusted_pending + b.untrusted_pending)
+        }
+
+        /// A fresh, previously-unused sweep destination.
+        ///
+        /// Reusing one address for every sweep links an operator's whole book on chain. The
+        /// index now persists, so successive calls really do advance rather than restarting at
+        /// zero on each run.
+        pub fn fresh_receive_spk(&self) -> Result<ScriptBuf> {
+            let w = self.locked()?;
+            Ok(w.get_address(AddressIndex::New)
+                .map_err(|e| SwapError::Other(format!("receive address: {e}")))?
+                .script_pubkey())
         }
 
         /// A fresh deposit address (for funding the wallet).

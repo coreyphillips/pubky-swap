@@ -23,7 +23,14 @@ tokio = { version = "1", features = ["time", "rt", "rt-multi-thread"] }
 # pulls no networking stack.
 electrum-client = { version = "0.18", optional = true }
 # BDK funding wallet (feature `bdk-wallet`). Optional so the default build stays light.
-bdk = { version = "0.30", features = ["all-keys", "keys-bip39"], optional = true }
+# `sqlite-bundled` compiles SQLite in, so a persistent wallet database needs no system
+# library. Persistence is not optional here: a memory-backed wallet rescans from scratch on
+# every start and hands out the same address every time.
+bdk = { version = "0.30", features = [
+    "all-keys",
+    "keys-bip39",
+    "sqlite-bundled",
+], optional = true }
 
 [dev-dependencies]
 # Enables Transaction::verify (libbitcoinconsensus) so tests validate the claim/refund

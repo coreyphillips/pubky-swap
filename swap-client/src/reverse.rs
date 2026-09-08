@@ -81,8 +81,14 @@ pub async fn execute_reverse_swap(
         // If the payment terminated before funding appeared, there's nothing to claim.
         if pay_task.is_finished() {
             let res = pay_task.await.map_err(|e| anyhow!("pay task join: {e}"))?;
+            // Report why it ended, not the whole result: a successful `PaymentResult` carries
+            // the preimage, and this string reaches the logs.
+            let detail = match res {
+                Ok(_) => "the payment settled".to_string(),
+                Err(e) => e.to_string(),
+            };
             return Err(anyhow!(
-                "invoice payment ended before the HTLC was funded: {res:?}"
+                "invoice payment ended before the HTLC was funded: {detail}"
             ));
         }
         sleep(poll).await;

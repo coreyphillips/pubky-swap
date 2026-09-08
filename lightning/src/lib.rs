@@ -81,11 +81,25 @@ pub enum PaymentStatus {
 }
 
 /// Result of paying a BOLT11 invoice.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand and redacts the preimage. The derived one printed it, and the
+/// client formatted this whole struct into an error message, so a routine failure wrote the
+/// secret linking both legs of a swap into the logs. Redacting it here makes that impossible to
+/// reintroduce by accident at any call site.
+#[derive(Clone)]
 pub struct PaymentResult {
-    /// The preimage learned from a successful payment — the atomic link to the on-chain leg.
+    /// The preimage learned from a successful payment: the atomic link to the on-chain leg.
     pub preimage: [u8; 32],
     pub fee_msat: u64,
+}
+
+impl std::fmt::Debug for PaymentResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaymentResult")
+            .field("preimage", &"<redacted>")
+            .field("fee_msat", &self.fee_msat)
+            .finish()
+    }
 }
 
 /// Decoded essentials of a BOLT11 invoice.
@@ -276,3 +290,25 @@ pub use lnd::LndBackend;
 mod lnd_wallet;
 #[cfg(feature = "lnd")]
 pub use lnd_wallet::LndWallet;
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::PaymentResult;
+
+    /// The preimage links both legs of a swap. It used to be printed by the derived `Debug`, and
+    /// the client formatted this whole struct into an error message, so a routine failure wrote
+    /// the secret into the logs.
+    #[test]
+    fn payment_result_debug_does_not_contain_the_preimage() {
+        let result = PaymentResult {
+            preimage: [0xab; 32],
+            fee_msat: 1_234,
+        };
+        let printed = format!("{result:?}");
+        assert!(!printed.contains("ab"), "preimage leaked: {printed}");
+        assert!(!printed.contains("171"), "preimage bytes leaked: {printed}");
+        assert!(printed.contains("<redacted>"));
+        // The useful part survives.
+        assert!(printed.contains("1234"));
+    }
+}

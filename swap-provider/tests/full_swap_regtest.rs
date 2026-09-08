@@ -27,6 +27,10 @@ use swap_common::{random_keypair, SwapState};
 use swap_provider::reverse::{drive_reverse_swap, init_reverse_swap, OnchainWallet};
 use swap_provider::wallet::BdkWallet;
 
+/// A unique wallet directory per run, so tests never share a database.
+fn temp_wallet_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("pubky-swap-test-wallet-{}", uuid::Uuid::new_v4()))
+}
 const MNEMONIC: &str =
     "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 const AMOUNT_SAT: u64 = 50_000;
@@ -114,6 +118,7 @@ async fn full_reverse_swap_two_nodes() {
             Network::Regtest,
             &electrum,
             5.0,
+            &temp_wallet_dir(),
         )
         .expect("build funding wallet");
         // Make sure the BDK wallet has coins to fund the HTLC.

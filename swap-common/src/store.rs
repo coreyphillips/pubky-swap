@@ -41,7 +41,11 @@ pub enum SwapRole {
 
 /// A persisted in-flight swap. Bitcoin types are stored as hex/strings because the `bitcoin`
 /// crate is built without its `serde` feature here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is written by hand and redacts the branch key and preimage. A derived one would print
+/// both, and this struct is exactly the sort of thing that ends up in a `warn!` while someone is
+/// debugging a stuck swap.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SwapRecord {
     pub swap_id: Uuid,
     /// Which side wrote this record. Absent on records written before roles existed, which were
@@ -125,6 +129,30 @@ pub struct SwapRecord {
     pub retry_count: u32,
     #[serde(default)]
     pub updated_at_unix: u64,
+}
+
+impl std::fmt::Debug for SwapRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwapRecord")
+            .field("swap_id", &self.swap_id)
+            .field("role", &self.role)
+            .field("direction", &self.direction)
+            .field("peer", &self.peer)
+            .field("network", &self.network)
+            .field("payment_hash_hex", &self.payment_hash_hex)
+            .field("onchain_amount_sat", &self.onchain_amount_sat)
+            .field("timeout_height", &self.timeout_height)
+            .field("secret_key_hex", &"<redacted>")
+            .field(
+                "preimage_hex",
+                &self.preimage_hex.as_ref().map(|_| "<redacted>"),
+            )
+            .field("state", &self.state)
+            .field("funding_txid_hex", &self.funding_txid_hex)
+            .field("funding_vout", &self.funding_vout)
+            .field("last_error", &self.last_error)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SwapRecord {
@@ -498,5 +526,33 @@ mod tests {
         let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "records hold key material");
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    /// A record carries the only key that can move the funds on this side's HTLC branch, and it
+    /// is exactly the sort of thing that ends up in a log line while someone debugs a stuck swap.
+    #[test]
+    fn debug_output_does_not_contain_key_material() {
+        let mut rec = SwapRecord::new_progress();
+        rec.secret_key_hex = "aa".repeat(32);
+        rec.preimage_hex = Some("bb".repeat(32));
+
+        let printed = format!("{rec:?}");
+        assert!(
+            !printed.contains(&"aa".repeat(32)),
+            "branch key leaked: {printed}"
+        );
+        assert!(
+            !printed.contains(&"bb".repeat(32)),
+            "preimage leaked: {printed}"
+        );
+        assert!(printed.contains("<redacted>"));
+        // Everything useful for debugging is still there.
+        assert!(printed.contains("swap_id"));
+        assert!(printed.contains("state"));
     }
 }
