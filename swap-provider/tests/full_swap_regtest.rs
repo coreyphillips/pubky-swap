@@ -172,6 +172,7 @@ async fn full_reverse_swap_two_nodes() {
 
     let client_dest = spk_of(&cli(&["getnewaddress", "", "bech32"]));
     let claim = ReverseClaim {
+        timeout_height: timeout,
         htlc_script: swap.htlc_script.clone(),
         htlc_spk: swap.htlc_spk.clone(),
         onchain_amount_sat: swap.onchain_amount_sat,

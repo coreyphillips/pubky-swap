@@ -21,16 +21,17 @@ use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
 use lightning_backend::LightningBackend;
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
-use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
+use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, PaymentHash};
 use swap_common::onchain::{
-    build_claim_tx, estimate_spend_fee, extract_preimage, CLAIM_FEE_TARGET_BLOCKS,
+    build_claim_tx, estimate_spend_fee, extract_preimage, fee_rate_cap, spend_vsize,
+    ABSOLUTE_MAX_FEE_RATE_SAT_VB, CLAIM_FEE_TARGET_BLOCKS, DEFAULT_MAX_FEE_BPS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::timelock::{self, TimelockParams};
 use swap_common::SwapState;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// State describing one provider-side submarine swap.
 pub struct SubmarineSwap {
@@ -225,13 +226,14 @@ pub async fn drive_submarine_swap(
     //    (RBF) — the claim races the client's refund timeout, so a stuck claim is bumped.
     let dest = wallet.receive_destination();
     let preimage = payment.preimage;
+    let claim_vsize = spend_vsize(&swap.htlc_script, &dest, true);
     let build = |rate: u64| {
         build_claim_tx(
             funding_outpoint,
             swap.onchain_amount_sat,
             &swap.htlc_script,
             dest.clone(),
-            estimate_spend_fee(rate, true),
+            estimate_spend_fee(rate, claim_vsize),
             preimage,
             &swap.claim_key,
         )
@@ -250,21 +252,66 @@ pub async fn drive_submarine_swap(
         .ok()
         .flatten()
     };
-    confirm_or_bump(
-        chain,
-        &swap.htlc_spk,
+    // The claim races the client's refund branch, so it escalates as that height approaches
+    // rather than on a fixed bump count. `CLAIM_ABORT_MARGIN` keeps the deadline a few blocks
+    // short of the refund opening, since a claim landing in the same block as a refund is a
+    // coin toss we have already paid for.
+    let deadline = swap
+        .timeout_height
+        .saturating_sub(swap_common::timelock::CLAIM_ABORT_MARGIN);
+    let cfg = SpendWatchConfig::claim(
         CLAIM_FEE_TARGET_BLOCKS,
         swap.fee_rate_sat_vb,
+        fee_rate_cap(
+            swap.onchain_amount_sat,
+            claim_vsize,
+            DEFAULT_MAX_FEE_BPS,
+            ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+            swap.fee_rate_sat_vb,
+        ),
         poll,
-        MAX_FEE_BUMPS,
         FINALITY_DEPTH,
+        deadline,
+    );
+    match confirm_or_bump(
+        chain,
+        &swap.htlc_spk,
+        funding_outpoint,
+        &cfg,
         Some(&cpfp),
         build,
     )
     .await
-    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?;
-    info!("Submarine swap: invoice paid and on-chain HTLC claimed");
-    Ok(SwapState::Claimed)
+    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?
+    {
+        SpendOutcome::Confirmed { .. } => {
+            info!("Submarine swap: invoice paid and on-chain HTLC claimed");
+            Ok(SwapState::Claimed)
+        }
+        // We paid the invoice and the client's refund confirmed anyway: a realised loss of the
+        // on-chain amount. The pre-payment claim-window check should make this unreachable, so
+        // reaching it means the timelock parameters are wrong and want the operator's attention,
+        // not a quiet `Failed`.
+        SpendOutcome::ConflictingSpend { tx } => {
+            error!(
+                "Submarine swap: LOSS. The invoice was paid but the client's refund {} confirmed \
+                 before our claim. Check --min-claim-window-blocks and --timeout-blocks.",
+                tx.txid()
+            );
+            Ok(SwapState::Failed(
+                "the client's refund won the claim race after the invoice was paid".into(),
+            ))
+        }
+        SpendOutcome::DeadlineExceeded { last_txid, tip } => {
+            error!(
+                "Submarine swap: LOSS RISK. The invoice was paid but claim {last_txid} has not \
+                 confirmed by height {tip}, past its deadline. The client can now refund."
+            );
+            Ok(SwapState::Failed(
+                "the on-chain claim did not confirm before the client's refund window".into(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -21,7 +21,9 @@ use std::thread::sleep;
 use std::time::Duration;
 use swap_common::chain::{ChainWatcher, ElectrumWatcher};
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
-use swap_common::onchain::{build_claim_tx, build_refund_tx, estimate_spend_fee, extract_preimage};
+use swap_common::onchain::{
+    build_claim_tx, build_refund_tx, estimate_spend_fee, extract_preimage, spend_vsize,
+};
 use swap_common::random_keypair;
 
 const VALUE_SAT: u64 = 100_000;
@@ -142,7 +144,7 @@ fn htlc_claim_roundtrip() {
 
     // Build and broadcast the claim (reveals the preimage).
     let dest = spk_of(&new_address());
-    let fee = estimate_spend_fee(FEE_RATE, true);
+    let fee = estimate_spend_fee(FEE_RATE, spend_vsize(&redeem, &dest, true));
     let claim_tx =
         build_claim_tx(outpoint, VALUE_SAT, &redeem, dest, fee, preimage, &claim_sk).unwrap();
     let txid = chain
@@ -184,7 +186,7 @@ fn htlc_refund_is_rejected_before_timeout_and_accepted_after() {
     let outpoint = wait_for_funding(&chain, &htlc_spk);
 
     let dest = spk_of(&new_address());
-    let fee = estimate_spend_fee(FEE_RATE, false);
+    let fee = estimate_spend_fee(FEE_RATE, spend_vsize(&redeem, &dest, false));
     let refund_tx =
         build_refund_tx(outpoint, VALUE_SAT, &redeem, dest, fee, timeout, &refund_sk).unwrap();
 

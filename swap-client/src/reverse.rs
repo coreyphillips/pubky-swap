@@ -13,9 +13,12 @@ use lightning_backend::LightningBackend;
 use std::sync::Arc;
 use std::time::Duration;
 use swap_common::chain::{run_blocking, ChainWatcher};
-use swap_common::fee_bump::{confirm_or_bump, MAX_FEE_BUMPS};
+use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::Preimage;
-use swap_common::onchain::{build_claim_tx, estimate_spend_fee, CLAIM_FEE_TARGET_BLOCKS};
+use swap_common::onchain::{
+    build_claim_tx, estimate_spend_fee, fee_rate_cap, spend_vsize, ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+    CLAIM_FEE_TARGET_BLOCKS, DEFAULT_MAX_FEE_BPS,
+};
 use swap_common::reorg::FINALITY_DEPTH;
 use tokio::time::sleep;
 use tracing::info;
@@ -29,6 +32,12 @@ pub struct ReverseClaim {
     pub htlc_spk: ScriptBuf,
     /// Amount the provider locks on-chain.
     pub onchain_amount_sat: u64,
+    /// The height at which the provider's refund branch opens.
+    ///
+    /// The client's claim is racing this, so it needs to know it: without a deadline the claim
+    /// has nothing to escalate its fee against, and no point at which pushing further is
+    /// throwing money at a spend that has already lost.
+    pub timeout_height: u32,
     /// The hold invoice to pay.
     pub invoice: String,
     /// The client's preimage (kept secret until the on-chain claim).
@@ -82,32 +91,67 @@ pub async fn execute_reverse_swap(
 
     // 3. Claim the HTLC, revealing the preimage on-chain — and keep it confirming under fee
     //    pressure (RBF), since it must land before the provider's refund timeout.
+    let claim_vsize = spend_vsize(&claim.htlc_script, &claim.dest_spk, true);
     let build = |rate: u64| {
         build_claim_tx(
             funding.outpoint,
             claim.onchain_amount_sat,
             &claim.htlc_script,
             claim.dest_spk.clone(),
-            estimate_spend_fee(rate, true),
+            estimate_spend_fee(rate, claim_vsize),
             claim.preimage,
             &claim.claim_key,
         )
     };
-    // The claim sweeps to the client's chosen address (not necessarily a wallet we can spend from
-    // here), so RBF is the only bump mechanism — no CPFP fallback.
-    let txid = confirm_or_bump(
-        chain.as_ref(),
-        &claim.htlc_spk,
+    // The claim sweeps to the client's chosen address, which is not necessarily a wallet we can
+    // spend from here, so RBF is the only bump mechanism: no CPFP fallback.
+    //
+    // It races the provider's refund branch, so the fee escalates as that height approaches.
+    let deadline = claim
+        .timeout_height
+        .saturating_sub(swap_common::timelock::CLAIM_ABORT_MARGIN);
+    let cfg = SpendWatchConfig::claim(
         CLAIM_FEE_TARGET_BLOCKS,
         claim.fee_rate_sat_vb,
+        fee_rate_cap(
+            claim.onchain_amount_sat,
+            claim_vsize,
+            DEFAULT_MAX_FEE_BPS,
+            ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+            claim.fee_rate_sat_vb,
+        ),
         poll,
-        MAX_FEE_BUMPS,
         FINALITY_DEPTH,
+        deadline,
+    );
+    let txid = match confirm_or_bump(
+        chain.as_ref(),
+        &claim.htlc_spk,
+        funding.outpoint,
+        &cfg,
         None,
         build,
     )
     .await
-    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?;
+    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?
+    {
+        SpendOutcome::Confirmed { txid } => txid,
+        // The provider refunded first. Pushing another claim would only burn fees against a
+        // confirmed spend, and our Lightning payment fails back on its own.
+        SpendOutcome::ConflictingSpend { tx } => {
+            return Err(anyhow!(
+                "the provider refunded the HTLC ({}) before our claim confirmed; the hold \
+                 invoice will be cancelled and the payment returned",
+                tx.txid()
+            ));
+        }
+        SpendOutcome::DeadlineExceeded { last_txid, tip } => {
+            return Err(anyhow!(
+                "claim {last_txid} did not confirm by height {tip}, past the provider's refund \
+                 window; not broadcasting further"
+            ));
+        }
+    };
     info!("Client: claim broadcast {txid}; awaiting hold-invoice settlement");
 
     // 4. The provider sees our claim, recovers the preimage, and settles the invoice — which
@@ -140,6 +184,8 @@ mod tests {
     use swap_common::random_keypair;
 
     const AMOUNT: u64 = 100_000;
+    const MOCK_TIP: u32 = 700_000;
+    const TIMEOUT: u32 = MOCK_TIP + 144;
 
     struct MockLn {
         preimage: [u8; 32],
@@ -193,7 +239,7 @@ mod tests {
     }
     impl ChainWatcher for MockChain {
         fn tip_height(&self) -> swap_common::Result<u32> {
-            Ok(1000)
+            Ok(MOCK_TIP)
         }
         fn find_funding(
             &self,
@@ -253,6 +299,7 @@ mod tests {
             claim_key: claim_sk,
             dest_spk: dest,
             fee_rate_sat_vb: 5,
+            timeout_height: TIMEOUT,
         };
 
         execute_reverse_swap(ln, chain, claim, 10_000, 1, Duration::from_millis(0))
