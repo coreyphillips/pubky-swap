@@ -190,7 +190,9 @@ macro_rules! guard {
 struct SwapView {
     swap_id: String,
     direction: String,
-    state: String,
+    state: &'static str,
+    /// The reason, when the state carries one. `Failed` is the only variant that does.
+    state_detail: Option<String>,
     peer: String,
     onchain_amount_sat: u64,
     service_fee_sat: u64,
@@ -208,7 +210,24 @@ impl From<&SwapRecord> for SwapView {
         Self {
             swap_id: rec.swap_id.to_string(),
             direction: format!("{:?}", rec.direction).to_lowercase(),
-            state: format!("{:?}", rec.state),
+            // Not `{:?}`: a failed swap would render as `Failed("the peer never paid")`, quotes
+            // and all, and a dashboard would put that in a badge.
+            state: match rec.state {
+                SwapState::Created => "created",
+                SwapState::LockupPending => "lockup_pending",
+                SwapState::LockupConfirmed => "lockup_confirmed",
+                SwapState::InvoicePending => "invoice_pending",
+                SwapState::InvoicePaid => "invoice_paid",
+                SwapState::ClaimPending => "claim_pending",
+                SwapState::Claimed => "claimed",
+                SwapState::Refunded => "refunded",
+                SwapState::Expired => "expired",
+                SwapState::Failed(_) => "failed",
+            },
+            state_detail: match &rec.state {
+                SwapState::Failed(reason) => Some(reason.clone()),
+                _ => None,
+            },
             peer: rec.peer.clone(),
             onchain_amount_sat: rec.onchain_amount_sat,
             service_fee_sat: rec.service_fee_sat,
@@ -431,5 +450,25 @@ mod tests {
             "the preimage reached the wire"
         );
         assert!(json.contains("peer"), "and the view is not simply empty");
+    }
+
+    /// The reason a swap failed belongs in a field, not inside the state name.
+    ///
+    /// `format!("{:?}")` on `Failed(String)` renders `Failed("the peer never paid")`, quotes
+    /// included, and a dashboard puts whatever it is given into a badge. Anything that reads this
+    /// API has to be able to switch on the state without parsing it.
+    #[test]
+    fn a_failure_reason_is_a_field_rather_than_part_of_the_state() {
+        let mut rec = SwapRecord::new_progress();
+        rec.state = SwapState::Failed("the peer never paid".into());
+        let view = SwapView::from(&rec);
+        assert_eq!(view.state, "failed");
+        assert_eq!(view.state_detail.as_deref(), Some("the peer never paid"));
+
+        let mut rec = SwapRecord::new_progress();
+        rec.state = SwapState::LockupConfirmed;
+        let view = SwapView::from(&rec);
+        assert_eq!(view.state, "lockup_confirmed");
+        assert_eq!(view.state_detail, None);
     }
 }

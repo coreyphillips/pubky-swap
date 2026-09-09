@@ -720,6 +720,16 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         provider_pkarr: provider_pkarr.clone(),
     })
     .await?;
+    // A build without the feature cannot serve the address it was given, and saying nothing
+    // leaves a dashboard polling a port that will never answer.
+    #[cfg(not(feature = "status"))]
+    if config.status_addr.as_deref().is_some_and(|a| !a.is_empty()) {
+        warn!(
+            "status_addr is set to {} but this build has no status API; rebuild with \
+             --features status (or full)",
+            config.status_addr.as_deref().unwrap_or_default()
+        );
+    }
 
     // Lightning backend (real with `--features lnd`, else a stub).
     let ln = make_backend(&config).await;
