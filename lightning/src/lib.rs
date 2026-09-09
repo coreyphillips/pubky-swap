@@ -114,6 +114,13 @@ pub struct DecodedInvoice {
     /// Whether the invoice carried an explicit amount. A zero-amount invoice is not a
     /// zero-value one; it means the payer chooses, which a swap must refuse.
     pub amount_is_explicit: bool,
+    /// Unix seconds at which the invoice expires, or `0` when the backend does not say.
+    ///
+    /// A swap has to outlive its own Lightning leg: an invoice that expires before the on-chain
+    /// side can complete leaves a client that has committed coins with nothing to settle against.
+    /// The check for that existed and was fed a hard-coded zero, which is the value that means
+    /// "unknown" and so disabled it.
+    pub expires_at_unix: u64,
 }
 
 /// Everything needed to create a hold invoice for a reverse swap.

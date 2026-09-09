@@ -409,12 +409,18 @@ impl LightningBackend for LndBackend {
                 resp.cltv_expiry
             ))
         })?;
+        // LND reports the creation timestamp and a relative expiry, both signed.
+        let expires_at_unix = match (u64::try_from(resp.timestamp), u64::try_from(resp.expiry)) {
+            (Ok(t), Ok(e)) => t.saturating_add(e),
+            _ => 0,
+        };
         Ok(DecodedInvoice {
             payment_hash,
             amount_msat,
             min_final_cltv_expiry,
             // LND reports 0 for an amountless invoice, where the payer chooses the amount.
             amount_is_explicit: resp.num_msat > 0,
+            expires_at_unix,
         })
     }
 }

@@ -526,6 +526,7 @@ mod tests {
                 amount_msat: INVOICE_SAT * 1000,
                 min_final_cltv_expiry: 80,
                 amount_is_explicit: true,
+                expires_at_unix: 0,
             })
         }
     }

@@ -1373,7 +1373,7 @@ fn spawn_reverse_driver(
         Some(w) => w,
         None => return,
     };
-    let resume = resume_from_record(&record);
+    let resume = record.resume();
     let peer = record.peer.clone();
     let swap_id = record.swap_id;
     let required_confirmations = record.required_confirmations;
@@ -1548,7 +1548,7 @@ fn spawn_submarine_driver(
         Some(w) => w,
         None => return,
     };
-    let resume = resume_from_record(&record);
+    let resume = record.resume();
     let already_attempted_payment = record.invoice_pay_started_at_unix.is_some();
     let peer = record.peer.clone();
     let swap_id = record.swap_id;
@@ -1585,18 +1585,6 @@ fn spawn_submarine_driver(
         )
         .await;
     });
-}
-
-/// Everything a driver needs to know about what a previous run of this swap already did.
-///
-/// Built in one place for both directions so the two cannot drift: the fields exist precisely
-/// because a resumed driver that ignores one of them repeats an irreversible act.
-fn resume_from_record(rec: &SwapRecord) -> reverse::Resume {
-    reverse::Resume {
-        funding: rec.funding_outpoint(),
-        funding_intent_at_height: rec.funding_intent_at_height,
-        our_spends: rec.our_spends(),
-    }
 }
 
 /// Reconstruct a [`ReverseSwap`] from a persisted record (resume path).

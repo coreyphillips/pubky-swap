@@ -167,6 +167,35 @@ impl std::fmt::Debug for SwapRecord {
     }
 }
 
+/// What a restarted driver knows about a swap that was already in flight.
+///
+/// Every field is something a record wrote down *before* an irreversible act, and this is the
+/// whole of what a driver is allowed to conclude from a previous run. It lives beside
+/// [`SwapRecord`] rather than in either binary because both sides resume, both sides can fund an
+/// HTLC, and a provider and a client that disagreed about what a marker means would each be right
+/// about their own half of the same bug.
+///
+/// [`Resume::default`] is a fresh start, and a driver given one behaves exactly as it did before
+/// any of this existed: the fields only ever narrow what a resumed driver is willing to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Resume {
+    /// The HTLC funding outpoint, once it was known.
+    pub funding: Option<OutPoint>,
+    /// The tip height at which a funding broadcast was about to be attempted, still set because
+    /// no outpoint was ever recorded for it. Means "a funding may exist; go and look", and it is
+    /// enough on its own: a driver that sees it will never fund, however empty the chain looks.
+    pub funding_intent_at_height: Option<u32>,
+    /// Claim or refund transactions an earlier run put on the wire.
+    pub our_spends: Vec<Txid>,
+}
+
+impl Resume {
+    /// Whether this is a first run rather than a resumed one.
+    pub fn is_fresh(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// How many of our own claim/refund txids a record keeps.
 ///
 /// Escalation replaces a transaction rather than adding one, so only the most recent handful can
@@ -282,6 +311,15 @@ impl SwapRecord {
             .chain(self.spend_txid_hex.iter())
             .filter_map(|h| Txid::from_str(h).ok())
             .collect()
+    }
+
+    /// What a driver resuming this swap must honour.
+    pub fn resume(&self) -> Resume {
+        Resume {
+            funding: self.funding_outpoint(),
+            funding_intent_at_height: self.funding_intent_at_height,
+            our_spends: self.our_spends(),
+        }
     }
 
     /// The funding outpoint, if it has been recorded.

@@ -219,14 +219,23 @@ async fn full_reverse_swap_two_nodes() {
             .await
         })
     };
-    let client_task = tokio::spawn(execute_reverse_swap(
-        client_ln.clone(),
-        chain_c.clone(),
-        claim,
-        100_000,
-        1,
-        Duration::from_secs(1),
-    ));
+    let client_task = {
+        let ln = client_ln.clone();
+        let chain = chain_c.clone();
+        tokio::spawn(async move {
+            execute_reverse_swap(
+                ln,
+                chain,
+                claim,
+                100_000,
+                1,
+                Duration::from_secs(1),
+                &Resume::default(),
+                &(),
+            )
+            .await
+        })
+    };
 
     let provider_result = tokio::time::timeout(Duration::from_secs(90), provider_task)
         .await
