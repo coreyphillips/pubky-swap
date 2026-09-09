@@ -87,6 +87,8 @@ mod bdk_impl {
         /// restored may have a history behind it. A loaded wallet has its own checkpoint and only
         /// needs the difference.
         needs_full_scan: AtomicBool,
+        /// Written once the first full scan has actually finished; see [`Self::sync`].
+        full_scan_marker: std::path::PathBuf,
         /// A sweep destination resolved at construction.
         ///
         /// `receive_destination` is infallible, so it cannot derive a fresh address on demand.
@@ -187,12 +189,29 @@ mod bdk_impl {
                 .persist(&mut conn)
                 .map_err(|e| SwapError::Other(format!("persist wallet: {e}")))?;
 
+            // Whether a full scan is still owed is a fact about the wallet on disk, so it lives
+            // on disk. It used to be `is_new`, which is only "did this process create the
+            // database". A first start that creates the database and then dies before the scan
+            // completes, which is a slow operation over Electrum against a restored seed with
+            // history, comes back as a load: `is_new` is false, the full scan is never attempted
+            // again, and the wallet syncs only addresses it has revealed. For a restored mnemonic
+            // that is none of them, so the coins are never seen. Nothing surfaces an error; the
+            // balance is simply zero, forever.
+            let full_scan_marker = std::path::Path::new(&db_path).with_extension("scanned");
+            let scanned = full_scan_marker.exists();
+            if is_new && scanned {
+                // A database that was deleted while its marker stayed behind would otherwise skip
+                // the scan the fresh database needs.
+                let _ = std::fs::remove_file(&full_scan_marker);
+            }
+
             Ok(Self {
                 inner: Mutex::new(Persisted { wallet, conn }),
                 chain,
                 fee_client,
                 fee_rate_sat_vb,
-                needs_full_scan: AtomicBool::new(is_new),
+                needs_full_scan: AtomicBool::new(is_new || !scanned),
+                full_scan_marker,
                 receive_spk,
             })
         }
@@ -221,6 +240,18 @@ mod bdk_impl {
                 p.wallet
                     .apply_update(update)
                     .map_err(|e| SwapError::Other(format!("apply full scan: {e}")))?;
+                // Persisted before the flag is cleared, and only after the update is applied, so
+                // an interrupted first scan is retried on the next start rather than skipped.
+                p.persist()?;
+                if let Err(e) = std::fs::write(&self.full_scan_marker, b"1") {
+                    // Not fatal: the cost of failing to write it is one extra full scan next
+                    // start, which is the safe direction to err in.
+                    tracing::warn!(
+                        "could not record that the wallet's full scan finished ({}): {e}. The \
+                         next start will scan again.",
+                        self.full_scan_marker.display()
+                    );
+                }
                 self.needs_full_scan.store(false, Ordering::Relaxed);
             } else {
                 let request = p.wallet.start_sync_with_revealed_spks().build();

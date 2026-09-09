@@ -127,3 +127,75 @@ fn bdk_wallet_funds_htlc() {
         htlc_spk.to_hex_string()
     );
 }
+
+/// A wallet whose database exists but whose first full scan never finished must still scan.
+///
+/// `needs_full_scan` was set from "did this process create the database", which is only the same
+/// thing on a start that gets all the way through. A first start that creates the database and
+/// then dies before the scan completes, and an Electrum full scan against a seed with history is
+/// exactly the slow part, comes back as a load: the flag is false, the scan is never attempted
+/// again, and the wallet syncs only the addresses it has revealed. For a restored mnemonic that
+/// is none of them, so its coins are never seen. Nothing errors; the balance is simply zero.
+///
+/// This is that sequence: fund the seed, throw the wallet away mid-life leaving the database
+/// behind with no completed-scan marker, and reopen it.
+#[test]
+#[ignore = "requires docker regtest bitcoind + electrs"]
+fn a_wallet_whose_first_scan_never_finished_scans_again() {
+    let bal: f64 = cli(&["getbalance"]).parse().unwrap_or(0.0);
+    if bal < 1.0 {
+        mine(110);
+    }
+
+    let dir = temp_wallet_dir();
+
+    // First life: fund the seed so there is history behind it, and let the scan complete.
+    let deposit = {
+        let wallet =
+            BdkWallet::from_mnemonic(MNEMONIC, Network::Regtest, &electrum_url(), 5, &dir).unwrap();
+        let deposit = wallet.deposit_address().unwrap().to_string();
+        let send = cli(&["sendtoaddress", &deposit, "0.25"]);
+        assert!(!send.starts_with("ERROR"), "funding deposit failed: {send}");
+        mine(1);
+        for _ in 0..30 {
+            if wallet.balance().unwrap() >= 20_000_000 {
+                break;
+            }
+            sleep(Duration::from_secs(1));
+        }
+        assert!(wallet.balance().unwrap() >= 20_000_000);
+        deposit
+    };
+
+    // Now make it look like the scan never finished: the database survives, the marker does not.
+    // This is what a process killed part-way through its first scan leaves behind.
+    let marker = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|e| e == "scanned"))
+        .expect("a completed scan records that it completed");
+    std::fs::remove_file(&marker).unwrap();
+
+    // Second life: the database is there, so this is a load, not a create.
+    let wallet =
+        BdkWallet::from_mnemonic(MNEMONIC, Network::Regtest, &electrum_url(), 5, &dir).unwrap();
+    let mut balance = 0;
+    for _ in 0..30 {
+        balance = wallet.balance().unwrap();
+        if balance >= 20_000_000 {
+            break;
+        }
+        sleep(Duration::from_secs(1));
+    }
+    assert!(
+        balance >= 20_000_000,
+        "a wallet that never finished its first scan must scan again, not report {balance} for a \
+         seed holding coins at {deposit}"
+    );
+    assert!(
+        marker.exists(),
+        "and record that this scan finished, so the next start need not repeat it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

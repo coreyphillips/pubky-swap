@@ -403,29 +403,49 @@ pub async fn drive_reverse_swap(
     progress: &dyn ProgressSink,
 ) -> Result<SwapState> {
     // 1. Wait for the client to pay the hold invoice (give up at timeout — nothing locked yet).
-    loop {
-        match ln
-            .invoice_state(swap.payment_hash)
-            .await
-            .map_err(|e| anyhow!("invoice state: {e}"))?
-        {
-            InvoiceState::Accepted => break,
-            InvoiceState::Settled => return Ok(SwapState::Claimed),
-            InvoiceState::Cancelled => {
-                return Ok(SwapState::Failed("hold invoice cancelled".into()))
-            }
-            InvoiceState::Open => {
-                if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
-                    if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
-                        warn!("Reverse swap: failed to cancel hold invoice on expiry: {e}");
+    //
+    //    "Nothing locked yet" is only true before this driver funds. A resumed one may have
+    //    coins on chain already, and then every exit here is wrong: the parenthetical above was
+    //    written for a fresh start and the loop was reached on both paths. `Cancelled` is the
+    //    expensive one. It returns the client's payment and, in a reverse swap, the client is
+    //    the party that chose the preimage: they can still claim the funded HTLC, for free,
+    //    the moment they notice. Returning `Failed` here leaves nobody driving the refund that
+    //    races them.
+    //
+    //    So a driver that may have funded skips this loop entirely and goes to the funding
+    //    path, which adopts what is on chain and drives it to a claim or a refund. Whether the
+    //    invoice can still be settled is decided there, with the coins accounted for.
+    let may_have_funded = resume.funding.is_some() || resume.funding_intent_at_height.is_some();
+    if may_have_funded {
+        info!(
+            "Reverse swap: resuming a swap that may already hold coins on chain, so the invoice \
+             state does not decide this on its own."
+        );
+    } else {
+        loop {
+            match ln
+                .invoice_state(swap.payment_hash)
+                .await
+                .map_err(|e| anyhow!("invoice state: {e}"))?
+            {
+                InvoiceState::Accepted => break,
+                InvoiceState::Settled => return Ok(SwapState::Claimed),
+                InvoiceState::Cancelled => {
+                    return Ok(SwapState::Failed("hold invoice cancelled".into()))
+                }
+                InvoiceState::Open => {
+                    if run_blocking(|| chain.tip_height())? >= swap.timeout_height {
+                        if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
+                            warn!("Reverse swap: failed to cancel hold invoice on expiry: {e}");
+                        }
+                        return Ok(SwapState::Expired);
                     }
-                    return Ok(SwapState::Expired);
                 }
             }
+            sleep(poll).await;
         }
-        sleep(poll).await;
+        info!("Reverse swap: hold invoice accepted");
     }
-    info!("Reverse swap: hold invoice accepted");
 
     // 2. Establish the HTLC funding outpoint, idempotently, so a resumed driver never
     //    double-funds. Only the branch that commits *new* funds is gated on the timelocks: once
@@ -1092,6 +1112,144 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(final_state, SwapState::Refunded);
+        assert_eq!(chain.broadcast_count(), 1);
+    }
+
+    /// A cancelled hold invoice is a fatal answer only while nothing is committed on chain.
+    ///
+    /// The provider's coins are in the HTLC and, in a reverse swap, the *client* chose the
+    /// preimage: a cancel returns their Lightning payment and leaves them able to claim the
+    /// on-chain contract for nothing. Returning `Failed` here marks the record terminal, so it
+    /// leaves `load_active`, no restart resumes it, and the refund that races the client is never
+    /// broadcast. The whole funded amount is lost on the one branch the provider holds the key
+    /// for.
+    ///
+    /// LND cancels an accepted hold invoice as its incoming HTLC nears expiry, and the timelock
+    /// model deliberately makes the Lightning leg outlive the on-chain refund, so this is the
+    /// ordinary end of an unhappy swap rather than an exotic case.
+    #[tokio::test]
+    async fn a_cancelled_invoice_does_not_abandon_an_already_funded_htlc() {
+        let secp = Secp256k1::new();
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let swap = init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            params(),
+        )
+        .await
+        .unwrap();
+
+        // The state a restart finds: our funding is on chain and confirmed, and the node has
+        // since cancelled the invoice.
+        let outpoint = funding_outpoint();
+        let ln = MockLn::new(InvoiceState::Cancelled);
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT)
+            .with_funding(FundingUtxo {
+                outpoint,
+                value_sat: AMOUNT,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = NeverFundWallet { refund_spk: dest() };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume {
+                funding: Some(outpoint),
+                ..Default::default()
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            final_state,
+            SwapState::Refunded,
+            "a funded HTLC must be refunded, not abandoned because the invoice was cancelled"
+        );
+        assert_eq!(
+            chain.broadcast_count(),
+            1,
+            "and the refund must actually reach the wire"
+        );
+    }
+
+    /// The same hole reached through the intent marker rather than a recorded outpoint: a driver
+    /// that crashed between broadcasting its funding and writing down where it landed.
+    #[tokio::test]
+    async fn a_cancelled_invoice_does_not_abandon_a_funding_we_only_intended() {
+        let secp = Secp256k1::new();
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let swap = init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            params(),
+        )
+        .await
+        .unwrap();
+
+        let outpoint = funding_outpoint();
+        let ln = MockLn::new(InvoiceState::Cancelled);
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT)
+            .with_funding(FundingUtxo {
+                outpoint,
+                value_sat: AMOUNT,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = NeverFundWallet { refund_spk: dest() };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume {
+                funding_intent_at_height: Some(MOCK_TIP),
+                ..Default::default()
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
         assert_eq!(final_state, SwapState::Refunded);
         assert_eq!(chain.broadcast_count(), 1);
     }

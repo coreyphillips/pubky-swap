@@ -32,13 +32,50 @@ use std::path::Path;
 /// Deliberately several options, because the right one differs by deployment: a systemd unit has
 /// `LoadCredential`, a container has environment variables, and someone running it by hand has a
 /// file. What none of them should need is the command line.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SecretSource {
     /// The value itself. Settable from the environment or a config file; never from a flag.
     pub value: Secret,
     /// A file holding the value, whose first line is read and trimmed.
     pub file: String,
+}
+
+/// Accepts either the struct or a bare string.
+///
+/// `PUBKY_SWAP_RECOVERY_PHRASE=<phrase>` is the name an operator reaches for; the `__VALUE`
+/// suffix is a consequence of this being a two-field struct, not something anyone would guess.
+/// Before this, that spelling was a type error, and figment's type errors quote the offending
+/// value: the seed went to stderr, which on a packaged install is the app's log.
+///
+/// Taking the bare string is the fix rather than a nicety. It removes the error, and with it the
+/// only way that particular mistake could print a secret.
+impl<'de> Deserialize<'de> for SecretSource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Fields {
+            value: Secret,
+            file: String,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Inline(String),
+            Fields(Fields),
+        }
+
+        Ok(match Either::deserialize(d)? {
+            Either::Inline(value) => SecretSource {
+                value: Secret::new(value),
+                file: String::new(),
+            },
+            Either::Fields(f) => SecretSource {
+                value: f.value,
+                file: f.file,
+            },
+        })
+    }
 }
 
 impl SecretSource {
@@ -179,7 +216,82 @@ where
     figment = figment.merge(Env::prefixed(env_prefix).split("__"));
     figment = figment.merge(Serialized::defaults(cli_overrides));
 
-    figment.extract().context("assembling the configuration")
+    figment.extract().map_err(redact_config_error)
+}
+
+/// Turn a figment error into one that cannot contain a configuration value.
+///
+/// figment's messages quote what it found: `invalid type: found string "abandon abandon ..."`.
+/// That is the right message for a port number and the wrong one for a seed, and the layer that
+/// raises it does not know which it is holding. A packaged install makes it worse: the message
+/// goes to stderr, which is the app's log buffer, which the dashboard renders.
+///
+/// So no value is quoted, whatever the key. What an operator needs is the key and what was
+/// expected there, and both survive. The one thing lost is being able to see the offending value
+/// in the error, which is not a thing to want from a file that holds seeds.
+fn redact_config_error(err: figment::Error) -> anyhow::Error {
+    let mut lines = Vec::new();
+    for e in err {
+        let where_ = if e.path.is_empty() {
+            String::new()
+        } else {
+            format!(" for `{}`", e.path.join("."))
+        };
+        let source = e
+            .metadata
+            .as_ref()
+            .map(|m| format!(" (from {})", m.name))
+            .unwrap_or_default();
+        lines.push(match &e.kind {
+            // The three kinds that carry a value. `Actual` renders the value itself, so only its
+            // shape is reported.
+            figment::error::Kind::InvalidType(actual, expected) => format!(
+                "invalid type{where_}{source}: expected {expected}, found {}",
+                actual_shape(actual)
+            ),
+            figment::error::Kind::InvalidValue(actual, expected) => format!(
+                "invalid value{where_}{source}: expected {expected}, found {}",
+                actual_shape(actual)
+            ),
+            figment::error::Kind::Unsupported(actual) => {
+                format!(
+                    "unsupported value{where_}{source}: {}",
+                    actual_shape(actual)
+                )
+            }
+            figment::error::Kind::UnsupportedKey(actual, expected) => format!(
+                "unsupported key{where_}{source}: expected {expected}, found {}",
+                actual_shape(actual)
+            ),
+            // Everything else names keys and types, not values.
+            other => format!("{other}{where_}{source}"),
+        });
+    }
+    if lines.is_empty() {
+        lines.push("the configuration could not be assembled".into());
+    }
+    anyhow::anyhow!(lines.join("; ")).context("assembling the configuration")
+}
+
+/// The shape of a value, never the value.
+fn actual_shape(actual: &figment::error::Actual) -> &'static str {
+    use figment::error::Actual;
+    match actual {
+        Actual::Bool(_) => "a boolean",
+        Actual::Unsigned(_) | Actual::Signed(_) => "an integer",
+        Actual::Float(_) => "a decimal",
+        Actual::Char(_) => "a character",
+        Actual::Str(_) => "a string",
+        Actual::Bytes(_) => "bytes",
+        Actual::Unit => "a unit",
+        Actual::Option => "an option",
+        Actual::NewtypeStruct | Actual::NewtypeVariant => "a newtype",
+        Actual::Seq | Actual::TupleVariant => "a list",
+        Actual::Map | Actual::StructVariant => "a table",
+        Actual::Enum | Actual::UnitVariant => "an enum",
+        // `Other` carries a free-form description that may quote a value, so it is not printed.
+        Actual::Other(_) => "a value of another type",
+    }
 }
 
 /// Render a configuration as TOML, with secrets redacted.
@@ -397,5 +509,132 @@ mod tests {
             missing.resolve("x").is_err(),
             "a named file that is absent is an error"
         );
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    #[serde(default)]
+    struct Conf {
+        recovery_phrase: SecretSource,
+        min_amount_sat: u64,
+    }
+
+    /// What the binaries pass when no flag was given: a struct whose every field is skipped.
+    #[derive(Default, Serialize)]
+    struct NoOverrides {}
+
+    const PHRASE: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+         abandon about";
+
+    /// The obvious spelling has to work, because the alternative is that it fails in a way that
+    /// prints the value.
+    ///
+    /// `PUBKY_SWAP_RECOVERY_PHRASE=<phrase>` is what an operator reaches for; `__VALUE` is a
+    /// consequence of the field being a two-field struct and is not something anyone would guess.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment\'s Jail error type, not ours
+    fn a_secret_can_be_given_as_a_bare_string() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PUBKY_SWAP_RECOVERY_PHRASE", PHRASE);
+            let c: Conf = load(None, "PUBKY_SWAP_", &NoOverrides {}).unwrap();
+            assert_eq!(c.recovery_phrase.value.expose(), PHRASE);
+            assert!(c.recovery_phrase.file.is_empty());
+            Ok(())
+        });
+    }
+
+    /// And the explicit form still means what it meant.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment\'s Jail error type, not ours
+    fn the_explicit_forms_still_work() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PUBKY_SWAP_RECOVERY_PHRASE__VALUE", PHRASE);
+            let c: Conf = load(None, "PUBKY_SWAP_", &NoOverrides {}).unwrap();
+            assert_eq!(c.recovery_phrase.value.expose(), PHRASE);
+
+            jail.clear_env();
+            jail.set_env("PUBKY_SWAP_RECOVERY_PHRASE__FILE", "/tmp/somewhere");
+            let c: Conf = load(None, "PUBKY_SWAP_", &NoOverrides {}).unwrap();
+            assert_eq!(c.recovery_phrase.file, "/tmp/somewhere");
+            assert!(c.recovery_phrase.value.is_empty());
+            Ok(())
+        });
+    }
+
+    /// No configuration error may quote a configuration value.
+    ///
+    /// figment reports what it found: `invalid type: found string "abandon abandon ..."`. That is
+    /// right for a port and catastrophic for a seed, and the layer raising it cannot tell which
+    /// it is holding. On a packaged install the message goes to stderr, which is the app's log
+    /// buffer, which the dashboard renders.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment\'s Jail error type, not ours
+    fn a_failing_secret_never_reaches_the_error_message() {
+        figment::Jail::expect_with(|jail| {
+            // A shape `SecretSource` cannot accept, so the deserializer has to complain about
+            // something that is a seed.
+            jail.create_file(
+                "c.toml",
+                &format!("recovery_phrase = {{ value = {{ nested = \"{PHRASE}\" }} }}\n"),
+            )?;
+            let err = load::<Conf, _>(
+                Some(std::path::Path::new("c.toml")),
+                "NOTHING_",
+                &NoOverrides {},
+            )
+            .expect_err("this cannot deserialize");
+            let printed = format!("{err:#}");
+            assert!(
+                !printed.contains("abandon"),
+                "the secret reached the error: {printed}"
+            );
+            Ok(())
+        });
+    }
+
+    /// Redacting must not cost the operator the ability to fix their configuration: the key and
+    /// the expected type are what they need, and neither is the value.
+    /// The second line of defence, and the one that does not depend on knowing which keys hold
+    /// secrets. figment quotes what it found for any key; a value that lands in the wrong field
+    /// is a mistake an operator makes precisely when they are moving secrets around.
+    #[test]
+    #[allow(clippy::result_large_err)] // figment\'s Jail error type, not ours
+    fn no_error_quotes_a_value_even_for_a_key_that_is_not_a_secret() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PUBKY_SWAP_MIN_AMOUNT_SAT", PHRASE);
+            let err = load::<Conf, _>(None, "PUBKY_SWAP_", &NoOverrides {}).expect_err("not a u64");
+            let printed = format!("{err:#}");
+            assert!(
+                !printed.contains("abandon"),
+                "a secret pasted into the wrong key still reached the error: {printed}"
+            );
+            assert!(printed.contains("min_amount_sat"), "{printed}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // figment\'s Jail error type, not ours
+    fn a_failing_value_still_says_which_key_and_what_was_expected() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("PUBKY_SWAP_MIN_AMOUNT_SAT", "not-a-number");
+            let err = load::<Conf, _>(None, "PUBKY_SWAP_", &NoOverrides {})
+                .expect_err("a string is not a u64");
+            let printed = format!("{err:#}");
+            assert!(printed.contains("min_amount_sat"), "{printed}");
+            assert!(printed.contains("u64"), "{printed}");
+            assert!(printed.contains("found a string"), "{printed}");
+            assert!(
+                !printed.contains("not-a-number"),
+                "the value is not quoted, even a harmless one: {printed}"
+            );
+            Ok(())
+        });
     }
 }

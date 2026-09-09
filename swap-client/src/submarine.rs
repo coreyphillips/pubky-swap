@@ -16,11 +16,12 @@ use swap_common::chain::{run_blocking, select_recorded_funding, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::PaymentHash;
 use swap_common::onchain::{
-    build_refund_tx, estimate_spend_fee, fee_rate_cap, spend_vsize, ABSOLUTE_MAX_FEE_RATE_SAT_VB,
-    DEFAULT_MAX_FEE_BPS, REFUND_FEE_TARGET_BLOCKS,
+    build_refund_tx, estimate_spend_fee, extract_preimage, fee_rate_cap, spend_vsize,
+    ABSOLUTE_MAX_FEE_RATE_SAT_VB, DEFAULT_MAX_FEE_BPS, REFUND_FEE_TARGET_BLOCKS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::store::Resume;
+use swap_common::timelock::claim_start_is_safe;
 use swap_common::wallet::OnchainWallet;
 use swap_common::SwapState;
 use tokio::time::sleep;
@@ -102,6 +103,22 @@ async fn establish_funding(
     }
 
     let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip height: {e}"))?;
+
+    // Nothing has been committed yet, so there is still a decision to make: is this swap worth
+    // funding at all? On the fresh path `validate_accept` answered that before we got here. A
+    // resume calls straight into this function with a record rebuilt from disk and asks nothing,
+    // so a client restarted after the timeout would fund an HTLC whose provider gave up long ago,
+    // then immediately refund it. That is two on-chain fees and the whole amount locked and
+    // unlocked, for a swap that was already dead.
+    if !claim_start_is_safe(tip, funding.timeout_height) {
+        return Err(anyhow!(
+            "this swap's HTLC times out at height {} and the tip is {tip}, so there is no window \
+             left for the provider to pay and claim. Not funding it. Nothing was committed on \
+             chain.",
+            funding.timeout_height
+        ));
+    }
+
     // Written before the broadcast: without it a crash in the gap leaves coins in an HTLC with
     // nothing on disk pointing at them, and the refund key alone is not enough to find them.
     progress.funding_intent(tip)?;
@@ -230,12 +247,28 @@ pub async fn execute_submarine_swap(
         {
             // If the provider already claimed the HTLC, the preimage is public and our invoice
             // will settle — don't refund (the refund would just lose to their claim).
-            if run_blocking(|| chain.find_spend(&funding.htlc_spk, &outpoint))
+            //
+            // A spend is not by itself a claim. Our own refund spends this same outpoint, and it
+            // sits in the mempool for as long as it takes to confirm; a resumed run, or the next
+            // turn of this loop, would read it back and conclude the provider had won. That
+            // returns `Claimed` for a swap nobody claimed, stops driving the refund before it is
+            // confirmed, and leaves the fee escalation that gets it mined unstarted.
+            //
+            // Only a spend that reveals the preimage is the provider's claim. Nothing else can
+            // produce one: that is the whole point of the hashlock branch.
+            if let Some(spend) = run_blocking(|| chain.find_spend(&funding.htlc_spk, &outpoint))
                 .map_err(|e| anyhow!("find spend: {e}"))?
-                .is_some()
             {
-                info!("Submarine client: HTLC already claimed by provider; awaiting settlement");
-                return Ok(SwapState::Claimed);
+                if extract_preimage(&spend, &outpoint, &funding.payment_hash).is_some() {
+                    info!(
+                        "Submarine client: HTLC already claimed by provider; awaiting settlement"
+                    );
+                    return Ok(SwapState::Claimed);
+                }
+                info!(
+                    "Submarine client: the HTLC is spent by a transaction that reveals no \
+                     preimage, so it is our own refund. Continuing to drive it."
+                );
             }
 
             warn!("Submarine client: timeout reached without settlement; refunding HTLC");
@@ -295,16 +328,32 @@ pub async fn execute_submarine_swap(
             .map_err(|e| anyhow!("refund broadcast/bump: {e}"))?
             {
                 SpendOutcome::Confirmed { .. } => return Ok(SwapState::Refunded),
-                // The provider claimed while we were refunding. The preimage is public now, so
-                // our invoice settles and we are paid over Lightning: this is the swap
-                // succeeding, not failing.
+                // A spend that is not one we recognise. Whether it is the provider claiming or
+                // our own earlier refund is decided by the witness, not by whether we happen to
+                // have the txid on file: a crash between broadcasting a refund and persisting its
+                // txid leaves `known_ours` empty for a transaction that is very much ours, and
+                // reading that as the provider's claim ends the swap as `Claimed` with our own
+                // coins still unconfirmed in an unfinished refund nobody is bumping any more.
+                //
+                // Only the hashlock branch can produce a preimage. That is the test.
                 SpendOutcome::ConflictingSpend { tx } => {
+                    let txid = tx.compute_txid();
+                    if extract_preimage(&tx, &outpoint, &funding.payment_hash).is_some() {
+                        // The provider claimed while we were refunding. The preimage is public
+                        // now, so our invoice settles and we are paid over Lightning: this is the
+                        // swap succeeding, not failing.
+                        info!(
+                            "Submarine client: the provider claimed the HTLC ({txid}) as we \
+                             refunded; awaiting Lightning settlement"
+                        );
+                        return Ok(SwapState::Claimed);
+                    }
                     info!(
-                        "Submarine client: the provider claimed the HTLC ({}) as we refunded; \
-                         awaiting Lightning settlement",
-                        tx.compute_txid()
+                        "Submarine client: the HTLC is spent by {txid}, which reveals no \
+                         preimage, so it is a refund of ours from an earlier run. Adopting it."
                     );
-                    return Ok(SwapState::Claimed);
+                    progress.spend_broadcast(txid);
+                    return Ok(SwapState::Refunded);
                 }
                 SpendOutcome::DeadlineExceeded { last_txid, tip } => {
                     warn!(
@@ -461,6 +510,120 @@ mod tests {
         }
     }
 
+    /// A resume must not fund a swap that is already over.
+    ///
+    /// On the fresh path `validate_accept` answers "is this worth funding" before anything is
+    /// committed. The resume path calls straight in with a record rebuilt from disk and asks
+    /// nothing, so a client restarted after the timeout funded an HTLC whose provider gave up
+    /// long ago and then immediately refunded it: two on-chain fees and the whole amount locked
+    /// and unlocked, on a swap that was dead before the funding was broadcast.
+    #[tokio::test]
+    async fn a_resumed_client_does_not_fund_a_swap_whose_window_has_closed() {
+        let secp = Secp256k1::new();
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, TIMEOUT);
+        let f = funding(refund_sk, script, ph);
+
+        // Restarted well past the timeout, with nothing funded and no marker: the state a client
+        // that died before broadcasting comes back in.
+        let chain = MockChain::new().always_final().with_tip(TIMEOUT + 50);
+        let ln = MockLn {
+            state: InvoiceState::Open,
+        };
+        let wallet = PanicFundWallet { dest: dest() };
+
+        let result = execute_submarine_swap(
+            Arc::new(ln),
+            Arc::new(chain),
+            Arc::new(wallet),
+            f,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await;
+
+        // `PanicFundWallet` panics if funding is attempted, so reaching here at all is the
+        // assertion; the error says so out loud.
+        assert!(
+            result.is_err(),
+            "a swap whose window has closed must be refused, not funded and refunded"
+        );
+    }
+
+    /// Our own refund spends the same outpoint the provider's claim would, and it sits in the
+    /// mempool for as long as it takes to confirm. Reading any spend as the provider's claim
+    /// returns `Claimed` for a swap nobody claimed, and stops driving the refund before it is
+    /// mined: the fee escalation that gets it in never starts, and the client's own coins are the
+    /// ones left in the HTLC.
+    ///
+    /// Only a spend revealing the preimage is the provider's claim.
+    #[tokio::test]
+    async fn our_own_unconfirmed_refund_is_not_mistaken_for_the_providers_claim() {
+        let secp = Secp256k1::new();
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, TIMEOUT);
+        let f = funding(refund_sk, script.clone(), ph);
+
+        // Past the timeout, funded, and already spent by a refund we broadcast: a refund witness
+        // carries no preimage, which is the whole distinction.
+        let our_refund = swap_common::onchain::build_refund_tx(
+            outpoint(),
+            AMOUNT,
+            &script,
+            dest(),
+            500,
+            TIMEOUT,
+            &refund_sk,
+        )
+        .unwrap();
+        assert!(
+            swap_common::onchain::extract_preimage(&our_refund, &outpoint(), &ph).is_none(),
+            "a refund reveals no preimage; that is what this test rests on"
+        );
+
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(TIMEOUT + 1)
+            .with_funding(swap_common::chain::FundingUtxo {
+                outpoint: outpoint(),
+                value_sat: AMOUNT,
+                confirmations: 3,
+            })
+            .with_spend(our_refund);
+        let ln = MockLn {
+            state: InvoiceState::Open,
+        };
+        let wallet = PanicFundWallet { dest: dest() };
+
+        let state = execute_submarine_swap(
+            Arc::new(ln),
+            Arc::new(chain),
+            Arc::new(wallet),
+            f,
+            Duration::from_millis(0),
+            &Resume {
+                funding: Some(outpoint()),
+                ..Default::default()
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(
+            state,
+            SwapState::Claimed,
+            "our own refund must not be read as the provider claiming; the swap refunded"
+        );
+    }
+
     /// The client's version of the double-funding hole, and the more expensive one: these are the
     /// client's own coins, and a second HTLC has no counterparty watching it at all, so it comes
     /// back only at the timeout and only if the refund key survives.
@@ -598,7 +761,14 @@ mod tests {
         let ln: Arc<dyn LightningBackend> = Arc::new(MockLn {
             state: InvoiceState::Open, // never settles
         });
-        let chain_mock = Arc::new(MockChain::new().with_tip(TIMEOUT).always_final());
+        // The tip advances while the swap runs: funding happens with the window open, and the
+        // timeout arrives afterwards. Starting at the timeout would mean funding into a window
+        // that had already closed, which is a thing the client now refuses to do.
+        let chain_mock = Arc::new(
+            MockChain::new()
+                .with_tips(vec![TIMEOUT - 100, TIMEOUT])
+                .always_final(),
+        );
         let chain: Arc<dyn ChainWatcher> = chain_mock.clone();
         let wallet: Arc<dyn OnchainWallet> = Arc::new(MockWallet {
             outpoint: outpoint(),
@@ -621,6 +791,75 @@ mod tests {
             chain_mock.broadcasts().len(),
             1,
             "a refund tx must be broadcast"
+        );
+    }
+
+    /// TEMPORARY probe: a resumed client whose OWN refund is the only spend of the HTLC.
+    #[tokio::test]
+    async fn probe_resumed_client_reads_its_own_refund() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::{Amount, Sequence, Transaction, TxIn, TxOut, Witness};
+        let secp = Secp256k1::new();
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let (_c_sk, claim_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, TIMEOUT);
+
+        // Our own refund: spends the HTLC outpoint, no preimage in the witness.
+        let our_refund = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::from_height(TIMEOUT).unwrap(),
+            input: vec![TxIn {
+                previous_output: outpoint(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(AMOUNT - 500),
+                script_pubkey: dest(),
+            }],
+        };
+        let our_txid = our_refund.compute_txid();
+
+        let chain = Arc::new(
+            MockChain::new()
+                .with_tip(TIMEOUT + 1)
+                .always_final()
+                .with_spend(our_refund),
+        );
+        let ln: Arc<dyn LightningBackend> = Arc::new(MockLn {
+            state: InvoiceState::Open, // the provider never paid
+        });
+        let wallet: Arc<dyn OnchainWallet> = Arc::new(MockWallet {
+            outpoint: outpoint(),
+            dest: dest(),
+        });
+
+        let state = execute_submarine_swap(
+            ln,
+            chain.clone(),
+            wallet,
+            funding(refund_sk, script, ph),
+            Duration::from_millis(0),
+            &Resume {
+                funding: Some(outpoint()),
+                funding_intent_at_height: None,
+                our_spends: vec![our_txid],
+                reorg_seen_at_height: None,
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+        println!(
+            "PROBE RESULT: {state:?}, broadcasts={}",
+            chain.broadcast_count()
+        );
+        assert_eq!(
+            state,
+            SwapState::Refunded,
+            "PROBE: our own refund was read as the provider's claim"
         );
     }
 }

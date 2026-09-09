@@ -1831,19 +1831,30 @@ fn react_to_reorg(chain: &dyn ChainWatcher, store: &dyn SwapStore, fork: u32) {
             return;
         }
     };
-    for mut rec in records {
+    for rec in records {
         let Ok(spk) = rec.htlc_spk() else { continue };
         let swap_id = rec.swap_id;
 
         // Write the fact down first. Everything below is a best effort against a chain that may
         // still be settling; the marker is what survives if this process does not.
-        rec.reorg_seen_at_height = Some(match rec.reorg_seen_at_height {
-            Some(seen) => seen.min(fork),
-            None => fork,
-        });
-        rec.updated_at_unix = now_unix();
-        if let Err(e) = store.put(&rec) {
-            error!("reorg at {fork}: could not mark swap {swap_id}: {e}");
+        //
+        // Through `mutate`, not `put`. `records` is a snapshot, and the swap's own driver is
+        // running against the same store: it writes a funding intent before it broadcasts and a
+        // payment intent before it pays, and those markers are the only thing stopping a resumed
+        // driver doing either a second time. Putting this stale copy back would erase whichever
+        // of them was written since the snapshot was taken, and this task runs on every reorg,
+        // which is exactly when a driver is busiest.
+        match store.mutate(swap_id, &mut |r: &mut SwapRecord| {
+            r.reorg_seen_at_height = Some(match r.reorg_seen_at_height {
+                Some(seen) => seen.min(fork),
+                None => fork,
+            });
+            r.updated_at_unix = now_unix();
+        }) {
+            Ok(true) => {}
+            // Terminal and pruned between the snapshot and now. Nothing to mark, nothing wrong.
+            Ok(false) => continue,
+            Err(e) => error!("reorg at {fork}: could not mark swap {swap_id}: {e}"),
         }
 
         let Some(op) = rec.funding_outpoint() else {

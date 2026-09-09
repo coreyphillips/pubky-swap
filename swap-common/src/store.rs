@@ -24,6 +24,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -407,11 +409,29 @@ pub trait SwapStore: Send + Sync {
     /// Delete terminal records older than `retain`, returning how many were removed. Called only
     /// by a background sweeper, never by a driver.
     fn prune_terminal(&self, retain: Duration) -> Result<usize>;
+
+    /// Read-modify-write one record, atomically with respect to other writers.
+    ///
+    /// `put` takes a whole record, which is correct for the driver that owns a swap and wrong for
+    /// anyone else: a caller that loaded a record, changed one field and put it back also writes
+    /// back every other field as it was when it loaded. The reorg monitor does exactly that, and
+    /// the fields it would revert are the funding-intent and payment-intent markers, whose only
+    /// job is to stop a resumed driver funding or paying a second time.
+    ///
+    /// Returns `Ok(false)` when the record is gone, which is not an error: a swap can reach a
+    /// terminal state and be pruned while a background task is deciding to touch it.
+    fn mutate(&self, swap_id: Uuid, f: &mut dyn FnMut(&mut SwapRecord)) -> Result<bool>;
 }
 
 /// A directory-of-JSON-files [`SwapStore`]: one `<dir>/<swap_id>.json` per swap.
 pub struct JsonFileSwapStore {
     dir: PathBuf,
+    /// Serializes read-modify-write against other writers in this process.
+    ///
+    /// It does not make the store safe against a second process, which nothing here needs: one
+    /// daemon owns its data directory. What it does is make [`SwapStore::mutate`] mean what it
+    /// says between the driver task and the background monitors that share this store.
+    write_lock: Mutex<()>,
 }
 
 impl JsonFileSwapStore {
@@ -427,18 +447,47 @@ impl JsonFileSwapStore {
                 tracing::warn!("could not restrict permissions on {dir:?}: {e}");
             }
         }
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            write_lock: Mutex::new(()),
+        })
     }
 
     fn path_for(&self, swap_id: Uuid) -> PathBuf {
         self.dir.join(format!("{swap_id}.json"))
     }
+
+    /// A temp path no other writer will pick.
+    ///
+    /// It used to be `<swap_id>.json.tmp`, which is per-swap and not per-write. Two tasks writing
+    /// the same swap at once both opened that path with `truncate`, wrote different byte counts
+    /// over each other, and renamed in turn; the shorter write leaves the tail of the longer one
+    /// behind, and the record no longer parses. `load_active` skips a record it cannot parse, so
+    /// the loss is silent, and what is lost is a swap that is in flight by definition.
+    fn tmp_path_for(&self, swap_id: Uuid) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        self.dir
+            .join(format!("{swap_id}.{}.{n}.tmp", std::process::id()))
+    }
 }
 
 impl SwapStore for JsonFileSwapStore {
+    fn mutate(&self, swap_id: Uuid, f: &mut dyn FnMut(&mut SwapRecord)) -> Result<bool> {
+        // Held across the read and the write, so a concurrent `mutate` cannot read the same
+        // record and write back over this one's change.
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut rec) = self.get(swap_id)? else {
+            return Ok(false);
+        };
+        f(&mut rec);
+        self.put(&rec)?;
+        Ok(true)
+    }
+
     fn put(&self, rec: &SwapRecord) -> Result<()> {
         let path = self.path_for(rec.swap_id);
-        let tmp = path.with_extension("json.tmp");
+        let tmp = self.tmp_path_for(rec.swap_id);
         let bytes = serde_json::to_vec_pretty(rec).context("serialize swap record")?;
 
         // Write to a temp file, fsync it, then rename. The rename is what makes the update
@@ -729,5 +778,127 @@ mod redaction_tests {
         // Everything useful for debugging is still there.
         assert!(printed.contains("swap_id"));
         assert!(printed.contains("state"));
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+
+    /// An isolated store under the system temp dir, removed when the test ends.
+    struct TempStore {
+        dir: PathBuf,
+        store: JsonFileSwapStore,
+    }
+    impl Drop for TempStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn store() -> TempStore {
+        let dir = std::env::temp_dir().join(format!("pubky-swap-concurrency-{}", Uuid::new_v4()));
+        let store = JsonFileSwapStore::new(&dir).unwrap();
+        TempStore { dir, store }
+    }
+
+    /// `put` writes a whole record, so a caller that loaded one, changed a field and put it back
+    /// also writes back every other field as it was when it loaded.
+    ///
+    /// The reorg monitor does exactly that, on a snapshot, while the swap's own driver is writing
+    /// to the same store. The fields it reverts are the funding-intent and payment-intent
+    /// markers, whose only job is to stop a resumed driver funding or paying a second time. This
+    /// is the read-modify-write that keeps a background writer from undoing them.
+    #[test]
+    fn mutate_does_not_revert_a_concurrent_writers_markers() {
+        let t = store();
+        let store = &t.store;
+        let mut rec = SwapRecord::new_progress();
+        rec.peer = "peer".into();
+        store.put(&rec).unwrap();
+
+        // The background task's snapshot, taken before the driver wrote anything.
+        let stale = store.get(rec.swap_id).unwrap().unwrap();
+        assert_eq!(stale.funding_intent_at_height, None);
+
+        // The driver records that it is about to fund, and then that it did.
+        let mut live = store.get(rec.swap_id).unwrap().unwrap();
+        live.funding_intent_at_height = Some(800_000);
+        live.funding_txid_hex = Some("aa".repeat(32));
+        live.funding_vout = Some(0);
+        store.put(&live).unwrap();
+
+        // The background task marks its own field, the way the reorg monitor does.
+        let marked = store
+            .mutate(rec.swap_id, &mut |r| r.reorg_seen_at_height = Some(799_999))
+            .unwrap();
+        assert!(marked);
+
+        let after = store.get(rec.swap_id).unwrap().unwrap();
+        assert_eq!(after.reorg_seen_at_height, Some(799_999), "its own field");
+        assert_eq!(
+            after.funding_intent_at_height,
+            Some(800_000),
+            "the funding intent survived; putting the stale copy back would have erased it"
+        );
+        assert_eq!(after.funding_vout, Some(0));
+
+        // Which is what a `put` of the snapshot would have done.
+        store.put(&stale).unwrap();
+        let clobbered = store.get(rec.swap_id).unwrap().unwrap();
+        assert_eq!(
+            clobbered.funding_intent_at_height, None,
+            "this is the behaviour `mutate` exists to avoid"
+        );
+    }
+
+    /// A record that reached a terminal state and was pruned is not an error to mutate: a
+    /// background task can decide to touch a swap that finishes while it is deciding.
+    #[test]
+    fn mutating_a_missing_record_is_not_an_error() {
+        let t = store();
+        assert!(!t.store.mutate(Uuid::new_v4(), &mut |_| {}).unwrap());
+    }
+
+    /// Concurrent writers used to share one temp path per swap, so two writes of the same record
+    /// opened the same file with `truncate`, wrote over each other and renamed in turn. The
+    /// shorter write leaves the tail of the longer behind and the record no longer parses;
+    /// `load_active` drops what it cannot parse, silently, and what it drops is by definition a
+    /// swap in flight.
+    #[test]
+    fn concurrent_writes_of_one_record_always_leave_it_parsable() {
+        let t = store();
+        let store = &t.store;
+        let mut rec = SwapRecord::new_progress();
+        rec.peer = "peer".into();
+        store.put(&rec).unwrap();
+        let id = rec.swap_id;
+        let store = std::sync::Arc::new(JsonFileSwapStore::new(&t.dir).unwrap());
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for n in 0..40 {
+                    let mut r = SwapRecord::new_progress();
+                    r.swap_id = id;
+                    // Wildly different lengths, so an interleaved write leaves a tail.
+                    r.last_error = Some("x".repeat(1 + (i * 40 + n) * 7));
+                    store.put(&r).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        store
+            .get(id)
+            .expect("the record must still parse")
+            .expect("and still exist");
+        // And no temp files were left behind for `load_all` to trip over.
+        assert!(
+            store.load_all().unwrap().len() == 1,
+            "exactly one record, and nothing that looks like one"
+        );
     }
 }
