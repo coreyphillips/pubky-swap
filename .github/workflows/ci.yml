@@ -36,6 +36,7 @@ jobs:
           cargo clippy -p swap-client --features full --all-targets -- -D warnings
           # beignet needs no protoc, so it also builds in the default job.
           cargo clippy -p beignet-backend --all-targets -- -D warnings
+          cargo clippy -p swap-config --all-targets -- -D warnings
           cargo clippy -p swap-provider --features full,beignet --all-targets -- -D warnings
           cargo clippy -p swap-client --features full,beignet --all-targets -- -D warnings
 

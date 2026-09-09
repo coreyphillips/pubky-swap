@@ -281,6 +281,10 @@ impl LightningBackend for StubBackend {
     }
 }
 
+/// Finding an existing node's credentials on disk. Needs no `lnd` feature: it only looks at
+/// the filesystem, so `doctor` can report on it in any build.
+pub mod discover;
+
 #[cfg(feature = "lnd")]
 mod lnd;
 #[cfg(feature = "lnd")]

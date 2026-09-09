@@ -8,6 +8,7 @@
 //! sending the client a final `SwapStatusUpdate`. Without those pieces it stays
 //! negotiation-only and rejects `SwapRequest`s.
 
+pub mod preflight;
 pub mod pricing;
 pub mod reverse;
 pub mod risk;
