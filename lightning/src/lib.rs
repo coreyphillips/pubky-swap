@@ -253,27 +253,54 @@ pub struct LndConfig {
     pub macaroon_path: String,
 }
 
-/// A backend that implements no operations — used when no Lightning node is configured, or
-/// when the `lnd` feature is disabled. Every call returns [`LightningError::NotImplemented`].
-#[derive(Default)]
-pub struct StubBackend;
+/// A backend that implements no operations, used when no Lightning node is configured, when the
+/// `lnd` feature is disabled, or when connecting to the configured one failed. Every call returns
+/// [`LightningError::NotImplemented`].
+///
+/// It carries a reason, because it is what the operator ends up reading. A daemon that cannot
+/// reach its node falls back to this, and every later call reports the stub's message rather than
+/// the connect error, which was logged once at startup and then lost. Told "no Lightning backend
+/// configured (build with --features lnd)" when the real problem is a macaroon at the wrong path,
+/// an operator goes and rebuilds.
+pub struct StubBackend {
+    reason: String,
+}
 
-impl StubBackend {
-    pub fn new() -> Self {
-        Self
+impl Default for StubBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-const STUB: &str =
+impl StubBackend {
+    pub fn new() -> Self {
+        Self {
+            reason: DEFAULT_STUB.into(),
+        }
+    }
+
+    /// A stub that says what actually failed.
+    pub fn with_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+
+    fn err<T>(&self) -> Result<T> {
+        Err(LightningError::NotImplemented(self.reason.clone()))
+    }
+}
+
+const DEFAULT_STUB: &str =
     "no Lightning backend configured (build with --features lnd and provide LND credentials)";
 
 #[async_trait]
 impl LightningBackend for StubBackend {
     async fn node_info(&self) -> Result<NodeInfo> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn create_hold_invoice(&self, _req: HoldInvoiceRequest) -> Result<HoldInvoice> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn create_invoice(
         &self,
@@ -281,16 +308,16 @@ impl LightningBackend for StubBackend {
         _expiry_secs: u64,
         _memo: &str,
     ) -> Result<HoldInvoice> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn invoice_status(&self, _payment_hash: [u8; 32]) -> Result<InvoiceStatus> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn settle_hold_invoice(&self, _preimage: [u8; 32]) -> Result<()> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn cancel_hold_invoice(&self, _payment_hash: [u8; 32]) -> Result<()> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn pay_invoice(
         &self,
@@ -298,13 +325,13 @@ impl LightningBackend for StubBackend {
         _max_fee_msat: u64,
         _cltv_limit: Option<u32>,
     ) -> Result<PaymentResult> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn payment_status(&self, _payment_hash: [u8; 32]) -> Result<PaymentStatus> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
     async fn decode_invoice(&self, _bolt11: &str) -> Result<DecodedInvoice> {
-        Err(LightningError::NotImplemented(STUB.into()))
+        self.err()
     }
 }
 
@@ -341,5 +368,54 @@ mod redaction_tests {
         assert!(printed.contains("<redacted>"));
         // The useful part survives.
         assert!(printed.contains("1234"));
+    }
+}
+
+#[cfg(test)]
+mod stub_tests {
+    use super::*;
+
+    /// The stub is what an operator with a broken setup actually reads.
+    ///
+    /// A daemon that cannot reach its node falls back to the stub, and every later call reports
+    /// the stub's message rather than the connect error, which was logged once at startup and
+    /// then lost. The generic message named the wrong fix: it told an operator whose macaroon was
+    /// at the wrong path to rebuild the binary. Whatever went wrong has to survive the fallback.
+    #[tokio::test]
+    async fn a_stub_reports_the_reason_it_was_created_with() {
+        let stub = StubBackend::with_reason(
+            "could not connect to LND at https://x:10009: no such file tls.cert",
+        );
+        let printed = stub.node_info().await.unwrap_err().to_string();
+        assert!(
+            printed.contains("tls.cert"),
+            "the real cause was dropped: {printed}"
+        );
+        assert!(
+            !printed.contains("--features lnd"),
+            "and it must not send the operator off to rebuild instead: {printed}"
+        );
+
+        // Every other call has to say the same thing: which one an operator hits first depends on
+        // where in a swap the daemon was.
+        let printed = stub.decode_invoice("lnbc1").await.unwrap_err().to_string();
+        assert!(printed.contains("tls.cert"), "{printed}");
+        let printed = stub.invoice_status([0; 32]).await.unwrap_err().to_string();
+        assert!(printed.contains("tls.cert"), "{printed}");
+    }
+
+    /// The old message is still right when nothing was configured at all, which is the case it
+    /// was written for.
+    #[tokio::test]
+    async fn an_unconfigured_stub_still_says_so() {
+        let printed = StubBackend::new()
+            .node_info()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            printed.contains("no Lightning backend configured"),
+            "{printed}"
+        );
     }
 }
