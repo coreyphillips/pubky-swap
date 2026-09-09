@@ -161,7 +161,7 @@ fn funding_outpoint(tx: &Transaction, spk: &ScriptBuf) -> Option<OutPoint> {
         .iter()
         .position(|o| &o.script_pubkey == spk)
         .map(|vout| OutPoint {
-            txid: tx.txid(),
+            txid: tx.compute_txid(),
             vout: vout as u32,
         })
 }
@@ -238,23 +238,23 @@ mod tests {
         .unwrap();
         let other = ScriptBuf::from_hex("0014cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd").unwrap();
         let tx = Transaction {
-            version: 2,
+            version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![],
             output: vec![
                 TxOut {
-                    value: 1000,
+                    value: bitcoin::Amount::from_sat(1000),
                     script_pubkey: other,
                 },
                 TxOut {
-                    value: 50_000,
+                    value: bitcoin::Amount::from_sat(50_000),
                     script_pubkey: spk.clone(),
                 },
             ],
         };
         let op = funding_outpoint(&tx, &spk).expect("must find the output");
         assert_eq!(op.vout, 1);
-        assert_eq!(op.txid, tx.txid());
+        assert_eq!(op.txid, tx.compute_txid());
         let missing = ScriptBuf::from_hex("0014ffffffffffffffffffffffffffffffffffffffff").unwrap();
         assert!(funding_outpoint(&tx, &missing).is_none());
     }

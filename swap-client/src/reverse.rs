@@ -238,7 +238,7 @@ pub async fn execute_reverse_swap(
             return Err(anyhow!(
                 "the provider refunded the HTLC ({}) before our claim confirmed; the hold \
                  invoice will be cancelled and the payment returned",
-                tx.txid()
+                tx.compute_txid()
             ));
         }
         SpendOutcome::DeadlineExceeded { last_txid, tip } => {

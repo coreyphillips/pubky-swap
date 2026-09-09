@@ -236,14 +236,14 @@ impl ChainWatcher for MockChain {
     }
 }
 
-/// Bridges the `txid()` / `compute_txid()` rename across `bitcoin` versions, so the mock does not
-/// need touching when the dependency moves.
+/// Bridged the `txid()` / `compute_txid()` rename across `bitcoin` versions. The rename has since
+/// happened, and the shim did its job: this is the one place the mock needed touching.
 trait TxidCompat {
     fn compute_txid_compat(&self) -> Txid;
 }
 
 impl TxidCompat for Transaction {
     fn compute_txid_compat(&self) -> Txid {
-        self.txid()
+        self.compute_txid()
     }
 }

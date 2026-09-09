@@ -372,7 +372,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
             swap_id: client_swap_id,
             direction: SwapDirection::Reverse,
             peer: config.provider_pkarr.clone(),
-            network: swap_common::NetworkSpec::from_bitcoin_network(network),
+            network: swap_common::NetworkSpec::from_bitcoin_network(network)?,
             payment_hash: ph,
             branch_key: claim_sk.secret_bytes(),
             preimage: Some(preimage),
@@ -598,7 +598,7 @@ async fn run_submarine(
             swap_id: client_swap_id,
             direction: SwapDirection::Submarine,
             peer: config.provider_pkarr.clone(),
-            network: swap_common::NetworkSpec::from_bitcoin_network(network),
+            network: swap_common::NetworkSpec::from_bitcoin_network(network)?,
             payment_hash: ph,
             branch_key: refund_sk.secret_bytes(),
             preimage: None,
@@ -795,7 +795,7 @@ async fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn
             &config.wallet_mnemonic,
             network,
             &config.electrum_url,
-            config.onchain_fee_rate_sat_vb as f32,
+            config.onchain_fee_rate_sat_vb,
             &std::path::Path::new(&config.data_dir).join("wallet"),
         )
         .map_err(|e| anyhow!("funding wallet: {e}"))?;

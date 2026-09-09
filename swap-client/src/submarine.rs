@@ -302,7 +302,7 @@ pub async fn execute_submarine_swap(
                     info!(
                         "Submarine client: the provider claimed the HTLC ({}) as we refunded; \
                          awaiting Lightning settlement",
-                        tx.txid()
+                        tx.compute_txid()
                     );
                     return Ok(SwapState::Claimed);
                 }

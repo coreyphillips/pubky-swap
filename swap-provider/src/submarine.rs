@@ -472,7 +472,7 @@ pub async fn drive_submarine_swap(
             error!(
                 "Submarine swap: LOSS. The invoice was paid but the client's refund {} confirmed \
                  before our claim. Check --min-claim-window-blocks and --timeout-blocks.",
-                tx.txid()
+                tx.compute_txid()
             );
             Ok(SwapState::Failed(
                 "the client's refund won the claim race after the invoice was paid".into(),

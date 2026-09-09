@@ -505,7 +505,7 @@ pub async fn drive_reverse_swap(
     loop {
         // Any spend of the HTLC, ours or theirs.
         if let Some(spend) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))? {
-            let spend_txid = spend.txid();
+            let spend_txid = spend.compute_txid();
             if let Some(preimage) = extract_preimage(&spend, &funding_outpoint, &swap.payment_hash)
             {
                 if !settled {
@@ -582,7 +582,7 @@ pub async fn drive_reverse_swap(
                     info!(
                         "Reverse swap: the client's claim {} beat our refund; recovering the \
                          preimage from it",
-                        tx.txid()
+                        tx.compute_txid()
                     );
                     sleep(poll).await;
                     continue;
@@ -1209,7 +1209,7 @@ mod tests {
         let chain = MockChain::new()
             .always_final()
             .with_tip(MOCK_TIP)
-            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.compute_txid())
             .with_spend(claim_tx);
         let wallet = PanicFundWallet { refund_spk: dest() };
 
@@ -1261,8 +1261,8 @@ mod tests {
         let chain = MockChain::new()
             .always_final()
             .with_tip(MOCK_TIP)
-            .with_spent_output(other, AMOUNT, claim_tx.txid())
-            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spent_output(other, AMOUNT, claim_tx.compute_txid())
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.compute_txid())
             .with_spend(claim_tx);
         let history = chain.find_historical_outputs(&swap.htlc_spk).unwrap();
         assert_eq!(history.len(), 2);
@@ -1301,7 +1301,7 @@ mod tests {
         let chain = MockChain::new()
             .always_final()
             .with_tip(MOCK_TIP)
-            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.compute_txid())
             .with_spend(claim_tx);
         let wallet = PanicFundWallet { refund_spk: dest() };
 
@@ -1525,7 +1525,7 @@ mod tests {
         let chain = MockChain::new()
             .always_final()
             .with_tip(MOCK_TIP)
-            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.compute_txid())
             .with_spend(claim_tx);
         let wallet = LosesTheResponseWallet {
             refund_spk: dest(),

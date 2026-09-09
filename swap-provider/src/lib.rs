@@ -605,13 +605,17 @@ fn spawn_offer_refresher(
         loop {
             sleep(period).await;
             let rate = offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb);
-            let fresh = build_offer(
+            // A network this build cannot name is a startup failure, not something to keep
+            // repricing against; `run` has already refused to start in that case.
+            let Ok(fresh) = build_offer(
                 &config,
                 &provider_pkarr,
                 network,
                 lightning_node_id.clone(),
                 rate,
-            );
+            ) else {
+                continue;
+            };
             let changed = {
                 let current = offer.read().await;
                 current.onchain_fee_sat != fresh.onchain_fee_sat
@@ -799,7 +803,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         network,
         lightning_node_id.clone(),
         offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb),
-    )));
+    )?));
     {
         let o = offer.read().await;
         info!(
@@ -1047,7 +1051,7 @@ fn build_bdk_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
         &config.wallet_mnemonic,
         network,
         &config.electrum_url,
-        config.onchain_fee_rate_sat_vb as f32,
+        config.onchain_fee_rate_sat_vb,
         &std::path::Path::new(&config.data_dir).join("wallet"),
     ) {
         Ok(w) => Some(Arc::new(w)),
@@ -1083,7 +1087,7 @@ fn build_offer(
     network: Network,
     lightning_node_id: Option<String>,
     fee_rate_sat_vb: u64,
-) -> SwapOffer {
+) -> Result<SwapOffer> {
     // Price the on-chain component from the direction that costs the most, so a single advertised
     // figure covers whichever direction a client picks.
     let script = pricing::representative_htlc_script();
@@ -1095,10 +1099,10 @@ fn build_offer(
         .max()
         .unwrap_or(0);
 
-    SwapOffer {
+    Ok(SwapOffer {
         offer_id: Uuid::new_v4(),
         provider_pkarr: provider_pkarr.to_string(),
-        network: NetworkSpec::from_bitcoin_network(network),
+        network: NetworkSpec::from_bitcoin_network(network)?,
         directions: config.directions.clone(),
         min_amount_sat: config.min_amount_sat,
         max_amount_sat: config.max_amount_sat,
@@ -1114,7 +1118,7 @@ fn build_offer(
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
         features: Vec::new(),
-    }
+    })
 }
 
 async fn handle_message(
@@ -1336,7 +1340,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         swap_id,
         direction: SwapDirection::Reverse,
         peer: sender.to_string(),
-        network: NetworkSpec::from_bitcoin_network(ctx.network),
+        network: NetworkSpec::from_bitcoin_network(ctx.network)?,
         payment_hash_hex: hex::encode(swap.payment_hash),
         onchain_amount_sat: swap.onchain_amount_sat,
         fee_rate_sat_vb: swap.fee_rate_sat_vb,
@@ -1517,7 +1521,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         swap_id,
         direction: SwapDirection::Submarine,
         peer: sender.to_string(),
-        network: NetworkSpec::from_bitcoin_network(ctx.network),
+        network: NetworkSpec::from_bitcoin_network(ctx.network)?,
         payment_hash_hex: hex::encode(swap.payment_hash),
         onchain_amount_sat: swap.onchain_amount_sat,
         fee_rate_sat_vb: swap.fee_rate_sat_vb,

@@ -31,17 +31,17 @@ fn htlc_spk() -> ScriptBuf {
 /// first, so a test proves the vout is found rather than assumed.
 fn funding_tx(amount: u64) -> Transaction {
     Transaction {
-        version: 2,
+        version: bitcoin::transaction::Version::TWO,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![],
         output: vec![
             TxOut {
-                value: 5_000,
+                value: bitcoin::Amount::from_sat(5_000),
                 script_pubkey: ScriptBuf::from_hex("0014cccccccccccccccccccccccccccccccccccccccc")
                     .unwrap(),
             },
             TxOut {
-                value: amount,
+                value: bitcoin::Amount::from_sat(amount),
                 script_pubkey: htlc_spk(),
             },
         ],
@@ -70,7 +70,7 @@ async fn funding_finds_the_right_output_in_the_returned_transaction() {
     let server = MockServer::start().await;
     mount_address(&server).await;
     let tx = funding_tx(100_000);
-    let txid = tx.txid();
+    let txid = tx.compute_txid();
     Mock::given(method("POST"))
         .and(path("/send"))
         .and(body_partial_json(serde_json::json!({
@@ -104,7 +104,7 @@ async fn funding_rejects_a_transaction_whose_value_is_wrong() {
     Mock::given(method("POST"))
         .and(path("/send"))
         .respond_with(ok(serde_json::json!({
-            "txid": tx.txid().to_string(),
+            "txid": tx.compute_txid().to_string(),
             "hex": hex::encode(bitcoin::consensus::serialize(&tx)),
         })))
         .mount(&server)

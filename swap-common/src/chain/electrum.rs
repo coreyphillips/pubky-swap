@@ -60,7 +60,7 @@ impl ElectrumConfig {
 
     fn build_client(&self) -> Result<Client> {
         let mut builder = ConfigBuilder::new()
-            .timeout(Some(self.timeout_secs))
+            .timeout(Some(Duration::from_secs(u64::from(self.timeout_secs))))
             .retry(self.client_retries)
             .validate_domain(self.validate_domain);
         if let Some(proxy) = &self.socks5 {
@@ -247,7 +247,7 @@ impl ChainWatcher for ElectrumWatcher {
 
         let mut outputs = Vec::new();
         for (tx, height) in &txs {
-            let txid = tx.txid();
+            let txid = tx.compute_txid();
             for (vout, out) in tx.output.iter().enumerate() {
                 if out.script_pubkey.as_script() != spk {
                     continue;
@@ -257,7 +257,7 @@ impl ChainWatcher for ElectrumWatcher {
                         txid,
                         vout: vout as u32,
                     },
-                    value_sat: out.value,
+                    value_sat: out.value.to_sat(),
                     confirmations: self.confirmations_from_height(*height, tip),
                     spent_by: None,
                 });
@@ -270,7 +270,7 @@ impl ChainWatcher for ElectrumWatcher {
                     .iter_mut()
                     .find(|o| o.outpoint == input.previous_output)
                 {
-                    o.spent_by = Some(tx.txid());
+                    o.spent_by = Some(tx.compute_txid());
                 }
             }
         }
@@ -317,7 +317,13 @@ impl ChainWatcher for ElectrumWatcher {
     fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
         // Electrum's `blockchain.estimatefee` returns BTC/kB (and `-1` when it has no estimate,
         // e.g. on regtest). Convert to sat/vB, yielding `None` for the unavailable sentinel.
-        let btc_per_kvb = self.call("estimatefee", |c| c.estimate_fee(target_blocks as usize))?;
+        // `None` leaves the estimation mode to the server, which is what this asked for before
+        // the parameter existed. `Conservative` is available and is arguably the right choice for
+        // a spend that loses an output if it is underpriced, but it needs protocol v1.6 and this
+        // is a dependency upgrade, not the place to change what a provider pays.
+        let btc_per_kvb = self.call("estimatefee", |c| {
+            c.estimate_fee(target_blocks as usize, None)
+        })?;
         Ok(crate::onchain::btc_per_kvb_to_sat_per_vb(btc_per_kvb))
     }
 
