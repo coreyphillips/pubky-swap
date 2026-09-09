@@ -324,7 +324,15 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     let store = store::open(&config.data_dir)?;
     // Before anything new: a swap left in flight has money in it, and starting a second one while
     // the first is unattended is how a client ends up with two.
-    resume_unfinished_swaps(&store, &config, network).await;
+    //
+    // Not in `--quote-only`. A quote moves nothing, signs nothing and starts no swap, so there is
+    // nothing for an unfinished one to collide with, and the next real run resumes it anyway.
+    // Resuming here made asking a provider for a price cost however long the open swap took to
+    // drive, which can be hours if it is waiting on confirmations, and a caller that bounded the
+    // quote on a timeout would kill the resume partway through.
+    if !config.quote_only {
+        resume_unfinished_swaps(&store, &config, network).await;
+    }
     if config.resume_only {
         info!("--resume-only: not starting a new swap");
         return Ok(());
@@ -387,15 +395,29 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // A receiving a quote confirms the peer is a live provider that serves this direction. In
     // quote-only mode, print a machine-readable line and stop (no funds move).
     if config.quote_only {
+        // `direction` is spelled the way the CLI, the config file and the wire spell it, rather
+        // than with `{:?}`: `Reverse` was the only capitalised spelling in the whole system, and
+        // every reader had to know to case-fold it.
+        //
+        // The fee split, the rate it was priced at and the expiry are all already in the `Quote`;
+        // they were simply never printed, so anything reading this line had to present an
+        // undifferentiated fee and could not tell the caller when the price stops being valid.
         println!(
-            "QUOTE provider={} direction={:?} amount_sat={} fee_sat={} total_sat={} timeout_blocks={} confirmations={}",
+            "QUOTE provider={} direction={} amount_sat={} fee_sat={} service_fee_sat={} \
+             onchain_fee_sat={} fee_rate_sat_vb={} total_sat={} timeout_blocks={} \
+             confirmations={} valid_until_unix={} quote_id={}",
             config.provider_pkarr,
-            config.direction,
+            config.direction.as_str(),
             quote.amount_sat,
             quote.fee_sat,
+            quote.service_fee_sat,
+            quote.onchain_fee_sat,
+            quote.fee_rate_sat_vb,
             quote.total_sat,
             quote.htlc_timeout_blocks,
-            required_confirmations
+            required_confirmations,
+            quote.valid_until_unix,
+            quote.quote_id
         );
         return Ok(());
     }
