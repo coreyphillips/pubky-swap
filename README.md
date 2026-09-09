@@ -11,10 +11,12 @@ Swaps are made atomic by a single 32-byte preimage whose SHA256 is the shared Li
 hash — the on-chain HTLC can only be claimed by revealing the preimage that settles the Lightning
 leg, and vice-versa.
 
-> ⚠️ **Regtest only — do not use with real funds.** The swap engine (HTLC scripting, timelocks,
-> claim/refund, hold invoices, chain watching, crash-resume) is implemented and tested on regtest,
-> but mainnet hardening is incomplete (RBF/CPFP fee-bumping and reorg handling are still on the
-> roadmap). Atomic-swap bugs lose money. See [`ROADMAP.md`](ROADMAP.md).
+> ⚠️ **Not audited. Do not risk what you cannot lose.** The swap engine (HTLC scripting,
+> timelocks, claim/refund, hold invoices, chain watching, crash-resume, RBF/CPFP fee-bumping and
+> reorg handling) is implemented and tested end-to-end on regtest against real LND, and every
+> fund-touching path has a regression test that fails without its fix. What is missing before
+> mainnet is signet soak testing and a third-party security review. Atomic-swap bugs lose money.
+> See [`ROADMAP.md`](ROADMAP.md).
 
 ## Swap types
 
@@ -216,10 +218,18 @@ with no field for a branch key or a preimage, and there is a test asserting that
 
 ## Running against your own node
 
-To point a provider/client at your own LND (with a generic walkthrough and a step-by-step
-**Umbrel** setup — where to find the cert/macaroon, the Electrs app, and the TLS gotcha), see
-[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md). ⚠️ It's not yet safe for mainnet funds — prefer a
-regtest/signet/testnet node until the [`ROADMAP.md`](ROADMAP.md) mainnet items and an audit land.
+To point a provider/client at your own LND or [beignet](https://github.com/coreyphillips/beignet)
+daemon (with a generic walkthrough and a step-by-step **Umbrel** setup covering where to find the
+cert/macaroon, the Electrs app, and the TLS gotcha), see
+[`docs/SELF_HOSTING.md`](docs/SELF_HOSTING.md).
+
+On **umbrelOS** there is a one-click app instead: add
+`https://github.com/coreyphillips/pubky-swap-umbrel` as a community app store and install
+**Pubky Swap**. It runs the provider against your Umbrel's own LND and Electrs, and gives it a
+web panel for the identity, the rates and the limits.
+
+⚠️ Not audited. Prefer a regtest/signet/testnet node, or amounts you can afford to lose,
+until the [`ROADMAP.md`](ROADMAP.md) mainnet items land.
 
 ## Integration tests (regtest)
 

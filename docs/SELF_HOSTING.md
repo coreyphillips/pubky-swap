@@ -3,12 +3,12 @@
 This guide shows how to point a pubky-swap **provider** (and **client**) at your own Lightning node
 — including a walkthrough for an **Umbrel** LND node.
 
-> ⚠️ **Status: not yet safe for mainnet funds.** The swap engine is implemented and tested (incl.
-> end-to-end on regtest against real LND), but mainnet hardening isn't finished and the code has not
-> had a third-party security audit — see [`ROADMAP.md`](../ROADMAP.md). **Use a regtest, signet, or
-> testnet node**, or a node you're willing to lose funds on. On `--network bitcoin` the provider
-> refuses obviously-unsafe parameters unless you pass `--allow-unsafe`; that flag does **not** make
-> it audited.
+> ⚠️ **Status: not audited.** The swap engine is implemented and tested end-to-end on regtest
+> against real LND, and every fund-touching path has a regression test that fails without its fix.
+> What is missing is signet soak testing and a third-party security review; see
+> [`ROADMAP.md`](../ROADMAP.md). Prefer a regtest, signet or testnet node, or amounts you can
+> afford to lose. On `--network bitcoin` the provider refuses obviously-unsafe parameters unless
+> you pass `--allow-unsafe`; that flag does **not** make it audited.
 
 ## What a provider needs
 
@@ -16,17 +16,60 @@ A fully-functional (swap-executing) provider needs three things, all configurabl
 
 | Capability | Flag(s) | Notes |
 |---|---|---|
-| **Lightning node** (LND, gRPC) | `--lnd-address` `--lnd-cert` `--lnd-macaroon` | A macaroon with **invoice + router** permissions (the `admin.macaroon` works). |
+| **Lightning node** | `--lightning lnd` with `--lnd-address` `--lnd-cert` `--lnd-macaroon`, or `--lightning beignet` with `--beignet-url` | For LND, a macaroon with **invoice + router** permissions (the `admin.macaroon` works). |
 | **Chain access** (Electrum/electrs) | `--electrum-url` | e.g. `tcp://host:50001` (mainnet/electrs) or `ssl://host:50002`. |
-| **Funding wallet** (on-chain) | `--wallet lnd` *(or a configured mnemonic)* | `--wallet lnd` funds reverse-swap HTLCs from **LND's own on-chain balance** (no extra seed, and recommended). Or use a separate BIP84 wallet with `--wallet bdk` and `PUBKY_SWAP_WALLET_MNEMONIC__FILE`. |
+| **Funding wallet** (on-chain) | `--wallet lnd`, `--wallet beignet`, or `--wallet bdk` | `--wallet lnd` funds reverse-swap HTLCs from **LND's own on-chain balance** (no extra seed, and recommended). `--wallet beignet` does the same from a beignet daemon's wallet. `--wallet bdk` is a separate BIP84 wallet from `PUBKY_SWAP_WALLET_MNEMONIC__FILE`. |
 
-Build with the `full` feature (needs [`protoc`](https://grpc.io/docs/protoc-installation/)):
+Build with the `full` feature (needs [`protoc`](https://grpc.io/docs/protoc-installation/), for
+LND's protobufs), adding `beignet` if you want that backend too:
 
 ```bash
-cargo build -p swap-provider --features full
+cargo build -p swap-provider --features full           # LND
+cargo build -p swap-provider --features full,beignet   # LND and beignet
 ```
 
-Without all three, the provider runs **negotiation-only** and rejects swap requests.
+The `beignet` feature needs no `protoc`. If you only want beignet, `--features chain,bdk-wallet,status,beignet`
+builds without the LND toolchain entirely.
+
+Without all three capabilities, the provider runs **negotiation-only** and rejects swap requests.
+`--doctor` tells you which one is missing.
+
+### Using beignet instead of LND
+
+[beignet](https://github.com/coreyphillips/beignet) is a single daemon that is both a Lightning
+node and an on-chain wallet, which makes it the shorter setup: one URL and one token instead of
+an address plus two credential files, and one wallet to fund instead of two.
+
+| Flag | Meaning |
+|---|---|
+| `--lightning beignet` | Use a beignet daemon for the Lightning leg. |
+| `--wallet beignet` | Fund on-chain HTLCs from the same daemon's wallet. |
+| `--beignet-url` | Base URL, e.g. `http://127.0.0.1:8080`. |
+| `--beignet-tls-cert` | PEM root certificate, if the daemon was started with `--tls-cert`. |
+| `--beignet-api-prefix` | API prefix, e.g. `/v1`, if the daemon is behind one. |
+
+The API token is a secret, so it has no flag: `PUBKY_SWAP_BEIGNET_TOKEN__FILE=<path>`, or
+`PUBKY_SWAP_BEIGNET_TOKEN__VALUE` to pass it inline. (`__` separates nesting, which is why the
+suffix is there: every secret is a `{ value, file }` pair.)
+
+```bash
+umask 077 && echo "<token>" > ~/.pubky-swap/beignet.token
+
+PUBKY_SWAP_RECOVERY_PHRASE__FILE=~/.pubky-swap/recovery.phrase \
+PUBKY_SWAP_BEIGNET_TOKEN__FILE=~/.pubky-swap/beignet.token \
+  swap-provider --network bitcoin \
+    --lightning beignet --wallet beignet \
+    --beignet-url http://127.0.0.1:8080 \
+    --electrum-url tcp://127.0.0.1:50001
+```
+
+**A version check, not a leap of faith.** The provider asks the daemon what it can do before
+advertising anything, and drops a direction it cannot serve safely rather than discovering it
+mid-swap. A reverse swap needs a hold invoice whose final CLTV outlives the on-chain refund, and
+a submarine swap needs a bound on the outgoing payment's total CLTV; a daemon that cannot set
+either has the matching direction removed from the offer, with a log line saying so. **beignet
+0.15.1 or later** supports both. The chain a beignet reports is checked against `--network` at
+startup too, and a disagreement aborts.
 
 ## Secrets, and where they go
 
@@ -147,6 +190,13 @@ hostname/IP that is already in the cert.
 
 ## Umbrel walkthrough (provider)
 
+> **There is a one-click app.** In umbrelOS, open the App Store, choose **Community App Stores**
+> from the menu, add `https://github.com/coreyphillips/pubky-swap-umbrel`, and install **Pubky
+> Swap**. It runs the provider on the Umbrel itself against its own LND and Electrs, with a web
+> panel for the identity, the rates and the limits, and it handles every credential path below
+> for you. The rest of this section is for running the provider on another machine, or for
+> wanting the CLI.
+
 Umbrel runs LND; an **Electrs** app provides chain access. The provider runs on any machine that can
 reach your Umbrel over the LAN (or on the Umbrel host itself).
 
@@ -189,9 +239,12 @@ cargo run -p swap-provider --features full -- \
 ```
 
 Notes:
-- The funding mnemonic is an **on-chain wallet separate from LND** that funds reverse-swap
-  HTLCs. Fund it with the amount you're willing to route through swaps. (It is *not* your LND
-  on-chain wallet.)
+- The command above uses the default `--wallet lnd`, so reverse-swap HTLCs are funded from your
+  LND's own on-chain balance: no second seed to back up and nothing separate to fund. Use
+  `--wallet bdk` with `PUBKY_SWAP_WALLET_MNEMONIC__FILE` only if you want the swap float kept in
+  a wallet of its own, and fund that wallet with the amount you are willing to route.
+- Check it with `swap-provider --doctor` before leaving it running. On an Umbrel it will find
+  the credentials it can see on the machine and print the flags to use them.
 - On mainnet the provider enforces a minimum confirmation count and fee floor; raise
   `--confirmations` / `--onchain-fee-rate` as appropriate, or it will refuse to start.
 - **Strongly prefer testnet/signet first** (`--network testnet`, an Electrs on that network, and a
