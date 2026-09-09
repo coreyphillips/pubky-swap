@@ -11,12 +11,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Absolute, not relative. `cargo test -p <pkg>` runs the test binary with the *package*
+  # directory as its working directory, not the workspace root, so `./lnd-a-tls.cert` resolved to
+  # `swap-provider/lnd-a-tls.cert` and both two-node swap tests failed on a missing file. That is
+  # what this workflow has been failing on.
   LND_A_URL: https://127.0.0.1:10011
-  LND_A_CERT: ./lnd-a-tls.cert
-  LND_A_MAC: ./lnd-a-admin.macaroon
+  LND_A_CERT: ${{ github.workspace }}/lnd-a-tls.cert
+  LND_A_MAC: ${{ github.workspace }}/lnd-a-admin.macaroon
   LND_B_URL: https://127.0.0.1:10012
-  LND_B_CERT: ./lnd-b-tls.cert
-  LND_B_MAC: ./lnd-b-admin.macaroon
+  LND_B_CERT: ${{ github.workspace }}/lnd-b-tls.cert
+  LND_B_MAC: ${{ github.workspace }}/lnd-b-admin.macaroon
   REGTEST_ELECTRUM_URL: tcp://127.0.0.1:60001
 
 jobs:
@@ -40,10 +44,14 @@ jobs:
 
       - name: Export LND credentials
         run: |
-          docker cp lnd-a:/home/lnd/.lnd/tls.cert ./lnd-a-tls.cert
-          docker cp lnd-a:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-a-admin.macaroon
-          docker cp lnd-b:/home/lnd/.lnd/tls.cert ./lnd-b-tls.cert
-          docker cp lnd-b:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon ./lnd-b-admin.macaroon
+          set -euo pipefail
+          docker cp lnd-a:/home/lnd/.lnd/tls.cert "$LND_A_CERT"
+          docker cp lnd-a:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon "$LND_A_MAC"
+          docker cp lnd-b:/home/lnd/.lnd/tls.cert "$LND_B_CERT"
+          docker cp lnd-b:/home/lnd/.lnd/data/chain/bitcoin/regtest/admin.macaroon "$LND_B_MAC"
+          # The same variables the tests read, so a path that is wrong is wrong here too rather
+          # than eight minutes later in a test that has already brought a channel up.
+          ls -l "$LND_A_CERT" "$LND_A_MAC" "$LND_B_CERT" "$LND_B_MAC"
 
       - name: HTLC engine + Electrum watcher
         run: cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
