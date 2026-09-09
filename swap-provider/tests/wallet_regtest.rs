@@ -72,7 +72,7 @@ fn bdk_wallet_funds_htlc() {
         MNEMONIC,
         Network::Regtest,
         &electrum_url(),
-        5.0,
+        5,
         &temp_wallet_dir(),
     )
     .unwrap();

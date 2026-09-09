@@ -20,7 +20,10 @@ use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
-use bitcoin::{ecdsa, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use bitcoin::{
+    ecdsa, transaction, Amount, OutPoint, Script, ScriptBuf, Sequence, Transaction, TxIn, TxOut,
+    Witness,
+};
 
 const DUST_THRESHOLD: u64 = 546;
 
@@ -245,7 +248,7 @@ pub fn build_htlc_spend(
     let sequence = Sequence::ENABLE_RBF_NO_LOCKTIME; // 0xFFFFFFFD
 
     let mut tx = Transaction {
-        version: 2,
+        version: transaction::Version::TWO,
         lock_time,
         input: vec![TxIn {
             previous_output: htlc_outpoint,
@@ -254,21 +257,25 @@ pub fn build_htlc_spend(
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: out_value,
+            value: Amount::from_sat(out_value),
             script_pubkey: dest_spk,
         }],
     };
 
     // BIP143 sighash over the HTLC witness script.
     let sighash = SighashCache::new(&tx)
-        .segwit_signature_hash(0, redeem_script, htlc_value_sat, EcdsaSighashType::All)
+        .p2wsh_signature_hash(
+            0,
+            redeem_script,
+            Amount::from_sat(htlc_value_sat),
+            EcdsaSighashType::All,
+        )
         .map_err(|e| SwapError::Htlc(format!("sighash: {e}")))?;
     let secp = Secp256k1::new();
-    let msg =
-        Message::from_slice(sighash.as_ref()).map_err(|e| SwapError::Htlc(format!("msg: {e}")))?;
+    let msg = Message::from_digest(sighash.to_byte_array());
     let ecdsa_sig = ecdsa::Signature {
-        sig: secp.sign_ecdsa(&msg, signing_key),
-        hash_ty: EcdsaSighashType::All,
+        signature: secp.sign_ecdsa(&msg, signing_key),
+        sighash_type: EcdsaSighashType::All,
     };
     let sig_bytes = ecdsa_sig.serialize();
 
@@ -391,16 +398,16 @@ mod tests {
 
         // Synthetic funding tx paying the HTLC; its inputs are irrelevant to verifying the spend.
         let funding = Transaction {
-            version: 2,
+            version: transaction::Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![],
             output: vec![TxOut {
-                value: VALUE,
+                value: Amount::from_sat(VALUE),
                 script_pubkey: htlc_spk.clone(),
             }],
         };
         let outpoint = OutPoint {
-            txid: funding.txid(),
+            txid: funding.compute_txid(),
             vout: 0,
         };
         Setup {

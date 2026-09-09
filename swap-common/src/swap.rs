@@ -34,13 +34,24 @@ impl NetworkSpec {
         }
     }
 
-    pub fn from_bitcoin_network(n: bitcoin::Network) -> Self {
-        match n {
+    /// The wire spec for a `bitcoin::Network`, or an error for one this protocol cannot name.
+    ///
+    /// Fallible because `bitcoin::Network` is `#[non_exhaustive]`: it gains variants, and the
+    /// catch-all this used to have mapped every future one to `Regtest`. A record carrying the
+    /// wrong network derives addresses on the wrong chain, and the whole point of writing the
+    /// network down is that a resumed driver can rebuild the HTLC exactly.
+    pub fn from_bitcoin_network(n: bitcoin::Network) -> crate::error::Result<Self> {
+        Ok(match n {
             bitcoin::Network::Bitcoin => NetworkSpec::Bitcoin,
             bitcoin::Network::Testnet => NetworkSpec::Testnet,
             bitcoin::Network::Signet => NetworkSpec::Signet,
-            _ => NetworkSpec::Regtest,
-        }
+            bitcoin::Network::Regtest => NetworkSpec::Regtest,
+            other => {
+                return Err(crate::error::SwapError::Permanent(format!(
+                    "this build has no wire name for the {other} network"
+                )))
+            }
+        })
     }
 }
 
@@ -78,5 +89,27 @@ impl SwapState {
             self,
             SwapState::Claimed | SwapState::Refunded | SwapState::Expired | SwapState::Failed(_)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `bitcoin::Network` is `#[non_exhaustive]`, so it gains variants: 0.32 has four and the
+    /// next release adds more. The mapping used to end in a catch-all that answered `Regtest` for
+    /// anything it did not recognise, which would put a record on the wrong chain and derive its
+    /// HTLC address there. Writing the network down is only worth doing if it is right.
+    #[test]
+    fn every_network_this_protocol_names_round_trips() {
+        for (spec, network) in [
+            (NetworkSpec::Bitcoin, bitcoin::Network::Bitcoin),
+            (NetworkSpec::Testnet, bitcoin::Network::Testnet),
+            (NetworkSpec::Signet, bitcoin::Network::Signet),
+            (NetworkSpec::Regtest, bitcoin::Network::Regtest),
+        ] {
+            assert_eq!(spec.to_bitcoin_network(), network);
+            assert_eq!(NetworkSpec::from_bitcoin_network(network).unwrap(), spec);
+        }
     }
 }

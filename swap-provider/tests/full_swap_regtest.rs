@@ -117,7 +117,7 @@ async fn full_reverse_swap_two_nodes() {
             &env("WALLET_MNEMONIC", MNEMONIC),
             Network::Regtest,
             &electrum,
-            5.0,
+            5,
             &temp_wallet_dir(),
         )
         .expect("build funding wallet");

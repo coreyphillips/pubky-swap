@@ -112,7 +112,7 @@ impl OnchainWallet for BeignetWallet {
                 .map_err(|e| SwapError::Permanent(format!("decode funding tx: {e}")))?;
             let tx: Transaction = bitcoin::consensus::deserialize(&raw)
                 .map_err(|e| SwapError::Permanent(format!("parse funding tx: {e}")))?;
-            if tx.txid() != txid {
+            if tx.compute_txid() != txid {
                 return Err(SwapError::Permanent(
                     "the transaction beignet returned does not match the txid it reported".into(),
                 ));
@@ -120,7 +120,7 @@ impl OnchainWallet for BeignetWallet {
             let vout = tx
                 .output
                 .iter()
-                .position(|o| o.script_pubkey == spk && o.value == amount_sat)
+                .position(|o| o.script_pubkey == spk && o.value.to_sat() == amount_sat)
                 .ok_or_else(|| {
                     SwapError::Permanent(format!(
                         "no output in {txid} pays {amount_sat} sat to the HTLC script"

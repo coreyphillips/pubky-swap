@@ -36,7 +36,15 @@ async fn lnd_hold_invoice_lifecycle() {
 
     // Create a hold invoice (invoicesrpc.AddHoldInvoice).
     let hold = lnd
-        .create_hold_invoice(payment_hash, 50_000_000, 3600, "pubky-swap smoke")
+        .create_hold_invoice(lightning_backend::HoldInvoiceRequest {
+            payment_hash,
+            amount_msat: 50_000_000,
+            expiry_secs: 3600,
+            // Non-zero, because the trait requires it and LND substitutes its own default for a
+            // zero: the very thing that made a reverse swap's Lightning leg expire first.
+            cltv_expiry_delta: 200,
+            memo: "pubky-swap smoke".into(),
+        })
         .await
         .expect("create hold invoice");
     println!("hold invoice: {}", hold.bolt11);

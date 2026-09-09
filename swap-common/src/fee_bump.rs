@@ -185,7 +185,7 @@ pub async fn confirm_or_bump(
         None
     } else {
         run_blocking(|| chain.find_spend(htlc_spk, &htlc_outpoint))?
-            .map(|tx| tx.txid())
+            .map(|tx| tx.compute_txid())
             .filter(|id| ours.contains(id))
     };
 
@@ -196,7 +196,7 @@ pub async fn confirm_or_bump(
         }
         None => {
             let initial = build(rate)?;
-            on_spend(initial.txid());
+            on_spend(initial.compute_txid());
             run_blocking(|| chain.broadcast(&initial))?
         }
     };
@@ -213,7 +213,7 @@ pub async fn confirm_or_bump(
         // spend removes ours from the picture entirely, and the answer is more useful than
         // "not found".
         if let Some(spend) = run_blocking(|| chain.find_spend(htlc_spk, &htlc_outpoint))? {
-            let spend_txid = spend.txid();
+            let spend_txid = spend.compute_txid();
             if !ours.contains(&spend_txid) {
                 warn!(
                     "the HTLC output was spent by {spend_txid}, which we did not broadcast; \
@@ -237,7 +237,7 @@ pub async fn confirm_or_bump(
             None => {
                 debug!("spend {txid} is not in the mempool or a block; re-broadcasting");
                 if let Ok(tx) = build(rate) {
-                    on_spend(tx.txid());
+                    on_spend(tx.compute_txid());
                     if let Ok(id) = run_blocking(|| chain.broadcast(&tx)) {
                         ours.insert(id);
                         txid = id;
@@ -259,7 +259,7 @@ pub async fn confirm_or_bump(
                     // `build` errors only when the higher fee would dust the output. That is the
                     // end of escalation, not an error: let the current transaction ride.
                     if let Ok(replacement) = build(next) {
-                        on_spend(replacement.txid());
+                        on_spend(replacement.compute_txid());
                         match run_blocking(|| chain.broadcast(&replacement)) {
                             Ok(id) => {
                                 info!("fee-bumped the spend to {id} at {next} sat/vB");
@@ -332,11 +332,11 @@ mod tests {
 
     fn tx_paying(value: u64) -> Transaction {
         Transaction {
-            version: 2,
+            version: bitcoin::transaction::Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![],
             output: vec![TxOut {
-                value,
+                value: bitcoin::Amount::from_sat(value),
                 script_pubkey: spk(),
             }],
         }
@@ -344,7 +344,7 @@ mod tests {
 
     fn htlc_outpoint() -> OutPoint {
         OutPoint {
-            txid: tx_paying(1).txid(),
+            txid: tx_paying(1).compute_txid(),
             vout: 0,
         }
     }
@@ -396,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn a_counterparty_spend_ends_the_loop_and_is_handed_back() {
         let rival = tx_paying(42);
-        let rival_txid = rival.txid();
+        let rival_txid = rival.compute_txid();
         // `None` forever: our transaction is nowhere to be found, exactly as when a rival wins.
         let chain = chain(vec![None]).with_spend(rival);
 
@@ -417,7 +417,7 @@ mod tests {
         .unwrap();
 
         match out {
-            SpendOutcome::ConflictingSpend { tx } => assert_eq!(tx.txid(), rival_txid),
+            SpendOutcome::ConflictingSpend { tx } => assert_eq!(tx.compute_txid(), rival_txid),
             other => panic!("expected the rival spend to be returned, got {other:?}"),
         }
         // And it stopped immediately rather than re-broadcasting into a spent output.
@@ -432,7 +432,7 @@ mod tests {
         // The transaction a previous run of this swap broadcast before the process died. It is
         // still in the mempool, so the first thing this run sees is its own work.
         let earlier = tx_paying(99_000);
-        let earlier_txid = earlier.txid();
+        let earlier_txid = earlier.compute_txid();
         let chain = chain(vec![Some(2)]).with_spend(earlier);
 
         let out = tokio::time::timeout(
@@ -497,7 +497,7 @@ mod tests {
             // The i-th report happens when i transactions have gone out, so its own has not.
             // Reporting afterwards is the ordering that loses the txid to a crash.
             assert_eq!(*count_at_report, i, "report {i} came after its broadcast");
-            assert_eq!(*txid, broadcasts[i].txid());
+            assert_eq!(*txid, broadcasts[i].compute_txid());
         }
     }
 
@@ -599,7 +599,7 @@ mod tests {
         let called = AtomicBool::new(false);
         let cpfp = |_parent: Txid, _rate: u64| -> Option<Txid> {
             called.store(true, Ordering::SeqCst);
-            Some(tx_paying(1).txid())
+            Some(tx_paying(1).compute_txid())
         };
         confirm_or_bump(
             &chain,

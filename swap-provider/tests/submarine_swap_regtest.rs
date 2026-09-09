@@ -106,7 +106,7 @@ async fn full_submarine_swap_two_nodes() {
             &env("WALLET_MNEMONIC", MNEMONIC),
             Network::Regtest,
             &electrum,
-            5.0,
+            5,
             &temp_wallet_dir(),
         )
         .expect("client funding wallet"),
@@ -116,7 +116,7 @@ async fn full_submarine_swap_two_nodes() {
             &env("WALLET_MNEMONIC", MNEMONIC),
             Network::Regtest,
             &electrum,
-            5.0,
+            5,
             &temp_wallet_dir(),
         )
         .expect("provider claim wallet"),
@@ -128,7 +128,7 @@ async fn full_submarine_swap_two_nodes() {
             &env("WALLET_MNEMONIC", MNEMONIC),
             Network::Regtest,
             &electrum,
-            5.0,
+            5,
             &temp_wallet_dir(),
         )
         .unwrap();

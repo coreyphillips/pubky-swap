@@ -1,8 +1,12 @@
 //! Key helpers.
 //!
-//! `bitcoin 0.30` re-exports `secp256k1` without its `rand` feature, so `SecretKey::new`
-//! (which needs an RNG) isn't available. These helpers build keys from OS randomness
-//! instead, retrying on the negligible chance of an out-of-range scalar.
+//! This crate's default build re-exports `secp256k1` without its `rand` feature, so
+//! `SecretKey::new` (which needs an RNG) isn't available. These helpers build keys from OS
+//! randomness instead, retrying on the negligible chance of an out-of-range scalar.
+//!
+//! Enabling `bdk-wallet` does turn `bitcoin/rand-std` on transitively, so `SecretKey::new` exists
+//! in that build. Deriving keys differently depending on which features are compiled in is not a
+//! difference worth having in the code that generates HTLC branch keys.
 
 use bitcoin::secp256k1::{Secp256k1, SecretKey, Signing};
 use bitcoin::PublicKey;
