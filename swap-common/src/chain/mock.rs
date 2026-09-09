@@ -15,7 +15,7 @@
 //! that forgets to script a confirmation sees a loop that keeps trying, which is what production
 //! would do.
 
-use super::{ChainWatcher, FundingUtxo};
+use super::{ChainWatcher, FundingUtxo, HistoricalOutput};
 use crate::error::Result;
 use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
 use std::collections::HashMap;
@@ -26,6 +26,9 @@ use std::sync::Mutex;
 pub struct MockChain {
     tip: Mutex<u32>,
     outputs: Mutex<Vec<FundingUtxo>>,
+    /// Outputs that paid the script and have since been spent. Unspent ones do not need listing
+    /// here: they are derived from `outputs`, so a test only names what it wants to be gone.
+    spent_outputs: Mutex<Vec<HistoricalOutput>>,
     spend: Mutex<Option<Transaction>>,
     /// Consumed one entry per `tx_confirmations` call; the last entry repeats.
     confirmations: Mutex<Vec<Option<u32>>>,
@@ -54,6 +57,18 @@ impl MockChain {
 
     pub fn with_outputs(self, utxos: Vec<FundingUtxo>) -> Self {
         *self.outputs.lock().unwrap() = utxos;
+        self
+    }
+
+    /// An output that paid the HTLC script and has already been spent, so it appears in the
+    /// chain's history but in no UTXO set. This is the shape a resumed driver has to survive.
+    pub fn with_spent_output(self, outpoint: OutPoint, value_sat: u64, spent_by: Txid) -> Self {
+        self.spent_outputs.lock().unwrap().push(HistoricalOutput {
+            outpoint,
+            value_sat,
+            confirmations: 1,
+            spent_by: Some(spent_by),
+        });
         self
     }
 
@@ -126,6 +141,31 @@ impl ChainWatcher for MockChain {
 
     fn find_outputs(&self, _spk: &Script) -> Result<Vec<FundingUtxo>> {
         Ok(self.outputs.lock().unwrap().clone())
+    }
+
+    fn find_historical_outputs(&self, _spk: &Script) -> Result<Vec<HistoricalOutput>> {
+        // Anything still unspent is also part of the history, so a test that scripts a UTXO gets
+        // a coherent answer here without saying so twice.
+        let mut all: Vec<HistoricalOutput> = self
+            .outputs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|u| HistoricalOutput {
+                outpoint: u.outpoint,
+                value_sat: u.value_sat,
+                confirmations: u.confirmations,
+                spent_by: None,
+            })
+            .collect();
+        for spent in self.spent_outputs.lock().unwrap().iter() {
+            if let Some(existing) = all.iter_mut().find(|h| h.outpoint == spent.outpoint) {
+                *existing = spent.clone();
+            } else {
+                all.push(spent.clone());
+            }
+        }
+        Ok(all)
     }
 
     fn outpoint_status(&self, _spk: &Script, outpoint: &OutPoint) -> Result<Option<FundingUtxo>> {

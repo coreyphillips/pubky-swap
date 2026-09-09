@@ -14,7 +14,7 @@
 //! The provider only pays the invoice *after* the on-chain HTLC has confirmed, so a failed
 //! Lightning payment costs it nothing on-chain.
 
-use crate::reverse::{OnchainWallet, ProgressSink};
+use crate::reverse::{OnchainWallet, ProgressSink, Resume};
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
@@ -133,9 +133,9 @@ pub async fn drive_submarine_swap(
     swap: &SubmarineSwap,
     required_confirmations: u32,
     poll: Duration,
-    // If resuming after a restart and the HTLC funding was already observed, its outpoint.
-    // `None` on a fresh start.
-    resume_funding: Option<OutPoint>,
+    // What a previous run of this swap already did. The provider does not fund a submarine
+    // swap, so only the observed funding and our own spends matter here.
+    resume: &Resume,
     // True when a previous run recorded that it was about to pay the invoice. Combined with the
     // node's own answer, this is what keeps a resumed driver from paying twice.
     already_attempted_payment: bool,
@@ -144,7 +144,7 @@ pub async fn drive_submarine_swap(
     // 1. Establish the funding outpoint. On a fresh start, wait for the client to fund the HTLC
     //    (give up at timeout — nothing at risk yet). On resume, adopt the known outpoint, and if
     //    we already claimed before the crash, finish immediately.
-    let funding_outpoint = match resume_funding {
+    let funding_outpoint = match resume.funding {
         Some(op) => {
             if let Some(spend) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &op))? {
                 if extract_preimage(&spend, &op, &swap.payment_hash).is_some() {
@@ -287,7 +287,7 @@ pub async fn drive_submarine_swap(
             )));
         }
         PaymentStatus::Unknown => {
-            if resume_funding.is_some() && already_attempted_payment {
+            if resume.funding.is_some() && already_attempted_payment {
                 // We recorded an intent to pay and the node has no record of it. Do not assume
                 // either way: keep polling. Paying again could pay twice; giving up would
                 // abandon an HTLC we may already have bought.
@@ -299,7 +299,7 @@ pub async fn drive_submarine_swap(
                 return Ok(SwapState::InvoicePending);
             }
             // Record the intent before the irreversible call.
-            progress.invoice_pay_started();
+            progress.invoice_pay_started()?;
             match ln
                 .pay_invoice(&swap.invoice, swap.max_routing_fee_msat)
                 .await
@@ -373,13 +373,15 @@ pub async fn drive_submarine_swap(
         poll,
         FINALITY_DEPTH,
         deadline,
-    );
+    )
+    .with_known_ours(resume.our_spends.clone());
     match confirm_or_bump(
         chain,
         &swap.htlc_spk,
         funding_outpoint,
         &cfg,
         Some(&cpfp),
+        &|txid| progress.spend_broadcast(txid),
         build,
     )
     .await
@@ -610,7 +612,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             false,
             &(),
         )
@@ -651,7 +653,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             false,
             &(),
         )
@@ -703,7 +705,10 @@ mod tests {
             &swap,
             1,
             Duration::from_millis(0),
-            Some(funding_outpoint()),
+            &Resume {
+                funding: Some(funding_outpoint()),
+                ..Default::default()
+            },
             true, // a previous run recorded that it was about to pay
             &(),
         )
@@ -746,7 +751,10 @@ mod tests {
             &swap,
             1,
             Duration::from_millis(0),
-            Some(funding_outpoint()),
+            &Resume {
+                funding: Some(funding_outpoint()),
+                ..Default::default()
+            },
             true,
             &(),
         )
@@ -789,7 +797,7 @@ mod tests {
             &swap,
             1,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             false,
             &(),
         )
@@ -832,7 +840,7 @@ mod tests {
             &swap,
             1,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             false,
             &(),
         )
@@ -866,7 +874,7 @@ mod tests {
             &swap,
             1,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             false,
             &(),
         )
@@ -904,7 +912,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             false,
             &(),
         )

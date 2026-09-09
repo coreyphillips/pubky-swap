@@ -136,6 +136,10 @@ pub async fn execute_reverse_swap(
         funding.outpoint,
         &cfg,
         None,
+        // Nowhere to record it yet: the client runs a swap to completion in one process and has
+        // no resume path, so there is no later run to tell that this transaction was its own.
+        // That is the gap being closed next, and this is where it hooks in.
+        &|_| {},
         build,
     )
     .await

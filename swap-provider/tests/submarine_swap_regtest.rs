@@ -26,6 +26,7 @@ use swap_common::chain::{ChainWatcher, ElectrumWatcher};
 use swap_common::timelock::TimelockParams;
 use swap_common::wallet::{BdkWallet, OnchainWallet};
 use swap_common::{random_keypair, SwapState};
+use swap_provider::reverse::Resume;
 use swap_provider::submarine::{drive_submarine_swap, init_submarine_swap};
 
 /// A unique wallet directory per run, so tests never share a database.
@@ -222,7 +223,7 @@ async fn full_submarine_swap_two_nodes() {
                 &swap,
                 1,
                 Duration::from_secs(1),
-                None,
+                &Resume::default(),
                 false,
                 &(),
             )

@@ -87,7 +87,11 @@ pub struct SwapRecord {
     /// known. Present with no outpoint means a funding may exist that we never recorded.
     #[serde(default)]
     pub funding_intent_at_height: Option<u32>,
-    /// How many funding attempts have been started, so a resume loop cannot fund repeatedly.
+    /// How many funding attempts this swap has started.
+    ///
+    /// Not consulted by any decision: a driver refuses to fund on the presence of the intent
+    /// marker alone, whatever the chain appears to show. This counts, and a value above one is
+    /// evidence that invariant was broken.
     #[serde(default)]
     pub funding_attempts: u32,
     /// Set immediately before an invoice payment is attempted. Present means a payment may be in
@@ -98,9 +102,17 @@ pub struct SwapRecord {
     /// never persisted; it is re-extracted from this transaction on chain.
     #[serde(default)]
     pub claim_observed_txid_hex: Option<String>,
-    /// Our own claim or refund, once broadcast.
+    /// Our own claim or refund, once broadcast. The most recent one, for the operator.
     #[serde(default)]
     pub spend_txid_hex: Option<String>,
+    /// Every claim or refund we have put on the wire for this swap, oldest first.
+    ///
+    /// One txid is not enough. A fee bump is a *different* transaction, so a run that bumped
+    /// twice and then crashed leaves two of ours that could each still confirm, and a resumed
+    /// driver that recognises only the last one reads the other as the counterparty's spend.
+    /// Bounded by [`MAX_TRACKED_OUR_SPENDS`]: the oldest are long since replaced.
+    #[serde(default)]
+    pub our_spend_txids: Vec<String>,
 
     // --- client-side recovery ---
     /// The client's preimage, for a reverse swap.
@@ -155,6 +167,13 @@ impl std::fmt::Debug for SwapRecord {
     }
 }
 
+/// How many of our own claim/refund txids a record keeps.
+///
+/// Escalation replaces a transaction rather than adding one, so only the most recent handful can
+/// still be in a mempool anywhere. This is a bound on a field that would otherwise grow with the
+/// length of a stuck swap, not a judgement about how many matter.
+pub const MAX_TRACKED_OUR_SPENDS: usize = 16;
+
 impl SwapRecord {
     /// Zeroed progress/diagnostic fields, so a constructor can name only the swap's own details.
     pub fn new_progress() -> Self {
@@ -181,6 +200,7 @@ impl SwapRecord {
             invoice_pay_started_at_unix: None,
             claim_observed_txid_hex: None,
             spend_txid_hex: None,
+            our_spend_txids: Vec::new(),
             preimage_hex: None,
             dest_spk_hex: None,
             quote_total_sat: 0,
@@ -237,6 +257,31 @@ impl SwapRecord {
             .as_slice()
             .try_into()
             .map_err(|_| anyhow!("payment hash must be 32 bytes"))
+    }
+
+    /// Record a claim or refund of ours, keeping the list bounded and free of repeats.
+    pub fn note_our_spend(&mut self, txid: Txid) {
+        let hex = txid.to_string();
+        if !self.our_spend_txids.contains(&hex) {
+            self.our_spend_txids.push(hex.clone());
+            if self.our_spend_txids.len() > MAX_TRACKED_OUR_SPENDS {
+                self.our_spend_txids.remove(0);
+            }
+        }
+        self.spend_txid_hex = Some(hex);
+    }
+
+    /// The claim/refund transactions this swap has broadcast, for seeding the fee-bump loop.
+    ///
+    /// Unparsable entries are skipped rather than failing the call: a malformed txid can only
+    /// make the loop treat one of our own transactions as a stranger's, which is the behaviour
+    /// without any of this, and refusing to resume over it would be worse.
+    pub fn our_spends(&self) -> Vec<Txid> {
+        self.our_spend_txids
+            .iter()
+            .chain(self.spend_txid_hex.iter())
+            .filter_map(|h| Txid::from_str(h).ok())
+            .collect()
     }
 
     /// The funding outpoint, if it has been recorded.
@@ -406,6 +451,37 @@ mod tests {
     use crate::htlc::{build_htlc_script, generate_preimage, payment_hash};
     use crate::random_keypair;
     use bitcoin::secp256k1::Secp256k1;
+
+    fn txid(n: u8) -> Txid {
+        use bitcoin::hashes::Hash;
+        Txid::from_byte_array([n; 32])
+    }
+
+    /// A swap that bumps its refund twice and then crashes has two transactions of its own that
+    /// could each still confirm. Keeping only the newest leaves the older one looking like the
+    /// counterparty's spend to the next run, which is the reading that abandons a swap we were
+    /// winning.
+    #[test]
+    fn a_record_remembers_every_spend_it_broadcast() {
+        let mut rec = SwapRecord::new_progress();
+        rec.note_our_spend(txid(1));
+        rec.note_our_spend(txid(2));
+        rec.note_our_spend(txid(2)); // a re-broadcast of the same transaction is not a new one
+
+        assert_eq!(rec.our_spends(), vec![txid(1), txid(2), txid(2)]);
+        assert_eq!(
+            rec.spend_txid_hex.as_deref(),
+            Some(txid(2).to_string().as_str()),
+            "the newest stays where the operator looks for it"
+        );
+
+        // Bounded: escalation replaces rather than adds, so only the recent ones can still be in
+        // a mempool, and the field must not grow with the length of a stuck swap.
+        for n in 0..(MAX_TRACKED_OUR_SPENDS as u8 + 5) {
+            rec.note_our_spend(txid(n.wrapping_add(10)));
+        }
+        assert_eq!(rec.our_spend_txids.len(), MAX_TRACKED_OUR_SPENDS);
+    }
 
     fn temp_dir() -> PathBuf {
         // A unique, isolated directory under the system temp dir (no Math.random needed: the
