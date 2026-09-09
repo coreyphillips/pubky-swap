@@ -122,6 +122,7 @@ two legs.
 | `electrum` | `swap-common` | `ElectrumWatcher` chain access (find funding, broadcast, fee estimation). |
 | `bdk-wallet` | `swap-provider` | BIP84 funding wallet over Electrum. |
 | `chain` | `swap-provider`, `swap-client` | The Electrum chain watcher. |
+| `status` | `swap-provider` | The read-only status API (adds an HTTP server). |
 | `full` | `swap-provider`, `swap-client` | Everything needed to execute swaps end-to-end. |
 
 Without the execution features a provider runs **negotiation-only** and rejects `SwapRequest`s.
@@ -175,6 +176,25 @@ anything that fails, including credentials it can find on this machine:
 ```
 
 It exits non-zero when the daemon could not run, so it works as a container readiness probe.
+
+### Status API
+
+`--status-addr 127.0.0.1:9737` serves a **read-only** JSON API, so a dashboard or a health check
+can see what the daemon is doing without parsing its logs:
+
+| Endpoint | What it answers |
+|---|---|
+| `/health` | the `--doctor` report, as JSON, with `capable` |
+| `/status` | pubky, network, directions, in-flight count, committed sats |
+| `/swaps` | live swaps, and the most recent finished ones |
+| `/limits` | exposure and concurrency against their ceilings, and per counterparty |
+| `/offer` | the offer currently being advertised |
+| `/earnings` | completed, refunded and failed swaps, volume, and fees earned |
+
+Read-only by design: nothing here moves money or changes a swap. It binds loopback and requires a
+bearer token, generated into `<data-dir>/status.token` at `0600` on first start, so a supervisor
+sharing that volume can read it and nothing else can. Responses are built from projection types
+with no field for a branch key or a preimage, and there is a test asserting that.
 
 ## Safety
 

@@ -14,10 +14,12 @@ lnd = ["lightning-backend/lnd"]
 bdk-wallet = ["swap-common/bdk-wallet"]
 # Enable the Electrum chain watcher.
 chain = ["swap-common/electrum"]
+# A read-only status API on loopback, for a dashboard or a health check.
+status = ["dep:axum", "dep:tower-http"]
 # Use a beignet daemon for Lightning and/or the on-chain wallet. Needs no protoc.
 beignet = ["dep:beignet-backend"]
 # Everything needed to actually execute swaps end-to-end.
-full = ["lnd", "bdk-wallet", "chain"]
+full = ["lnd", "bdk-wallet", "chain", "status"]
 # Learn interested client pubkys over the iroh P2P rendezvous (doorbell) instead of only the
 # follow graph. See pubky-transport's `p2p` module.
 iroh = ["pubky-transport/iroh"]
@@ -39,6 +41,9 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The status API (feature `status`). Optional so the default build pulls in no HTTP server.
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["set-header"], optional = true }
 
 [dev-dependencies]
 # The scriptable ChainWatcher used by the unit tests.
