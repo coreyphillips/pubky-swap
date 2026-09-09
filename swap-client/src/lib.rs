@@ -32,11 +32,17 @@ use uuid::Uuid;
 use crate::reverse::{execute_reverse_swap, ReverseClaim};
 use crate::submarine::{execute_submarine_swap, SubmarineFunding};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ClientConfig {
-    pub recovery_method: String,
-    pub recovery_value: String,
-    pub passphrase: String,
+    /// Path to a Pubky recovery file. Mutually exclusive with `recovery_phrase`.
+    pub recovery_file: String,
+    /// The Pubky recovery phrase, from the environment, a config file, or a file named by
+    /// `recovery_phrase.file`. Never from a flag: an argv value is readable by anything that can
+    /// see the process table.
+    pub recovery_phrase: swap_config::SecretSource,
+    /// Passphrase protecting the recovery file or phrase.
+    pub passphrase: swap_config::SecretSource,
     pub network: String,
     pub provider_pkarr: String,
     pub direction: SwapDirection,
@@ -46,7 +52,7 @@ pub struct ClientConfig {
     /// Base URL of a beignet daemon.
     pub beignet_url: String,
     /// Bearer token for that daemon.
-    pub beignet_token: String,
+    pub beignet_token: swap_config::SecretSource,
     /// PEM root certificate, when the daemon was started with `--tls-cert`.
     pub beignet_tls_cert: String,
     /// Optional `/v1` API prefix.
@@ -64,7 +70,7 @@ pub struct ClientConfig {
     /// Address that receives the swept on-chain funds (reverse-swap claim destination).
     pub claim_address: String,
     /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
-    pub wallet_mnemonic: String,
+    pub wallet_mnemonic: swap_config::SecretSource,
     /// On-chain wallet backend: `"lnd"` (fund/claim via the node's own LND wallet — no seed or
     /// claim address needed) or `"bdk"` (a separate BIP84 wallet from `wallet_mnemonic`).
     pub wallet_backend: String,
@@ -102,6 +108,52 @@ fn execution_ready(config: &ClientConfig) -> bool {
     !config.electrum_url.is_empty() && wallet_is_configured(config)
 }
 
+impl Default for ClientConfig {
+    /// The defaults live here rather than on the flags, which is what makes the config file and
+    /// the environment usable: a flag carrying a default value would overwrite them on every run.
+    fn default() -> Self {
+        Self {
+            recovery_file: String::new(),
+            recovery_phrase: Default::default(),
+            passphrase: Default::default(),
+            network: "regtest".to_string(),
+            provider_pkarr: String::new(),
+            direction: SwapDirection::Reverse,
+            amount_sat: 0,
+            lightning_backend: "lnd".to_string(),
+            beignet_url: "http://127.0.0.1:2112".to_string(),
+            beignet_token: Default::default(),
+            beignet_tls_cert: String::new(),
+            beignet_api_prefix: String::new(),
+            lnd_address: "https://127.0.0.1:10009".to_string(),
+            lnd_cert_path: String::new(),
+            lnd_macaroon_path: String::new(),
+            electrum_socks5: String::new(),
+            electrum_timeout_secs: 30,
+            electrum_url: String::new(),
+            claim_address: String::new(),
+            wallet_mnemonic: Default::default(),
+            wallet_backend: "bdk".to_string(),
+            onchain_fee_rate_sat_vb: 2,
+            max_routing_fee_msat: 10_000,
+            quote_only: false,
+            rendezvous_iroh: false,
+            min_confirmations: 0,
+            max_fee_bps: 500,
+            max_total_sat: 0,
+            data_dir: "./pubky-swap-client-data".to_string(),
+            resume_only: false,
+        }
+    }
+}
+
+impl ClientConfig {
+    /// Resolve the Pubky identity, or say precisely what is missing.
+    pub fn identity(&self) -> Result<swap_config::Identity> {
+        swap_config::resolve_identity(&self.recovery_file, &self.recovery_phrase, &self.passphrase)
+    }
+}
+
 /// Whether the configured wallet backend can both fund an HTLC and supply a sweep destination
 /// on its own, with no `--claim-address` and no separate seed.
 fn wallet_is_self_sufficient(config: &ClientConfig) -> bool {
@@ -110,7 +162,7 @@ fn wallet_is_self_sufficient(config: &ClientConfig) -> bool {
 
 /// Whether a wallet is configured at all.
 fn wallet_is_configured(config: &ClientConfig) -> bool {
-    wallet_is_self_sufficient(config) || !config.wallet_mnemonic.is_empty()
+    wallet_is_self_sufficient(config) || config.wallet_mnemonic.is_configured()
 }
 
 /// The policy this client holds providers to.
@@ -255,13 +307,10 @@ pub fn parse_network(s: &str) -> Result<Network> {
 pub async fn run(config: ClientConfig) -> Result<()> {
     let network = parse_network(&config.network)?;
 
-    let transport = match config.recovery_method.as_str() {
-        "file" => Transport::from_recovery_file(&config.recovery_value, &config.passphrase).await?,
-        "phrase" => {
-            Transport::from_recovery_phrase(&config.recovery_value, Some(&config.passphrase))
-                .await?
-        }
-        other => return Err(anyhow!("unknown recovery method: {other}")),
+    let identity = config.identity()?;
+    let transport = match identity.method {
+        "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
+        _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
     };
     let client_pkarr = transport.public_key_string();
     info!("Client pubky: {client_pkarr}");
@@ -720,10 +769,17 @@ async fn maybe_ring_provider(config: &ClientConfig) {
     if !config.rendezvous_iroh {
         return;
     }
+    let identity = match config.identity() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("iroh rendezvous disabled: {e}");
+            return;
+        }
+    };
     let secret = match pubky_transport::identity::secret_from_recovery(
-        &config.recovery_method,
-        &config.recovery_value,
-        &config.passphrase,
+        identity.method,
+        &identity.value,
+        &identity.passphrase,
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -791,8 +847,17 @@ async fn build_wallet(config: &ClientConfig, network: Network) -> Result<Arc<dyn
     let _ = network;
     #[cfg(feature = "bdk-wallet")]
     {
+        let mnemonic = config
+            .wallet_mnemonic
+            .resolve("the wallet mnemonic")?
+            .ok_or_else(|| {
+                anyhow!(
+                    "--wallet bdk needs a BIP39 mnemonic; set PUBKY_SWAP_WALLET_MNEMONIC__FILE to \
+                     a file holding it"
+                )
+            })?;
         let wallet = swap_common::wallet::BdkWallet::from_mnemonic(
-            &config.wallet_mnemonic,
+            mnemonic.expose(),
             network,
             &config.electrum_url,
             config.onchain_fee_rate_sat_vb,
@@ -822,7 +887,14 @@ fn beignet_http(config: &ClientConfig) -> Result<Arc<beignet_backend::BeignetHtt
     let token = std::env::var("BEIGNET_API_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
-        .or_else(|| (!config.beignet_token.is_empty()).then(|| config.beignet_token.clone()));
+        .or_else(|| {
+            config
+                .beignet_token
+                .resolve("the beignet API token")
+                .ok()
+                .flatten()
+                .map(|s| s.expose().to_string())
+        });
     cfg = cfg.with_token(token);
     cfg.api_prefix = config.beignet_api_prefix.clone();
     if !config.beignet_tls_cert.is_empty() {

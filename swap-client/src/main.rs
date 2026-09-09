@@ -1,118 +1,119 @@
 use clap::Parser;
+use serde::Serialize;
 use swap_client::{run, ClientConfig};
 use swap_common::SwapDirection;
 
 /// pubky-swap client.
+///
+/// Settings come from four places, most specific last: built-in defaults, a TOML config file, the
+/// environment, and these flags. A flag you do not pass leaves the lower layers alone.
+///
+/// Every flag has an environment variable, named by upper-casing it and prefixing `PUBKY_SWAP_`:
+/// `--electrum-url` is `PUBKY_SWAP_ELECTRUM_URL`. Secrets have no flag, only the environment or a
+/// file, because an argv value is readable by anything that can see the process table.
 #[derive(Parser, Debug)]
 #[command(name = "swap-client", version, about)]
 struct Cli {
     /// Provider's pubky. Not needed with --resume-only.
     provider: Option<String>,
 
-    /// Pubky recovery file path (mutually exclusive with --recovery-phrase).
+    /// Pubky recovery file path. Mutually exclusive with a configured recovery phrase.
     recovery_file: Option<String>,
 
-    /// Pubky recovery phrase (instead of a recovery file).
+    /// TOML configuration file. Defaults to $PUBKY_SWAP_CONFIG, then $PUBKY_SWAP_DATA_DIR/
+    /// config.toml, then ~/.config/pubky-swap/config.toml, then ./pubky-swap.toml.
     #[arg(long)]
-    recovery_phrase: Option<String>,
+    config: Option<String>,
 
-    #[arg(long, default_value = "")]
-    pass: String,
+    /// Print the resolved configuration, with secrets redacted, and exit.
+    #[arg(long)]
+    show_config: bool,
 
-    #[arg(long, default_value = "regtest")]
-    network: String,
+    /// Network: bitcoin, testnet, signet, regtest.
+    #[arg(long)]
+    network: Option<String>,
 
-    /// Swap direction: submarine (on-chain→LN) or reverse (LN→on-chain).
-    #[arg(long, default_value = "reverse")]
-    direction: String,
+    /// Swap direction: reverse (LN to on-chain) or submarine (on-chain to LN).
+    #[arg(long)]
+    direction: Option<String>,
 
     /// Amount in satoshis. Not needed with --resume-only.
     #[arg(long)]
     amount: Option<u64>,
 
     /// LND gRPC endpoint used to pay the hold invoice (reverse-swap execution).
-    #[arg(long, default_value = "https://127.0.0.1:10009")]
-    lnd_address: String,
-    #[arg(long, default_value = "")]
-    lnd_cert: String,
-    #[arg(long, default_value = "")]
-    lnd_macaroon: String,
+    #[arg(long)]
+    lnd_address: Option<String>,
+    #[arg(long)]
+    lnd_cert: Option<String>,
+    #[arg(long)]
+    lnd_macaroon: Option<String>,
 
     /// SOCKS5 proxy for Electrum, e.g. 127.0.0.1:9050. Required to reach a .onion server.
-    #[arg(long, default_value = "")]
-    electrum_socks5: String,
+    #[arg(long)]
+    electrum_socks5: Option<String>,
 
     /// Per-call Electrum socket timeout, in seconds.
-    #[arg(long, default_value_t = 30)]
-    electrum_timeout_secs: u8,
+    #[arg(long)]
+    electrum_timeout_secs: Option<u8>,
 
     /// Lightning backend: `lnd` (gRPC to your own node) or `beignet` (HTTP to a beignet daemon).
-    #[arg(long, default_value = "lnd")]
-    lightning: String,
+    #[arg(long)]
+    lightning: Option<String>,
 
     /// Base URL of a beignet daemon.
-    #[arg(long, default_value = "http://127.0.0.1:2112")]
-    beignet_url: String,
-
-    /// Bearer token for the beignet daemon. Prefer the BEIGNET_API_TOKEN environment variable.
-    #[arg(long, default_value = "", env = "BEIGNET_API_TOKEN")]
-    beignet_token: String,
+    #[arg(long)]
+    beignet_url: Option<String>,
 
     /// PEM root certificate for the beignet daemon, if it was started with --tls-cert.
-    #[arg(long, default_value = "")]
-    beignet_tls_cert: String,
+    #[arg(long)]
+    beignet_tls_cert: Option<String>,
 
     /// API prefix for the beignet daemon, e.g. /v1.
-    #[arg(long, default_value = "")]
-    beignet_api_prefix: String,
+    #[arg(long)]
+    beignet_api_prefix: Option<String>,
 
-    /// Electrum server URL for watching/claiming the on-chain HTLC.
-    #[arg(long, default_value = "")]
-    electrum_url: String,
-    /// Address that receives the swept on-chain funds (reverse-swap claim destination).
-    #[arg(long, default_value = "")]
-    claim_address: String,
-    /// BIP39 mnemonic for the on-chain funding wallet (submarine swaps fund the HTLC).
-    #[arg(long, default_value = "")]
-    wallet_mnemonic: String,
-    /// On-chain wallet: `lnd` (your LND node's own wallet), `beignet` (a beignet daemon's
-    /// wallet), or `bdk` (a separate BIP84 wallet from --wallet-mnemonic). `lnd` and `beignet`
-    /// need no --claim-address.
-    #[arg(long, default_value = "bdk")]
-    wallet: String,
-    /// Fee rate (sat/vB) for the claim transaction.
-    #[arg(long, default_value_t = 2)]
-    onchain_fee_rate: u64,
+    /// Electrum server URL for watching/claiming the HTLC.
+    #[arg(long)]
+    electrum_url: Option<String>,
+
+    /// Address to receive the swept on-chain funds (reverse swaps).
+    #[arg(long)]
+    claim_address: Option<String>,
+
+    /// On-chain wallet: `lnd`, `beignet`, or `bdk` (a BIP84 wallet from a configured mnemonic).
+    #[arg(long)]
+    wallet: Option<String>,
+
+    /// Fee rate (sat/vB) floor for claim/refund transactions.
+    #[arg(long)]
+    onchain_fee_rate: Option<u64>,
+
     /// Routing-fee cap (msat) when paying the hold invoice.
-    #[arg(long, default_value_t = 10_000)]
-    max_routing_fee_msat: u64,
-    /// Confirmations to require before acting on a provider's funding, whatever it quotes.
-    /// 0 uses the network default (2 on mainnet, 1 elsewhere). Raising it is safer; lowering it
-    /// below the default lets a provider get you to reveal a preimage against a funding it can
-    /// still replace.
-    #[arg(long, default_value_t = 0)]
-    min_confirmations: u32,
+    #[arg(long)]
+    max_routing_fee_msat: Option<u64>,
 
-    /// Most to pay in total fees, in basis points of the swap amount (500 = 5%).
-    #[arg(long, default_value_t = 500)]
-    max_fee_bps: u16,
+    /// Confirmations this client requires before acting, whatever the provider quotes.
+    #[arg(long)]
+    min_confirmations: Option<u32>,
 
-    /// Hard ceiling on what this client will lock on-chain or pay over Lightning, in satoshis.
-    /// 0 means no ceiling beyond the amount you asked to swap.
-    #[arg(long, default_value_t = 0)]
-    max_total_sat: u64,
+    /// Most this client will pay in total fees, in basis points of the swap amount.
+    #[arg(long)]
+    max_fee_bps: Option<u16>,
 
-    /// Directory for persisted in-flight swap state. A submarine swap's refund key is generated
-    /// here and exists nowhere else: losing it makes the on-chain output unspendable, forever.
-    #[arg(long, default_value = "./pubky-swap-client-data")]
-    data_dir: String,
+    /// Hard ceiling on anything this client will lock on-chain or pay over Lightning.
+    #[arg(long)]
+    max_total_sat: Option<u64>,
+
+    /// Directory for persisted in-flight swap state.
+    #[arg(long)]
+    data_dir: Option<String>,
 
     /// Only check the provider (request a quote and print its rates), then exit without swapping.
     #[arg(long)]
     quote_only: bool,
 
-    /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating, so a provider that
-    /// isn't already following us starts polling us. Requires a build with `--features iroh`.
+    /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating. Requires `iroh`.
     #[arg(long)]
     rendezvous_iroh: bool,
 
@@ -125,11 +126,108 @@ struct Cli {
     resume_only: bool,
 }
 
+/// What the operator typed, in the shape the config layers merge. Absent fields contribute
+/// nothing, which is what lets the file and the environment mean anything.
+#[derive(Serialize, Default)]
+struct Overrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_pkarr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direction: Option<SwapDirection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    amount_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lightning_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beignet_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beignet_tls_cert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beignet_api_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lnd_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lnd_cert_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lnd_macaroon_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    electrum_socks5: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    electrum_timeout_secs: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    electrum_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onchain_fee_rate_sat_vb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_routing_fee_msat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_confirmations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_fee_bps: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_total_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendezvous_iroh: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_only: Option<bool>,
+}
+
+/// A boolean flag contributes only when it is set: clap reports `false` for one nobody passed,
+/// and writing that into the top layer would turn off what the config file turned on.
+fn flag(set: bool) -> Option<bool> {
+    set.then_some(true)
+}
+
 fn parse_direction(s: &str) -> anyhow::Result<SwapDirection> {
     match s.to_lowercase().as_str() {
         "submarine" => Ok(SwapDirection::Submarine),
         "reverse" => Ok(SwapDirection::Reverse),
         other => Err(anyhow::anyhow!("unknown direction: {other}")),
+    }
+}
+
+impl Cli {
+    fn overrides(&self) -> anyhow::Result<Overrides> {
+        Ok(Overrides {
+            provider_pkarr: self.provider.clone(),
+            recovery_file: self.recovery_file.clone(),
+            network: self.network.clone(),
+            direction: self.direction.as_deref().map(parse_direction).transpose()?,
+            amount_sat: self.amount,
+            lightning_backend: self.lightning.clone(),
+            beignet_url: self.beignet_url.clone(),
+            beignet_tls_cert: self.beignet_tls_cert.clone(),
+            beignet_api_prefix: self.beignet_api_prefix.clone(),
+            lnd_address: self.lnd_address.clone(),
+            lnd_cert_path: self.lnd_cert.clone(),
+            lnd_macaroon_path: self.lnd_macaroon.clone(),
+            electrum_socks5: self.electrum_socks5.clone(),
+            electrum_timeout_secs: self.electrum_timeout_secs,
+            electrum_url: self.electrum_url.clone(),
+            claim_address: self.claim_address.clone(),
+            wallet_backend: self.wallet.clone(),
+            onchain_fee_rate_sat_vb: self.onchain_fee_rate,
+            max_routing_fee_msat: self.max_routing_fee_msat,
+            min_confirmations: self.min_confirmations,
+            max_fee_bps: self.max_fee_bps,
+            max_total_sat: self.max_total_sat,
+            data_dir: self.data_dir.clone(),
+            quote_only: flag(self.quote_only),
+            rendezvous_iroh: flag(self.rendezvous_iroh),
+            resume_only: flag(self.resume_only),
+        })
     }
 }
 
@@ -143,65 +241,22 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let path = swap_config::paths::resolve_config_path(cli.config.as_deref());
+    let config: ClientConfig = swap_config::load(Some(&path), "PUBKY_SWAP_", &cli.overrides()?)?;
 
-    let (recovery_method, recovery_value) = match (&cli.recovery_file, &cli.recovery_phrase) {
-        (Some(file), None) => ("file".to_string(), file.clone()),
-        (None, Some(phrase)) => ("phrase".to_string(), phrase.clone()),
-        _ => {
-            return Err(anyhow::anyhow!(
-                "provide exactly one of <recovery_file> or --recovery-phrase"
-            ))
-        }
-    };
+    if cli.show_config {
+        print!("{}", swap_config::to_redacted_toml(&config)?);
+        return Ok(());
+    }
 
     // A resume needs nothing from the provider: everything a swap needs to finish is already on
     // disk, which is the point of writing it there.
-    let (provider_pkarr, amount_sat) = if cli.resume_only {
-        (cli.provider.unwrap_or_default(), cli.amount.unwrap_or(0))
-    } else {
-        match (cli.provider, cli.amount) {
-            (Some(p), Some(a)) => (p, a),
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "a swap needs <provider> and --amount; pass --resume-only to finish swaps a \
-                     previous run left in flight instead"
-                ))
-            }
-        }
-    };
-
-    let config = ClientConfig {
-        recovery_method,
-        recovery_value,
-        passphrase: cli.pass,
-        network: cli.network,
-        provider_pkarr,
-        direction: parse_direction(&cli.direction)?,
-        amount_sat,
-        lightning_backend: cli.lightning,
-        beignet_url: cli.beignet_url,
-        beignet_token: cli.beignet_token,
-        beignet_tls_cert: cli.beignet_tls_cert,
-        beignet_api_prefix: cli.beignet_api_prefix,
-        lnd_address: cli.lnd_address,
-        lnd_cert_path: cli.lnd_cert,
-        lnd_macaroon_path: cli.lnd_macaroon,
-        electrum_url: cli.electrum_url,
-        electrum_socks5: cli.electrum_socks5,
-        electrum_timeout_secs: cli.electrum_timeout_secs,
-        claim_address: cli.claim_address,
-        wallet_mnemonic: cli.wallet_mnemonic,
-        wallet_backend: cli.wallet,
-        onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
-        max_routing_fee_msat: cli.max_routing_fee_msat,
-        quote_only: cli.quote_only,
-        min_confirmations: cli.min_confirmations,
-        max_fee_bps: cli.max_fee_bps,
-        max_total_sat: cli.max_total_sat,
-        data_dir: cli.data_dir,
-        rendezvous_iroh: cli.rendezvous_iroh,
-        resume_only: cli.resume_only,
-    };
+    if !config.resume_only && (config.provider_pkarr.is_empty() || config.amount_sat == 0) {
+        return Err(anyhow::anyhow!(
+            "a swap needs a provider pubky and an amount; pass --resume-only to finish swaps a \
+             previous run left in flight instead"
+        ));
+    }
 
     run(config).await
 }

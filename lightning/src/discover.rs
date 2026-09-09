@@ -44,7 +44,6 @@ fn home() -> Option<PathBuf> {
 /// one without a second round of checks.
 pub fn lnd_candidates(network: Network) -> Vec<LndCandidate> {
     let chain = lnd_chain_dir(network);
-    let macaroon_rel = format!("data/chain/bitcoin/{chain}/admin.macaroon");
     let mut roots: Vec<(&'static str, PathBuf, String)> = Vec::new();
 
     // A container that has been given the node's data directory read-only. Checked first because
@@ -92,8 +91,19 @@ pub fn lnd_candidates(network: Network) -> Vec<LndCandidate> {
         }
     }
 
+    candidates_in(&roots, chain)
+}
+
+/// The filesystem half, separated from where the roots come from.
+///
+/// Split out so a test can hand it a directory instead of setting `LND_DIR`. Mutating the
+/// environment from a test is process-global: it is unsound in Rust 2024, and it makes the test
+/// depend on nothing else in the process touching the same variable at the same time.
+fn candidates_in(roots: &[(&'static str, PathBuf, String)], chain: &str) -> Vec<LndCandidate> {
+    let macaroon_rel = format!("data/chain/bitcoin/{chain}/admin.macaroon");
     let mut found: Vec<LndCandidate> = roots
-        .into_iter()
+        .iter()
+        .cloned()
         .filter_map(|(label, root, address)| {
             let cert = root.join("tls.cert");
             let macaroon = root.join(&macaroon_rel);
@@ -180,19 +190,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pubky-swap-discover-{}", std::process::id()));
         let chain = dir.join("data/chain/bitcoin/regtest");
         std::fs::create_dir_all(&chain).unwrap();
-        std::env::set_var("LND_DIR", &dir);
+        let roots = vec![(
+            "LND_DIR",
+            dir.clone(),
+            "https://127.0.0.1:10009".to_string(),
+        )];
 
         // Only the certificate so far: not a candidate.
         std::fs::write(dir.join("tls.cert"), b"cert").unwrap();
         assert!(
-            !lnd_candidates(Network::Regtest)
+            !candidates_in(&roots, "regtest")
                 .iter()
                 .any(|c| c.label == "LND_DIR"),
             "a certificate with no macaroon is not usable"
         );
 
         std::fs::write(chain.join("admin.macaroon"), b"mac").unwrap();
-        let found = lnd_candidates(Network::Regtest);
+        let found = candidates_in(&roots, "regtest");
         let candidate = found
             .iter()
             .find(|c| c.label == "LND_DIR")

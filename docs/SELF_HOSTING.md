@@ -18,7 +18,7 @@ A fully-functional (swap-executing) provider needs three things, all configurabl
 |---|---|---|
 | **Lightning node** (LND, gRPC) | `--lnd-address` `--lnd-cert` `--lnd-macaroon` | A macaroon with **invoice + router** permissions (the `admin.macaroon` works). |
 | **Chain access** (Electrum/electrs) | `--electrum-url` | e.g. `tcp://host:50001` (mainnet/electrs) or `ssl://host:50002`. |
-| **Funding wallet** (on-chain) | `--wallet lnd` *(or `--wallet-mnemonic`)* | `--wallet lnd` funds reverse-swap HTLCs from **LND's own on-chain balance** (no extra seed — recommended). Or use a separate BIP84 wallet with `--wallet bdk --wallet-mnemonic "…"`. |
+| **Funding wallet** (on-chain) | `--wallet lnd` *(or a configured mnemonic)* | `--wallet lnd` funds reverse-swap HTLCs from **LND's own on-chain balance** (no extra seed, and recommended). Or use a separate BIP84 wallet with `--wallet bdk` and `PUBKY_SWAP_WALLET_MNEMONIC__FILE`. |
 
 Build with the `full` feature (needs [`protoc`](https://grpc.io/docs/protoc-installation/)):
 
@@ -27,6 +27,53 @@ cargo build -p swap-provider --features full
 ```
 
 Without all three, the provider runs **negotiation-only** and rejects swap requests.
+
+## Secrets, and where they go
+
+There is no flag for a seed. The Pubky recovery phrase, the funding wallet's mnemonic, the
+identity passphrase and the beignet API token come from the environment or from a file, because a
+value passed in argv is readable by anything that can see the process table, and lands in shell
+history on the way there.
+
+```bash
+umask 077
+mkdir -p ~/.pubky-swap
+echo "<twelve words>" > ~/.pubky-swap/recovery.phrase
+echo "<bip39 mnemonic>" > ~/.pubky-swap/wallet.mnemonic
+
+export PUBKY_SWAP_RECOVERY_PHRASE__FILE=~/.pubky-swap/recovery.phrase
+export PUBKY_SWAP_WALLET_MNEMONIC__FILE=~/.pubky-swap/wallet.mnemonic
+```
+
+Everything that is not a secret can live in a config file instead of a long flag list. Put it at
+`~/.config/pubky-swap/config.toml` and it is found automatically:
+
+```toml
+network = "bitcoin"
+lnd_address = "https://10.21.21.9:10009"
+lnd_cert_path = "/home/umbrel/umbrel/app-data/lightning/data/lnd/tls.cert"
+lnd_macaroon_path = "/home/umbrel/umbrel/app-data/lightning/data/lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+electrum_url = "tcp://10.21.21.10:50001"
+wallet_backend = "lnd"
+```
+
+Flags still win over the file, and the file wins over the defaults, so you can keep the settled
+values in the file and override one for a single run.
+
+## Check it before you run it
+
+```bash
+swap-provider --doctor
+```
+
+It reports on the identity, the parameters, the data directory, the Lightning node, the chain
+backend and the wallet, and every failure says what to do about it. When it cannot reach your LND
+it lists the credentials it *can* find on this machine, with the flags to use them, which on an
+Umbrel is usually the answer. It exits non-zero when the daemon could not run, so it also works as
+a container readiness probe.
+
+`swap-provider --show-config` prints the resolved configuration with every secret redacted, which
+is the thing to paste into an issue.
 
 ## Run as an always-on provider (advertise swaps at your rate)
 
@@ -57,13 +104,11 @@ graph, not a directory.
 
 ```bash
 cargo run -p swap-provider --features full -- \
-  --recovery-phrase "<your pubky recovery phrase>" \
   --network <bitcoin|testnet|signet|regtest> \
   --lnd-address https://<lnd-host>:10009 \
   --lnd-cert   /path/to/tls.cert \
   --lnd-macaroon /path/to/admin.macaroon \
   --electrum-url tcp://<electrs-host>:50001 \
-  --wallet-mnemonic "<bip39 mnemonic for the funding wallet>" \
   --data-dir ./pubky-swap-data
 ```
 
@@ -133,20 +178,18 @@ you edit the LND config from the Lightning app's advanced settings, then restart
 
 ```bash
 cargo run -p swap-provider --features full -- \
-  --recovery-phrase "<your pubky recovery phrase>" \
   --network bitcoin \
   --lnd-address https://umbrel.local:10009 \
   --lnd-cert   ./umbrel-tls.cert \
   --lnd-macaroon ./umbrel-admin.macaroon \
   --electrum-url tcp://umbrel.local:50001 \
-  --wallet-mnemonic "<bip39 mnemonic for a SEPARATE funding wallet>" \
   --base-fee 1000 --fee-ppm 2000 \
   --confirmations 3 \
   --data-dir ./pubky-swap-data
 ```
 
 Notes:
-- The `--wallet-mnemonic` is an **on-chain wallet separate from LND** that funds reverse-swap
+- The funding mnemonic is an **on-chain wallet separate from LND** that funds reverse-swap
   HTLCs. Fund it with the amount you're willing to route through swaps. (It is *not* your LND
   on-chain wallet.)
 - On mainnet the provider enforces a minimum confirmation count and fee floor; raise
@@ -164,18 +207,17 @@ availability/rates without swapping — handy to confirm a pubky is a live provi
 
 ```bash
 cargo run -p swap-client --features full -- <PROVIDER_PUBKY> \
-  --recovery-phrase "<client pubky phrase>" --direction reverse --amount 50000 --quote-only
+  --direction reverse --amount 50000 --quote-only
 ```
 
 **Seedless with `--wallet lnd`.** Like the provider, the client can fund submarine HTLCs and receive
-reverse-swap sweeps via **LND's own wallet** — no `--wallet-mnemonic` and no `--claim-address`
+reverse-swap sweeps via **LND's own wallet**: no funding mnemonic and no `--claim-address`
 needed. Add `--wallet lnd` to either command below (and drop those two flags).
 
 **Reverse swap** (you receive on-chain BTC for Lightning):
 
 ```bash
 cargo run -p swap-client --features full -- <PROVIDER_PUBKY> \
-  --recovery-phrase "<client pubky phrase>" \
   --network bitcoin --direction reverse --amount 50000 \
   --lnd-address https://umbrel.local:10009 \
   --lnd-cert ./umbrel-tls.cert --lnd-macaroon ./umbrel-admin.macaroon \
@@ -188,12 +230,10 @@ to lock the HTLC:
 
 ```bash
 cargo run -p swap-client --features full -- <PROVIDER_PUBKY> \
-  --recovery-phrase "<client pubky phrase>" \
   --network bitcoin --direction submarine --amount 50000 \
   --lnd-address https://umbrel.local:10009 \
   --lnd-cert ./umbrel-tls.cert --lnd-macaroon ./umbrel-admin.macaroon \
   --electrum-url tcp://umbrel.local:50001 \
-  --wallet-mnemonic "<bip39 mnemonic for the funding wallet>"
 ```
 
 ## Just want to try it safely first?
