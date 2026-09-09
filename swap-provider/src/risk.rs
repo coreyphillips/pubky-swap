@@ -178,13 +178,26 @@ impl RiskManager {
                 }
             }
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.locked();
         info!(
             "restored risk accounting: {} swap(s) in flight, {} sat committed",
             inner.total_in_flight, inner.total_committed_sat
         );
         drop(inner);
         guards
+    }
+
+    /// The accounting, whether or not a previous holder panicked while holding it.
+    ///
+    /// A poisoned mutex here used to panic, and it is the wrong place to be strict: the state
+    /// behind it is a set of counters, not an invariant a panic can leave half-written, and
+    /// refusing to unlock it would take out every future reservation *and* every release, so
+    /// exposure would be counted forever against a daemon that could no longer serve anyone.
+    /// This is the pattern the rest of the workspace already uses.
+    fn locked(&self) -> std::sync::MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Reserve capacity for a new swap, or say why not.
@@ -204,7 +217,7 @@ impl RiskManager {
         amount_sat: u64,
         forced: bool,
     ) -> std::result::Result<ReservationGuard, RejectReason> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.locked();
         let now = Instant::now();
         let hour = Duration::from_secs(3600);
 
@@ -272,7 +285,7 @@ impl RiskManager {
     }
 
     fn release(&self, swap_id: Uuid) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.locked();
         let Some((peer, amount)) = inner.reservations.remove(&swap_id) else {
             return;
         };
@@ -291,12 +304,12 @@ impl RiskManager {
 
     /// Total committed right now, for logging and the status surface.
     pub fn committed_sat(&self) -> u64 {
-        self.inner.lock().unwrap().total_committed_sat
+        self.locked().total_committed_sat
     }
 
     /// Swaps in flight right now.
     pub fn in_flight(&self) -> usize {
-        self.inner.lock().unwrap().total_in_flight
+        self.locked().total_in_flight
     }
 }
 
@@ -313,6 +326,41 @@ mod tests {
             min_onchain_reserve_sat: 0,
             max_new_swaps_per_peer_per_hour: 5,
         }
+    }
+
+    /// A driver that hands back control keeps its place in the limits.
+    ///
+    /// The guard is released by `Drop`, which is right while a swap is over: the task ends and
+    /// the capacity comes back. It is exactly wrong when the task ends only to be replaced,
+    /// which is what happens on every transient failure and every non-terminal return. Re-entry
+    /// used to give the new driver `None`, so one Electrum hiccup was enough to make a swap stop
+    /// counting against total exposure and concurrency while its coins were still in an HTLC,
+    /// and the daemon would start more swaps on top of it.
+    ///
+    /// This is the handoff, in the shape `finish_driver_run` performs it.
+    #[test]
+    fn a_reservation_handed_to_the_next_run_still_counts() {
+        let m = RiskManager::new(limits());
+        let swap = Uuid::new_v4();
+        let first = m.reserve("alice", swap, 300_000).unwrap();
+        assert_eq!(m.committed_sat(), 300_000);
+
+        // The driver returns, and its reservation goes to the run that takes over rather than
+        // being dropped with the task.
+        let handover = |reservation: Option<ReservationGuard>| reservation;
+        let second = handover(Some(first));
+
+        assert_eq!(
+            m.committed_sat(),
+            300_000,
+            "the swap's coins are still locked, so it must still be counted"
+        );
+        assert_eq!(m.in_flight(), 1);
+
+        // Only when the swap is really over does the capacity come back.
+        drop(second);
+        assert_eq!(m.committed_sat(), 0);
+        assert_eq!(m.in_flight(), 0);
     }
 
     #[test]

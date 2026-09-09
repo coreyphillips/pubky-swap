@@ -163,6 +163,73 @@ fn htlc_claim_roundtrip() {
     );
 }
 
+/// `find_historical_outputs` must still report a funding after it has been spent.
+///
+/// This is the question a restarted provider asks, and the only one the UTXO set cannot answer:
+/// a client that has already claimed leaves nothing unspent, so "no UTXO" and "never funded" look
+/// identical, and funding again on the second reading hands the client a second HTLC they hold
+/// the preimage for. The mock cannot check any of this, because it is handed its answers.
+#[test]
+#[ignore = "requires docker regtest bitcoind + electrs"]
+fn a_spent_funding_is_still_in_the_scripts_history() {
+    ensure_funds();
+    let chain = ElectrumWatcher::new(&electrum_url()).expect("connect electrs");
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let (claim_sk, claim_pk) = random_keypair(&secp);
+    let (_refund_sk, refund_pk) = random_keypair(&secp);
+    let preimage = generate_preimage();
+    let ph = payment_hash(&preimage);
+    let timeout = block_count() + 20;
+
+    let redeem = build_htlc_script(&ph, &claim_pk, &refund_pk, timeout);
+    let htlc_addr = htlc_p2wsh_address(&redeem, Network::Regtest);
+    let htlc_spk = htlc_addr.script_pubkey();
+
+    // Nothing has paid this script yet, so history is empty. This is the answer that must not be
+    // confused with the one below.
+    assert!(
+        chain.find_historical_outputs(&htlc_spk).unwrap().is_empty(),
+        "an unused HTLC script has no history"
+    );
+
+    let fund_txid = cli(&["sendtoaddress", &htlc_addr.to_string(), VALUE_BTC]);
+    assert!(!fund_txid.starts_with("ERROR"), "fund failed: {fund_txid}");
+    mine(1);
+    let outpoint = wait_for_funding(&chain, &htlc_spk);
+
+    let funded = chain.find_historical_outputs(&htlc_spk).unwrap();
+    assert_eq!(funded.len(), 1, "one output pays the script: {funded:?}");
+    assert_eq!(funded[0].outpoint, outpoint);
+    assert_eq!(funded[0].value_sat, VALUE_SAT);
+    assert!(funded[0].confirmations >= 1);
+    assert_eq!(funded[0].spent_by, None, "not spent yet");
+
+    // Claim it, which is what empties the UTXO set.
+    let dest = spk_of(&new_address());
+    let fee = estimate_spend_fee(FEE_RATE, spend_vsize(&redeem, &dest, true));
+    let claim_tx =
+        build_claim_tx(outpoint, VALUE_SAT, &redeem, dest, fee, preimage, &claim_sk).unwrap();
+    let claim_txid = chain.broadcast(&claim_tx).expect("broadcast claim");
+    mine(1);
+    wait_for_spend(&chain, &htlc_spk, &outpoint);
+
+    assert!(
+        chain.find_outputs(&htlc_spk).unwrap().is_empty(),
+        "the UTXO set is now empty, which is exactly the misleading answer"
+    );
+
+    let after = chain.find_historical_outputs(&htlc_spk).unwrap();
+    assert_eq!(after.len(), 1, "the funding is still in the history");
+    assert_eq!(after[0].outpoint, outpoint);
+    assert_eq!(after[0].value_sat, VALUE_SAT);
+    assert_eq!(
+        after[0].spent_by,
+        Some(claim_txid),
+        "and it names the transaction that spent it"
+    );
+}
+
 #[test]
 #[ignore = "requires docker regtest bitcoind + electrs"]
 fn htlc_refund_is_rejected_before_timeout_and_accepted_after() {

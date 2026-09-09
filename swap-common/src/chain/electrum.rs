@@ -12,7 +12,7 @@
 //! lifetime of the process. Calls now route through [`ElectrumWatcher::call`], which retries with
 //! backoff and rebuilds the client when the failure looks like a dead connection.
 
-use super::{ChainWatcher, FundingUtxo};
+use super::{ChainWatcher, FundingUtxo, HistoricalOutput};
 use crate::error::{Result, SwapError};
 use bitcoin::{BlockHash, OutPoint, Script, Transaction, Txid};
 use electrum_client::{Client, ConfigBuilder, ElectrumApi, Socks5Config};
@@ -230,6 +230,52 @@ impl ChainWatcher for ElectrumWatcher {
                 confirmations: self.confirmations_from_height(u.height as i32, tip),
             })
             .collect())
+    }
+
+    fn find_historical_outputs(&self, spk: &Script) -> Result<Vec<HistoricalOutput>> {
+        let history = self.call("history", |c| c.script_get_history(spk))?;
+        let tip = self.tip_height()?;
+
+        // Two passes over the same transactions: the first collects every output that paid this
+        // script, the second asks which of them something has since spent. Both come from the one
+        // history call, so a spend and the funding it consumed are always read from the same view
+        // of the chain rather than two that could disagree.
+        let mut txs = Vec::with_capacity(history.len());
+        for entry in &history {
+            txs.push((self.transaction(&entry.tx_hash)?, entry.height));
+        }
+
+        let mut outputs = Vec::new();
+        for (tx, height) in &txs {
+            let txid = tx.txid();
+            for (vout, out) in tx.output.iter().enumerate() {
+                if out.script_pubkey.as_script() != spk {
+                    continue;
+                }
+                outputs.push(HistoricalOutput {
+                    outpoint: OutPoint {
+                        txid,
+                        vout: vout as u32,
+                    },
+                    value_sat: out.value,
+                    confirmations: self.confirmations_from_height(*height, tip),
+                    spent_by: None,
+                });
+            }
+        }
+
+        for (tx, _) in &txs {
+            for input in &tx.input {
+                if let Some(o) = outputs
+                    .iter_mut()
+                    .find(|o| o.outpoint == input.previous_output)
+                {
+                    o.spent_by = Some(tx.txid());
+                }
+            }
+        }
+
+        Ok(outputs)
     }
 
     fn outpoint_status(&self, spk: &Script, outpoint: &OutPoint) -> Result<Option<FundingUtxo>> {

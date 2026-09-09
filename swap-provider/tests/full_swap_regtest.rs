@@ -24,7 +24,7 @@ use swap_common::chain::{ChainWatcher, ElectrumWatcher};
 use swap_common::htlc::{generate_preimage, payment_hash};
 use swap_common::timelock::TimelockParams;
 use swap_common::{random_keypair, SwapState};
-use swap_provider::reverse::{drive_reverse_swap, init_reverse_swap, OnchainWallet};
+use swap_provider::reverse::{drive_reverse_swap, init_reverse_swap, OnchainWallet, Resume};
 use swap_provider::wallet::BdkWallet;
 
 /// A unique wallet directory per run, so tests never share a database.
@@ -213,7 +213,7 @@ async fn full_reverse_swap_two_nodes() {
                 &swap,
                 1,
                 Duration::from_secs(1),
-                None,
+                &Resume::default(),
                 &(),
             )
             .await

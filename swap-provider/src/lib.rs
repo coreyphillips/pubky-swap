@@ -38,7 +38,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::reverse::{
-    drive_reverse_swap, init_reverse_swap, OnchainWallet, ProgressSink, ReverseSwap,
+    cancel_hold_invoice, drive_reverse_swap, init_reverse_swap, OnchainWallet, ProgressSink,
+    ReverseSwap,
 };
 use crate::store::{JsonFileSwapStore, SwapRecord, SwapStore};
 use crate::submarine::{drive_submarine_swap, init_submarine_swap, SubmarineSwap};
@@ -365,6 +366,14 @@ impl StoreProgress {
     /// a swap that will not be resumed, which for a funded HTLC means a refund that never
     /// happens. It is the loudest thing this daemon can be quiet about.
     fn update(&self, what: &str, f: impl FnOnce(&mut SwapRecord)) {
+        let _ = self.try_update(what, f);
+    }
+
+    /// Apply `f` to the record and persist it, reporting whether the write landed.
+    ///
+    /// Most callers cannot do anything about a failure and use [`update`](Self::update). The ones
+    /// that are about to do something irreversible can, and must: they stop.
+    fn try_update(&self, what: &str, f: impl FnOnce(&mut SwapRecord)) -> anyhow::Result<()> {
         let mut rec = match self.record.lock() {
             Ok(r) => r,
             Err(poisoned) => poisoned.into_inner(),
@@ -377,7 +386,9 @@ impl StoreProgress {
                  a restart; if it is funded, its refund depends on this process staying up.",
                 rec.swap_id
             );
+            return Err(anyhow!("could not persist {what}: {e}"));
         }
+        Ok(())
     }
 
     fn set_state(&self, state: SwapState) {
@@ -412,13 +423,22 @@ impl StoreProgress {
         attempts
     }
 
-    fn snapshot(&self) -> Option<SwapRecord> {
-        self.record.lock().ok().map(|r| r.clone())
+    /// The record as it stands.
+    ///
+    /// Poison-tolerant, like every other use of this lock. `lock().ok()` would return `None` after
+    /// any panic that touched it, and the callers of this are the re-entry paths: a `None` there
+    /// silently ends the swap *and* releases its place in the risk limits, while its coins sit in
+    /// an HTLC.
+    fn snapshot(&self) -> SwapRecord {
+        match self.record.lock() {
+            Ok(r) => r.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 }
 
 impl ProgressSink for StoreProgress {
-    fn funding_intent(&self, tip: u32) {
+    fn funding_intent(&self, tip: u32) -> anyhow::Result<()> {
         // Written *before* the funding transaction is broadcast.
         //
         // Recording the outpoint afterwards is not enough: a crash between broadcast and persist
@@ -426,11 +446,12 @@ impl ProgressSink for StoreProgress {
         // output (because the counterparty already claimed it, or Electrum is lagging, or the
         // value does not match exactly) funds a second one. This marker tells a resumed driver
         // that a funding may exist and to go looking for it rather than paying again.
-        self.update("funding intent", |rec| {
+        self.try_update("funding intent", |rec| {
             rec.funding_intent_at_height = Some(tip);
             rec.funding_attempts = rec.funding_attempts.saturating_add(1);
             rec.state = SwapState::LockupPending;
-        });
+            rec.retry_count = 0;
+        })
     }
 
     fn funded(&self, outpoint: OutPoint) {
@@ -439,20 +460,25 @@ impl ProgressSink for StoreProgress {
             rec.funding_vout = Some(outpoint.vout);
             rec.funding_intent_at_height = None;
             rec.state = SwapState::LockupConfirmed;
+            rec.retry_count = 0;
         });
     }
 
-    fn invoice_pay_started(&self) {
+    fn invoice_pay_started(&self) -> anyhow::Result<()> {
         // Written before `pay_invoice`, so a resumed driver knows a payment may be in flight and
         // consults the node rather than paying a second time.
-        self.update("invoice payment intent", |rec| {
+        self.try_update("invoice payment intent", |rec| {
             rec.invoice_pay_started_at_unix = Some(now_unix());
             rec.state = SwapState::InvoicePending;
-        });
+            rec.retry_count = 0;
+        })
     }
 
     fn invoice_paid(&self) {
-        self.update("invoice paid", |rec| rec.state = SwapState::InvoicePaid);
+        self.update("invoice paid", |rec| {
+            rec.state = SwapState::InvoicePaid;
+            rec.retry_count = 0;
+        });
     }
 
     fn claim_observed(&self, txid: Txid) {
@@ -461,13 +487,17 @@ impl ProgressSink for StoreProgress {
         self.update("observed claim", |rec| {
             rec.claim_observed_txid_hex = Some(txid.to_string());
             rec.state = SwapState::InvoicePaid;
+            rec.retry_count = 0;
         });
     }
 
     fn spend_broadcast(&self, txid: Txid) {
+        // Deliberately does not touch the state. This is called for a claim *and* for a refund,
+        // and the record's state is the operator's only view of a swap: labelling a refund
+        // `ClaimPending` would describe it as the opposite of what it is.
         self.update("broadcast spend", |rec| {
-            rec.spend_txid_hex = Some(txid.to_string());
-            rec.state = SwapState::ClaimPending;
+            rec.note_our_spend(txid);
+            rec.retry_count = 0;
         });
     }
 }
@@ -503,7 +533,12 @@ async fn finish_driver_run(
     peer: &str,
     swap_id: Uuid,
     result: Result<SwapState>,
-    respawn: impl FnOnce(&ExecCtx, SwapRecord),
+    // The swap's place in the risk limits, passed on to the re-entered driver rather than
+    // dropped here. Re-entry used to hand the new driver `None`, so a swap that hit one transient
+    // failure stopped counting against total exposure and concurrency for the rest of its life,
+    // while its coins were still very much at risk.
+    reservation: Option<risk::ReservationGuard>,
+    respawn: impl FnOnce(&ExecCtx, SwapRecord, Option<risk::ReservationGuard>),
 ) {
     match result {
         Ok(state) if state.is_terminal() => {
@@ -516,9 +551,7 @@ async fn finish_driver_run(
             // re-enter it on the state it left behind.
             warn!("swap {swap_id} returned non-terminal state {state:?}; re-entering the driver");
             progress.set_state(state);
-            if let Some(rec) = progress.snapshot() {
-                respawn(ctx, rec);
-            }
+            respawn(ctx, progress.snapshot(), reservation);
         }
         Err(e) => {
             let transient = is_transient(&e);
@@ -528,9 +561,7 @@ async fn finish_driver_run(
                     "swap {swap_id} hit a transient failure ({e}); attempt {attempts} of \
                      {MAX_DRIVER_RETRIES}, re-entering the driver"
                 );
-                if let Some(rec) = progress.snapshot() {
-                    respawn(ctx, rec);
-                }
+                respawn(ctx, progress.snapshot(), reservation);
             } else {
                 error!("swap {swap_id} failed permanently: {e}");
                 let state = SwapState::Failed(e.to_string());
@@ -1257,22 +1288,11 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     )
     .await?;
 
-    let accept = SwapAccept {
-        quote_id: req.quote_id,
-        swap_id,
-        direction: SwapDirection::Reverse,
-        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
-        htlc_address: htlc_p2wsh_address(&swap.htlc_script, ctx.network).to_string(),
-        onchain_amount_sat: swap.onchain_amount_sat,
-        timeout_block_height: swap.timeout_height,
-        provider_pubkey_hex: hex::encode(refund_pk.to_bytes()),
-        invoice: Some(swap.invoice.clone()),
-    };
-    ctx.transport
-        .send(sender, &SwapMessage::SwapAccept(accept))
-        .await?;
-    info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
-
+    // Persist before telling the client anything. The record is what makes the swap resumable,
+    // and the moment the `SwapAccept` is on the wire the client can pay the hold invoice; a
+    // record written after that leaves a window where the counterparty is committed and we have
+    // nothing on disk to come back to. Writing first also means a failure here costs nothing:
+    // nobody has acted yet.
     let record = SwapRecord {
         swap_id,
         direction: SwapDirection::Reverse,
@@ -1293,8 +1313,44 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         ..SwapRecord::new_progress()
     };
     if let Err(e) = ctx.store.put(&record) {
-        warn!("failed to persist reverse swap {swap_id}: {e}");
+        // Nothing has been promised, so take back the one thing that exists: the hold invoice.
+        // Leaving it open would let a client pay into a swap no driver is watching.
+        cancel_hold_invoice(ctx.ln.as_ref(), swap.payment_hash).await;
+        return Err(anyhow!("cannot start reverse swap {swap_id}: {e}"));
     }
+
+    let accept = SwapAccept {
+        quote_id: req.quote_id,
+        swap_id,
+        direction: SwapDirection::Reverse,
+        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+        htlc_address: htlc_p2wsh_address(&swap.htlc_script, ctx.network).to_string(),
+        onchain_amount_sat: swap.onchain_amount_sat,
+        timeout_block_height: swap.timeout_height,
+        provider_pubkey_hex: hex::encode(refund_pk.to_bytes()),
+        invoice: Some(swap.invoice.clone()),
+    };
+    if let Err(e) = ctx
+        .transport
+        .send(sender, &SwapMessage::SwapAccept(accept))
+        .await
+    {
+        // No driver will be spawned, so the record must not be left looking live: a restart would
+        // adopt a swap whose counterparty was told nothing. Cancel the invoice too, because a
+        // send that reports failure may still have been delivered, and an open hold invoice is
+        // one a client can pay into with nobody watching.
+        error!("could not send the SwapAccept for {swap_id} ({e}); abandoning the swap");
+        cancel_hold_invoice(ctx.ln.as_ref(), swap.payment_hash).await;
+        let mut abandoned = record;
+        abandoned.state = SwapState::Failed(format!("could not send the SwapAccept: {e}"));
+        abandoned.updated_at_unix = now_unix();
+        if let Err(e) = ctx.store.mark_terminal(&abandoned) {
+            warn!("failed to record the abandoned swap {swap_id}: {e}");
+        }
+        return Err(anyhow!("send SwapAccept for {swap_id}: {e}"));
+    }
+    info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
+
     spawn_reverse_driver(ctx, swap, record, Some(reservation));
     Ok(())
 }
@@ -1317,7 +1373,7 @@ fn spawn_reverse_driver(
         Some(w) => w,
         None => return,
     };
-    let resume_funding = record.funding_outpoint();
+    let resume = resume_from_record(&record);
     let peer = record.peer.clone();
     let swap_id = record.swap_id;
     let required_confirmations = record.required_confirmations;
@@ -1327,7 +1383,6 @@ fn spawn_reverse_driver(
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
-        let _reservation = reservation;
         let result = drive_reverse_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -1335,16 +1390,22 @@ fn spawn_reverse_driver(
             &swap,
             required_confirmations,
             Duration::from_secs(2),
-            resume_funding,
+            &resume,
             progress.as_ref(),
         )
         .await;
-        finish_driver_run(&ctx2, &progress, &peer, swap_id, result, |ctx, rec| {
-            match reverse_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, None),
+        finish_driver_run(
+            &ctx2,
+            &progress,
+            &peer,
+            swap_id,
+            result,
+            reservation,
+            |ctx, rec, reservation| match reverse_swap_from_record(&rec, ctx.timelock) {
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, reservation),
                 Err(e) => error!("cannot re-enter reverse swap {swap_id}: {e}"),
-            }
-        })
+            },
+        )
         .await;
     });
 }
@@ -1408,25 +1469,9 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
     )
     .await?;
 
-    let accept = SwapAccept {
-        quote_id: req.quote_id,
-        swap_id,
-        direction: SwapDirection::Submarine,
-        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
-        htlc_address: htlc_p2wsh_address(&swap.htlc_script, ctx.network).to_string(),
-        onchain_amount_sat: swap.onchain_amount_sat,
-        timeout_block_height: swap.timeout_height,
-        provider_pubkey_hex: hex::encode(claim_pk.to_bytes()),
-        invoice: None,
-    };
-    ctx.transport
-        .send(sender, &SwapMessage::SwapAccept(accept))
-        .await?;
-    info!(
-        "Submarine swap {swap_id} started (fund {} to the HTLC)",
-        swap.onchain_amount_sat
-    );
-
+    // Persist before the `SwapAccept` goes out, for the same reason as the reverse direction:
+    // once the client has the HTLC address it can fund it, and a claim key that only exists in
+    // this process is a claim key one crash away from being gone.
     let record = SwapRecord {
         swap_id,
         direction: SwapDirection::Submarine,
@@ -1447,8 +1492,41 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         ..SwapRecord::new_progress()
     };
     if let Err(e) = ctx.store.put(&record) {
-        warn!("failed to persist submarine swap {swap_id}: {e}");
+        return Err(anyhow!("cannot start submarine swap {swap_id}: {e}"));
     }
+
+    let accept = SwapAccept {
+        quote_id: req.quote_id,
+        swap_id,
+        direction: SwapDirection::Submarine,
+        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+        htlc_address: htlc_p2wsh_address(&swap.htlc_script, ctx.network).to_string(),
+        onchain_amount_sat: swap.onchain_amount_sat,
+        timeout_block_height: swap.timeout_height,
+        provider_pubkey_hex: hex::encode(claim_pk.to_bytes()),
+        invoice: None,
+    };
+    if let Err(e) = ctx
+        .transport
+        .send(sender, &SwapMessage::SwapAccept(accept))
+        .await
+    {
+        // As above. Nothing was created on the Lightning side here, so the record is all there is
+        // to take back, and leaving it live would have a restart drive a swap the client never
+        // heard about.
+        error!("could not send the SwapAccept for {swap_id} ({e}); abandoning the swap");
+        let mut abandoned = record;
+        abandoned.state = SwapState::Failed(format!("could not send the SwapAccept: {e}"));
+        abandoned.updated_at_unix = now_unix();
+        if let Err(e) = ctx.store.mark_terminal(&abandoned) {
+            warn!("failed to record the abandoned swap {swap_id}: {e}");
+        }
+        return Err(anyhow!("send SwapAccept for {swap_id}: {e}"));
+    }
+    info!(
+        "Submarine swap {swap_id} started (fund {} to the HTLC)",
+        swap.onchain_amount_sat
+    );
     spawn_submarine_driver(ctx, swap, record, Some(reservation));
     Ok(())
 }
@@ -1470,7 +1548,7 @@ fn spawn_submarine_driver(
         Some(w) => w,
         None => return,
     };
-    let resume_funding = record.funding_outpoint();
+    let resume = resume_from_record(&record);
     let already_attempted_payment = record.invoice_pay_started_at_unix.is_some();
     let peer = record.peer.clone();
     let swap_id = record.swap_id;
@@ -1481,7 +1559,6 @@ fn spawn_submarine_driver(
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
-        let _reservation = reservation;
         let result = drive_submarine_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -1489,19 +1566,37 @@ fn spawn_submarine_driver(
             &swap,
             required_confirmations,
             Duration::from_secs(2),
-            resume_funding,
+            &resume,
             already_attempted_payment,
             progress.as_ref(),
         )
         .await;
-        finish_driver_run(&ctx2, &progress, &peer, swap_id, result, |ctx, rec| {
-            match submarine_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, None),
+        finish_driver_run(
+            &ctx2,
+            &progress,
+            &peer,
+            swap_id,
+            result,
+            reservation,
+            |ctx, rec, reservation| match submarine_swap_from_record(&rec, ctx.timelock) {
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, reservation),
                 Err(e) => error!("cannot re-enter submarine swap {swap_id}: {e}"),
-            }
-        })
+            },
+        )
         .await;
     });
+}
+
+/// Everything a driver needs to know about what a previous run of this swap already did.
+///
+/// Built in one place for both directions so the two cannot drift: the fields exist precisely
+/// because a resumed driver that ignores one of them repeats an irreversible act.
+fn resume_from_record(rec: &SwapRecord) -> reverse::Resume {
+    reverse::Resume {
+        funding: rec.funding_outpoint(),
+        funding_intent_at_height: rec.funding_intent_at_height,
+        our_spends: rec.our_spends(),
+    }
 }
 
 /// Reconstruct a [`ReverseSwap`] from a persisted record (resume path).

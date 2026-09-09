@@ -67,6 +67,13 @@ pub struct SpendWatchConfig {
     pub max_wall_duration: Duration,
     /// Iteration ceiling for one call.
     pub max_iterations: u32,
+    /// Spends this swap broadcast in an *earlier* run, read back from its record.
+    ///
+    /// The set of our own transactions is rebuilt from nothing on every call, which is right
+    /// within one run and wrong across a restart: a replacement we broadcast before the crash is
+    /// still in the mempool, and an empty set classifies it as the counterparty's spend. On a
+    /// refund that reads as "they claimed it" and the swap is abandoned while we were winning.
+    pub known_ours: Vec<Txid>,
 }
 
 impl SpendWatchConfig {
@@ -88,7 +95,14 @@ impl SpendWatchConfig {
             deadline_height: Some(deadline_height),
             max_wall_duration: DEFAULT_MAX_WALL_DURATION,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            known_ours: Vec::new(),
         }
+    }
+
+    /// Adopt spends a previous run of this swap put on the wire.
+    pub fn with_known_ours(mut self, txids: Vec<Txid>) -> Self {
+        self.known_ours = txids;
+        self
     }
 
     /// A refund: no chain deadline, because giving up means losing the money.
@@ -108,6 +122,7 @@ impl SpendWatchConfig {
             deadline_height: None,
             max_wall_duration: DEFAULT_MAX_WALL_DURATION,
             max_iterations: DEFAULT_MAX_ITERATIONS,
+            known_ours: Vec::new(),
         }
     }
 }
@@ -133,12 +148,18 @@ pub enum SpendOutcome {
 ///   would push the output below dust; escalation stops there rather than failing the call.
 /// - `htlc_outpoint` is the output being spent, needed to notice a rival spending it.
 /// - `cpfp` is tried only when an RBF replacement cannot be broadcast.
+/// - `on_spend` is called with the txid of every transaction about to go on the wire, *before*
+///   the broadcast. Recording it afterwards would leave the crash window this exists to close:
+///   the caller persists it so a later run knows the transaction is its own. A txid recorded for
+///   a broadcast that then failed is harmless, since nothing will ever see it on chain.
 pub async fn confirm_or_bump(
     chain: &dyn ChainWatcher,
     htlc_spk: &Script,
     htlc_outpoint: bitcoin::OutPoint,
     cfg: &SpendWatchConfig,
     cpfp: Option<&CpfpBump<'_>>,
+    // `Sync` so the returned future stays `Send`: these drivers run as spawned tasks.
+    on_spend: &(dyn Fn(Txid) + Sync),
     mut build: impl FnMut(u64) -> Result<Transaction>,
 ) -> Result<SpendOutcome> {
     let estimate = |target: u16| run_blocking(|| chain.estimate_fee_rate(target)).unwrap_or(None);
@@ -148,13 +169,37 @@ pub async fn confirm_or_bump(
         cfg.floor_rate_sat_vb,
         cfg.cap_rate_sat_vb,
     );
-    let initial = build(rate)?;
-    let mut txid = run_blocking(|| chain.broadcast(&initial))?;
-
     // Every transaction we have put on the wire. An RBF replacement is a *different* transaction,
     // so without this an earlier replacement of ours confirming would be misread as a rival's
-    // spend and the swap would take the wrong branch.
-    let mut ours: HashSet<Txid> = HashSet::new();
+    // spend and the swap would take the wrong branch. Seeded from the record, so the same is true
+    // of a replacement an earlier run broadcast before a restart.
+    let mut ours: HashSet<Txid> = cfg.known_ours.iter().copied().collect();
+
+    // Before putting anything new on the wire, ask whether a spend from an earlier run is already
+    // the live one. Rebuilding produces a *different* transaction: the fee rate is re-derived from
+    // today's estimate with no memory of what the earlier run escalated to, so the replacement is
+    // usually cheaper than the one it would replace and the node rejects it under BIP125 rule 3.
+    // That rejection is `?`-propagated, so the call would fail outright rather than watching a
+    // perfectly good transaction of ours confirm.
+    let live = if ours.is_empty() {
+        None
+    } else {
+        run_blocking(|| chain.find_spend(htlc_spk, &htlc_outpoint))?
+            .map(|tx| tx.txid())
+            .filter(|id| ours.contains(id))
+    };
+
+    let mut txid = match live {
+        Some(id) => {
+            info!("adopting spend {id} from an earlier run of this swap rather than replacing it");
+            id
+        }
+        None => {
+            let initial = build(rate)?;
+            on_spend(initial.txid());
+            run_blocking(|| chain.broadcast(&initial))?
+        }
+    };
     ours.insert(txid);
 
     let started = Instant::now();
@@ -192,6 +237,7 @@ pub async fn confirm_or_bump(
             None => {
                 debug!("spend {txid} is not in the mempool or a block; re-broadcasting");
                 if let Ok(tx) = build(rate) {
+                    on_spend(tx.txid());
                     if let Ok(id) = run_blocking(|| chain.broadcast(&tx)) {
                         ours.insert(id);
                         txid = id;
@@ -213,6 +259,7 @@ pub async fn confirm_or_bump(
                     // `build` errors only when the higher fee would dust the output. That is the
                     // end of escalation, not an error: let the current transaction ride.
                     if let Ok(replacement) = build(next) {
+                        on_spend(replacement.txid());
                         match run_blocking(|| chain.broadcast(&replacement)) {
                             Ok(id) => {
                                 info!("fee-bumped the spend to {id} at {next} sat/vB");
@@ -277,6 +324,7 @@ mod tests {
     use crate::chain::mock::MockChain;
     use bitcoin::absolute::LockTime;
     use bitcoin::{OutPoint, TxOut};
+    use std::sync::Mutex;
 
     fn spk() -> bitcoin::ScriptBuf {
         bitcoin::ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap()
@@ -315,6 +363,7 @@ mod tests {
             deadline_height: deadline,
             max_wall_duration: Duration::from_secs(5),
             max_iterations: 50,
+            known_ours: Vec::new(),
         }
     }
 
@@ -327,6 +376,7 @@ mod tests {
             htlc_outpoint(),
             &cfg(None),
             None,
+            &|_| {},
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await
@@ -358,6 +408,7 @@ mod tests {
                 htlc_outpoint(),
                 &cfg(None),
                 None,
+                &|_| {},
                 |rate| Ok(tx_paying(100_000 - rate)),
             ),
         )
@@ -377,6 +428,80 @@ mod tests {
     /// I last broadcast" must not be read as a rival winning. Every transaction we broadcast is
     /// remembered.
     #[tokio::test]
+    async fn a_spend_from_an_earlier_run_is_not_mistaken_for_a_rival() {
+        // The transaction a previous run of this swap broadcast before the process died. It is
+        // still in the mempool, so the first thing this run sees is its own work.
+        let earlier = tx_paying(99_000);
+        let earlier_txid = earlier.txid();
+        let chain = chain(vec![Some(2)]).with_spend(earlier);
+
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            confirm_or_bump(
+                &chain,
+                spk().as_script(),
+                htlc_outpoint(),
+                &cfg(None).with_known_ours(vec![earlier_txid]),
+                None,
+                &|_| {},
+                |rate| Ok(tx_paying(100_000 - rate)),
+            ),
+        )
+        .await
+        .expect("must not loop forever")
+        .unwrap();
+
+        // Without the seed this is a `ConflictingSpend`, which a refund driver reads as "the
+        // counterparty claimed" and gives up on a swap it was winning.
+        match out {
+            SpendOutcome::Confirmed { txid } => assert_eq!(txid, earlier_txid),
+            other => panic!("expected our own earlier spend to confirm, got {other:?}"),
+        }
+        // And nothing new went on the wire. Rebuilding produces a different transaction at
+        // today's fee rate, usually cheaper than the one it would replace, so broadcasting it is
+        // at best a rejected replacement and at worst an error that aborts the whole call while a
+        // perfectly good spend of ours sits in the mempool.
+        assert_eq!(
+            chain.broadcast_count(),
+            0,
+            "a live spend of ours is adopted, not replaced"
+        );
+    }
+
+    /// Every transaction goes on the record before it goes on the wire.
+    ///
+    /// The other order leaves the gap this whole mechanism exists to close: broadcast, crash,
+    /// and the next run has no idea the transaction in the mempool is its own.
+    #[tokio::test]
+    async fn a_spend_is_reported_before_it_is_broadcast() {
+        let chain = chain(vec![Some(0), Some(2)]);
+        let seen: Mutex<Vec<(Txid, usize)>> = Mutex::new(Vec::new());
+
+        confirm_or_bump(
+            &chain,
+            spk().as_script(),
+            htlc_outpoint(),
+            &cfg(None),
+            None,
+            &|txid| seen.lock().unwrap().push((txid, chain.broadcast_count())),
+            |rate| Ok(tx_paying(100_000 - rate)),
+        )
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        let broadcasts = chain.broadcasts();
+        assert!(!seen.is_empty());
+        assert_eq!(seen.len(), broadcasts.len(), "one report per broadcast");
+        for (i, (txid, count_at_report)) in seen.iter().enumerate() {
+            // The i-th report happens when i transactions have gone out, so its own has not.
+            // Reporting afterwards is the ordering that loses the txid to a crash.
+            assert_eq!(*count_at_report, i, "report {i} came after its broadcast");
+            assert_eq!(*txid, broadcasts[i].txid());
+        }
+    }
+
+    #[tokio::test]
     async fn our_own_replacement_is_not_mistaken_for_a_rival() {
         // The first build (at the floor rate) is what `find_spend` will report.
         let ours = tx_paying(100_000 - 5);
@@ -387,6 +512,7 @@ mod tests {
             htlc_outpoint(),
             &cfg(None),
             None,
+            &|_| {},
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await
@@ -410,6 +536,7 @@ mod tests {
                 htlc_outpoint(),
                 &cfg(Some(800_000)), // the deadline is already here
                 None,
+                &|_| {},
                 |rate| Ok(tx_paying(100_000 - rate)),
             ),
         )
@@ -434,6 +561,7 @@ mod tests {
                 htlc_outpoint(),
                 &c,
                 None,
+                &|_| {},
                 |rate| Ok(tx_paying(100_000 - rate)),
             ),
         )
@@ -453,6 +581,7 @@ mod tests {
             htlc_outpoint(),
             &cfg(None),
             None,
+            &|_| {},
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await
@@ -478,6 +607,7 @@ mod tests {
             htlc_outpoint(),
             &cfg(Some(800_010)),
             Some(&cpfp),
+            &|_| {},
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await
@@ -494,6 +624,7 @@ mod tests {
             htlc_outpoint(),
             &cfg(None),
             None,
+            &|_| {},
             |rate| Ok(tx_paying(100_000 - rate)),
         )
         .await

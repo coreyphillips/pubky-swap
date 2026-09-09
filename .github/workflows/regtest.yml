@@ -48,6 +48,9 @@ jobs:
       - name: HTLC engine + Electrum watcher
         run: cargo test -p swap-common --features electrum --test regtest -- --ignored --nocapture
 
+      - name: HTLC script history (spent fundings stay visible)
+        run: cargo test -p swap-common --features electrum --test regtest a_spent_funding_is_still_in_the_scripts_history -- --ignored --nocapture
+
       - name: Reorg detection
         run: cargo test -p swap-common --features electrum --test reorg_regtest -- --ignored --nocapture
 

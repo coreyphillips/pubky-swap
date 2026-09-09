@@ -149,6 +149,8 @@ pub async fn execute_submarine_swap(
                 outpoint,
                 &cfg,
                 Some(&cpfp),
+                // See the note in the reverse client: there is no resumed run to tell yet.
+                &|_| {},
                 build,
             )
             .await

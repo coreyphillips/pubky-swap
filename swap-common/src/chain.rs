@@ -44,6 +44,22 @@ pub struct FundingUtxo {
     pub confirmations: u32,
 }
 
+/// An output that has paid an HTLC script at some point, whether or not it is still unspent.
+///
+/// [`FundingUtxo`] answers "what can still be spent", which is the right question while a swap is
+/// running and the wrong one when a restarted driver asks whether it already funded. A
+/// counterparty that has claimed leaves nothing unspent, so "no UTXO" and "never funded" look
+/// identical, and they call for opposite actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalOutput {
+    pub outpoint: OutPoint,
+    pub value_sat: u64,
+    /// 0 while unconfirmed (in the mempool).
+    pub confirmations: u32,
+    /// The transaction that spent it, if it has been spent.
+    pub spent_by: Option<Txid>,
+}
+
 /// Minimal chain access for the swap state machine. `Send + Sync` so a watcher can be shared
 /// (behind `Arc`) with spawned per-swap driver tasks.
 pub trait ChainWatcher: Send + Sync {
@@ -63,6 +79,18 @@ pub trait ChainWatcher: Send + Sync {
     /// The caller classifies them with [`select_funding`]. Separating "what is there" from "is it
     /// what we expected" is what lets a driver tell an underpayment from an empty address.
     fn find_outputs(&self, spk: &Script) -> Result<Vec<FundingUtxo>>;
+
+    /// Every output that has *ever* paid `spk`, including ones already spent.
+    ///
+    /// This is the resume question, and only history can answer it. A provider that broadcast a
+    /// funding transaction and crashed before recording its outpoint comes back knowing only that
+    /// a funding *may* exist. [`find_outputs`](ChainWatcher::find_outputs) reports nothing both
+    /// when the broadcast never happened and when the counterparty has already claimed, and
+    /// funding again in the second case hands them a second HTLC they hold the preimage for.
+    ///
+    /// Required, not defaulted: a watcher that answered `Ok(vec![])` here would put the driver
+    /// back on exactly the branch this exists to prevent.
+    fn find_historical_outputs(&self, spk: &Script) -> Result<Vec<HistoricalOutput>>;
 
     /// Whether this specific outpoint is still unspent, and how deep.
     ///

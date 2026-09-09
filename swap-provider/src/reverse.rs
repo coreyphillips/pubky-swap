@@ -47,11 +47,23 @@ pub use swap_common::wallet::OnchainWallet;
 /// leaves a window where funds have moved and no trace of it exists.
 pub trait ProgressSink: Send + Sync {
     /// About to broadcast a funding transaction, at the given tip height.
-    fn funding_intent(&self, _tip: u32) {}
+    ///
+    /// Fallible, unlike most of these, because this marker is the only thing standing between a
+    /// crash and a second funding. Broadcasting after failing to write it is how a swap gets
+    /// funded twice, so the driver stops instead.
+    fn funding_intent(&self, _tip: u32) -> Result<()> {
+        Ok(())
+    }
     /// The HTLC funding outpoint is now known (funded by us, or observed on-chain).
     fn funded(&self, _outpoint: OutPoint) {}
     /// About to pay a Lightning invoice, which cannot be undone.
-    fn invoice_pay_started(&self) {}
+    ///
+    /// Fallible for the same reason as [`funding_intent`](ProgressSink::funding_intent): without
+    /// this marker a resumed driver has no reason to ask the node whether a payment is already in
+    /// flight, and pays again.
+    fn invoice_pay_started(&self) -> Result<()> {
+        Ok(())
+    }
     /// The invoice payment succeeded.
     fn invoice_paid(&self) {}
     /// A counterparty spend revealing the preimage has been seen, identified by txid. The
@@ -62,6 +74,23 @@ pub trait ProgressSink: Send + Sync {
 }
 
 impl ProgressSink for () {}
+
+/// What a restarted driver knows about a swap that was already in flight.
+///
+/// Every field is something the record wrote down *before* an irreversible act. A fresh start
+/// passes [`Resume::default`] and the drivers behave exactly as they did before any of this
+/// existed; the fields only ever narrow what a resumed driver is willing to do.
+#[derive(Debug, Clone, Default)]
+pub struct Resume {
+    /// The HTLC funding outpoint, once it was known.
+    pub funding: Option<OutPoint>,
+    /// The tip height at which a funding broadcast was about to be attempted, still set because
+    /// no outpoint was ever recorded for it. Means "a funding may exist; go and look", and it is
+    /// enough on its own: a driver that sees it will never fund, however empty the chain looks.
+    pub funding_intent_at_height: Option<u32>,
+    /// Claim or refund transactions an earlier run put on the wire.
+    pub our_spends: Vec<Txid>,
+}
 
 /// State describing one provider-side reverse swap.
 pub struct ReverseSwap {
@@ -143,6 +172,247 @@ pub async fn init_reverse_swap(
     })
 }
 
+/// The result of trying to put the swap's coins into the HTLC.
+enum FundingOutcome {
+    /// The HTLC is funded, at this outpoint. Either we funded it now, or an earlier run did.
+    Funded(OutPoint),
+    /// Nothing was committed, and nothing will be. The hold invoice has been cancelled, so the
+    /// client is whole; this carries the terminal state to report.
+    Refused(SwapState),
+}
+
+/// Establish the HTLC funding outpoint without ever funding twice.
+///
+/// The order of the questions is the whole point. A known outpoint needs no chain call at all. An
+/// unspent output paying the script is the ordinary "someone already funded this" answer. Only
+/// when both are empty does history get asked, and only then because "no unspent output" means
+/// two opposite things: on a fresh start nothing has been funded, and on a resume the
+/// counterparty may simply have claimed already. Funding again in that second case hands them a
+/// second HTLC they hold the preimage for, which is a total loss of the amount.
+async fn establish_funding(
+    ln: &dyn LightningBackend,
+    chain: &dyn ChainWatcher,
+    wallet: &dyn OnchainWallet,
+    swap: &ReverseSwap,
+    resume: &Resume,
+    poll: Duration,
+    progress: &dyn ProgressSink,
+) -> Result<FundingOutcome> {
+    // Resumed with a known outpoint: we already funded before the restart.
+    if let Some(op) = resume.funding {
+        return Ok(FundingOutcome::Funded(op));
+    }
+
+    // Already funded and still unspent: adopt the existing output.
+    if let Some(u) = run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))? {
+        progress.funded(u.outpoint);
+        return Ok(FundingOutcome::Funded(u.outpoint));
+    }
+
+    // Nothing unspent, and a previous run recorded that it was about to broadcast a funding. From
+    // here this driver will not fund, whatever it finds. The two outcomes are not comparable:
+    // refusing costs a swap that fails and returns the client's money, while funding a second time
+    // costs the entire on-chain amount, because the client holds the preimage for the new HTLC
+    // just as much as the old one. So the answer to "I cannot see a funding I may have made" is to
+    // keep looking, not to make another.
+    if resume.funding_intent_at_height.is_some() {
+        return await_recorded_funding(ln, chain, swap, poll, progress).await;
+    }
+
+    // About to commit funds. Verify the *realised* timelocks first.
+    //
+    // Asking for a CLTV delta is not the same as getting one: a node may clamp it, ignore it, or
+    // apply its own default. LND's default is 80 blocks, well short of a 144-block on-chain
+    // timeout, which would let a client reclaim its sats over Lightning and *then* claim the
+    // on-chain HTLC for free. So read back the expiry the accepted HTLC actually carries and
+    // refuse unless the Lightning leg genuinely outlives our refund window.
+    //
+    // Refusing costs nobody anything: the payment is still held, so cancelling returns it in
+    // full.
+    let status = ln
+        .invoice_status(swap.payment_hash)
+        .await
+        .map_err(|e| anyhow!("invoice status: {e}"))?;
+    let ln_expiry = match status.earliest_htlc_expiry() {
+        Some(h) => h,
+        None => {
+            warn!("Reverse swap: invoice accepted but no HTLC is held; not funding");
+            cancel_hold_invoice(ln, swap.payment_hash).await;
+            return Ok(FundingOutcome::Refused(SwapState::Failed(
+                "no held HTLC on an accepted invoice".into(),
+            )));
+        }
+    };
+    let tip = run_blocking(|| chain.tip_height())?;
+    if let Err(violation) =
+        timelock::check_reverse_before_fund(tip, swap.timeout_height, ln_expiry, &swap.timelock)
+    {
+        error!(
+            "Reverse swap: refusing to fund the HTLC, timelock violation: {violation}. \
+             Cancelling the hold invoice; the client's payment is returned in full."
+        );
+        cancel_hold_invoice(ln, swap.payment_hash).await;
+        return Ok(FundingOutcome::Refused(SwapState::Failed(format!(
+            "timelock violation: {violation}"
+        ))));
+    }
+    info!(
+        "Reverse swap: lightning HTLC expires at {ln_expiry}, on-chain refund opens at {}; \
+         funding on-chain HTLC",
+        swap.timeout_height
+    );
+
+    // Record the intent before broadcasting. A crash in this gap otherwise leaves a funded HTLC
+    // with nothing on disk pointing at it, and this is the marker that stops a resumed driver
+    // reading that as "never funded".
+    //
+    // Nothing has gone on the wire yet, so a marker that cannot be written costs only this swap:
+    // cancel the invoice and the client is whole.
+    if let Err(e) = progress.funding_intent(tip) {
+        error!("Reverse swap: cannot record the funding intent ({e}); not funding");
+        cancel_hold_invoice(ln, swap.payment_hash).await;
+        return Ok(FundingOutcome::Refused(SwapState::Failed(format!(
+            "could not record the funding intent: {e}"
+        ))));
+    }
+
+    match run_blocking(|| wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat)) {
+        Ok(op) => {
+            progress.funded(op);
+            Ok(FundingOutcome::Funded(op))
+        }
+        // Not a failure to fund: a failure to *know whether* we funded. Both wallets can answer
+        // with an error after the transaction is already on the wire (a lost gRPC response, a
+        // reply we cannot decode), and treating that as a dead swap abandons a funded HTLC with
+        // no refund and no cancelled invoice. The marker is written, so this is the same
+        // situation a crash here would have left, and it takes the same route.
+        Err(e) => {
+            error!(
+                "Reverse swap: the funding call failed ({e}), but it may already have been \
+                 broadcast. Not funding again; watching for it to appear."
+            );
+            await_recorded_funding(ln, chain, swap, poll, progress).await
+        }
+    }
+}
+
+/// Wait for a funding this swap may already have broadcast, without ever broadcasting another.
+///
+/// Reached whenever a funding intent is on the record and no matching output is visible. That is
+/// two situations at once, and no single observation separates them: the broadcast may never have
+/// landed, or it may have landed and been spent, or this Electrum server may simply not have
+/// indexed it yet. Only time distinguishes them, so this watches until either the funding appears
+/// or the swap's own timeout arrives.
+async fn await_recorded_funding(
+    ln: &dyn LightningBackend,
+    chain: &dyn ChainWatcher,
+    swap: &ReverseSwap,
+    poll: Duration,
+    progress: &dyn ProgressSink,
+) -> Result<FundingOutcome> {
+    // Slower than the driver's own poll: this loop can run for the whole timeout window, and it
+    // asks for a script's entire history each time. Zero stays zero so tests do not sleep.
+    let watch_poll = if poll.is_zero() {
+        poll
+    } else {
+        poll.max(Duration::from_secs(30))
+    };
+    loop {
+        if let Some(u) =
+            run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))?
+        {
+            info!(
+                "Reverse swap: the recorded funding is visible at {}; adopting it",
+                u.outpoint
+            );
+            progress.funded(u.outpoint);
+            return Ok(FundingOutcome::Funded(u.outpoint));
+        }
+
+        let history = run_blocking(|| chain.find_historical_outputs(&swap.htlc_spk))?;
+        if let Some(op) = choose_recorded_funding(chain, swap, &history)? {
+            warn!(
+                "Reverse swap: the recorded funding is on chain at {op} and has been spent; \
+                 adopting it rather than funding again"
+            );
+            progress.funded(op);
+            return Ok(FundingOutcome::Funded(op));
+        }
+
+        let tip = run_blocking(|| chain.tip_height())?;
+        if tip >= swap.timeout_height {
+            // A whole timeout window of looking and nothing has ever paid this script, on any
+            // view of the chain this daemon has had. Nothing is locked, so returning the client's
+            // payment is both safe and the only thing left to do. The record keeps its funding
+            // markers, so an operator with a better view of the chain still has the outpoint to
+            // go looking with.
+            error!(
+                "Reverse swap: a funding was recorded but never became visible before height {}. \
+                 Cancelling the hold invoice. If coins were sent to the HTLC script, they are \
+                 refundable with the key in this swap's record.",
+                swap.timeout_height
+            );
+            cancel_hold_invoice(ln, swap.payment_hash).await;
+            return Ok(FundingOutcome::Refused(SwapState::Expired));
+        }
+        sleep(watch_poll).await;
+    }
+}
+
+/// Pick which historical output to drive, out of those that could be this swap's funding.
+///
+/// More than one is possible: the HTLC address is public from the moment it is in a `SwapAccept`,
+/// and a resumed run that funded twice would leave two. The spend builders take a single input, so
+/// only one can be driven, and the one to prefer is whichever the counterparty claimed: its spend
+/// carries the preimage, which is what settles the Lightning leg and pays for the swap.
+fn choose_recorded_funding(
+    chain: &dyn ChainWatcher,
+    swap: &ReverseSwap,
+    history: &[swap_common::chain::HistoricalOutput],
+) -> Result<Option<OutPoint>> {
+    let mut candidates: Vec<_> = history
+        .iter()
+        .filter(|h| h.value_sat == swap.onchain_amount_sat)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // Deepest first, so the choice does not change with the order a server happens to return.
+    candidates.sort_by(|a, b| {
+        b.confirmations
+            .cmp(&a.confirmations)
+            .then_with(|| a.outpoint.txid.cmp(&b.outpoint.txid))
+            .then_with(|| a.outpoint.vout.cmp(&b.outpoint.vout))
+    });
+
+    if candidates.len() > 1 {
+        warn!(
+            "Reverse swap: {} outputs have paid the HTLC script; preferring one whose spend \
+             reveals the preimage",
+            candidates.len()
+        );
+        for c in &candidates {
+            let Some(tx) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &c.outpoint))? else {
+                continue;
+            };
+            if extract_preimage(&tx, &c.outpoint, &swap.payment_hash).is_some() {
+                return Ok(Some(c.outpoint));
+            }
+        }
+    }
+    Ok(Some(candidates[0].outpoint))
+}
+
+/// Cancel the hold invoice, logging rather than failing.
+///
+/// Every caller is already on its way out and has something better to report than "and the cancel
+/// also failed"; the invoice expires on its own regardless, which returns the payment anyway.
+pub(crate) async fn cancel_hold_invoice(ln: &dyn LightningBackend, payment_hash: PaymentHash) {
+    if let Err(e) = ln.cancel_hold_invoice(payment_hash).await {
+        warn!("Reverse swap: failed to cancel the hold invoice: {e}");
+    }
+}
+
 /// Drive a reverse swap to a terminal [`SwapState`] (`Claimed`, `Refunded`, `Expired`, or
 /// `Failed`).
 ///
@@ -156,9 +426,9 @@ pub async fn drive_reverse_swap(
     swap: &ReverseSwap,
     required_confirmations: u32,
     poll: Duration,
-    // If resuming after a restart and the HTLC was already funded, its outpoint — so we never
-    // re-fund. `None` on a fresh start.
-    resume_funding: Option<OutPoint>,
+    // What a previous run of this swap already did, so this one does not do it again.
+    // [`Resume::default`] on a fresh start.
+    resume: &Resume,
     progress: &dyn ProgressSink,
 ) -> Result<SwapState> {
     // 1. Wait for the client to pay the hold invoice (give up at timeout — nothing locked yet).
@@ -190,82 +460,13 @@ pub async fn drive_reverse_swap(
     //    double-funds. Only the branch that commits *new* funds is gated on the timelocks: once
     //    coins are already in the HTLC the money is at risk either way, and refusing there would
     //    strand it instead of driving it to a refund.
-    let funding_outpoint = match resume_funding {
-        // Resumed with a known outpoint: we already funded before the restart.
-        Some(op) => op,
-        None => match run_blocking(|| chain.find_funding(&swap.htlc_spk, swap.onchain_amount_sat))?
-        {
-            // Already funded (and still unspent) - adopt the existing output.
-            Some(u) => {
-                progress.funded(u.outpoint);
-                u.outpoint
-            }
-            None => {
-                // About to commit funds. Verify the *realised* timelocks first.
-                //
-                // Asking for a CLTV delta is not the same as getting one: a node may clamp it,
-                // ignore it, or apply its own default. LND's default is 80 blocks, well short of
-                // a 144-block on-chain timeout, which would let a client reclaim its sats over
-                // Lightning and *then* claim the on-chain HTLC for free. So read back the expiry
-                // the accepted HTLC actually carries and refuse unless the Lightning leg
-                // genuinely outlives our refund window.
-                //
-                // Refusing costs nobody anything: the payment is still held, so cancelling
-                // returns it in full.
-                let status = ln
-                    .invoice_status(swap.payment_hash)
-                    .await
-                    .map_err(|e| anyhow!("invoice status: {e}"))?;
-                let ln_expiry = match status.earliest_htlc_expiry() {
-                    Some(h) => h,
-                    None => {
-                        warn!("Reverse swap: invoice accepted but no HTLC is held; not funding");
-                        if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
-                            warn!("Reverse swap: failed to cancel hold invoice: {e}");
-                        }
-                        return Ok(SwapState::Failed(
-                            "no held HTLC on an accepted invoice".into(),
-                        ));
-                    }
-                };
-                let tip = run_blocking(|| chain.tip_height())?;
-                if let Err(violation) = timelock::check_reverse_before_fund(
-                    tip,
-                    swap.timeout_height,
-                    ln_expiry,
-                    &swap.timelock,
-                ) {
-                    error!(
-                        "Reverse swap: refusing to fund the HTLC, timelock violation: \
-                         {violation}. Cancelling the hold invoice; the client's payment is \
-                         returned in full."
-                    );
-                    if let Err(e) = ln.cancel_hold_invoice(swap.payment_hash).await {
-                        warn!(
-                            "Reverse swap: failed to cancel hold invoice after refusing to \
-                             fund: {e}"
-                        );
-                    }
-                    return Ok(SwapState::Failed(format!(
-                        "timelock violation: {violation}"
-                    )));
-                }
-                info!(
-                    "Reverse swap: lightning HTLC expires at {ln_expiry}, on-chain refund opens \
-                     at {}; funding on-chain HTLC",
-                    swap.timeout_height
-                );
-                // Record the intent before broadcasting. A crash in this gap otherwise
-                // leaves a funded HTLC with nothing on disk pointing at it, and a resumed
-                // driver that cannot find the output funds a second one.
-                progress.funding_intent(tip);
-                let op =
-                    run_blocking(|| wallet.fund_htlc(&swap.htlc_spk, swap.onchain_amount_sat))?;
-                progress.funded(op);
-                op
-            }
-        },
-    };
+    let funding_outpoint =
+        match establish_funding(ln, chain, wallet, swap, resume, poll, progress).await? {
+            FundingOutcome::Funded(op) => op,
+            // Refused before committing anything. The hold invoice is already cancelled, so the
+            // client's payment is returned in full.
+            FundingOutcome::Refused(state) => return Ok(state),
+        };
     info!("Reverse swap: HTLC funded; awaiting client claim");
 
     // We funded the output ourselves, so we already know its outpoint. We do NOT separately
@@ -371,13 +572,15 @@ pub async fn drive_reverse_swap(
                 cap,
                 poll,
                 FINALITY_DEPTH,
-            );
+            )
+            .with_known_ours(resume.our_spends.clone());
             match confirm_or_bump(
                 chain,
                 &swap.htlc_spk,
                 funding_outpoint,
                 &cfg,
                 Some(&cpfp),
+                &|txid| progress.spend_broadcast(txid),
                 build,
             )
             .await
@@ -400,6 +603,7 @@ pub async fn drive_reverse_swap(
                          preimage from it",
                         tx.txid()
                     );
+                    sleep(poll).await;
                     continue;
                 }
                 SpendOutcome::DeadlineExceeded { last_txid, tip } => {
@@ -407,6 +611,7 @@ pub async fn drive_reverse_swap(
                         "Reverse swap: refund {last_txid} still unconfirmed at height {tip}; \
                          retrying"
                     );
+                    sleep(poll).await;
                     continue;
                 }
             }
@@ -646,7 +851,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             &(),
         )
         .await
@@ -708,7 +913,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             &(),
         )
         .await
@@ -789,7 +994,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             &(),
         )
         .await
@@ -900,7 +1105,7 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            None,
+            &Resume::default(),
             &(),
         )
         .await
@@ -925,6 +1130,348 @@ mod tests {
         fn receive_destination(&self) -> ScriptBuf {
             self.refund_spk.clone()
         }
+    }
+
+    /// A wallet that counts fundings instead of refusing them, for the cases where the assertion
+    /// is "it was not called" rather than "it must never be called".
+    struct CountingWallet {
+        refund_spk: ScriptBuf,
+        funded: Mutex<Vec<u64>>,
+    }
+    impl CountingWallet {
+        fn new() -> Self {
+            Self {
+                refund_spk: dest(),
+                funded: Mutex::new(Vec::new()),
+            }
+        }
+        fn fund_count(&self) -> usize {
+            self.funded.lock().unwrap().len()
+        }
+    }
+    impl OnchainWallet for CountingWallet {
+        fn fund_htlc(
+            &self,
+            _htlc_spk: &ScriptBuf,
+            amount_sat: u64,
+        ) -> swap_common::Result<OutPoint> {
+            self.funded.lock().unwrap().push(amount_sat);
+            Ok(funding_outpoint())
+        }
+        fn receive_destination(&self) -> ScriptBuf {
+            self.refund_spk.clone()
+        }
+    }
+
+    /// A sink whose intent markers cannot be written, standing in for a full or unwritable disk.
+    struct UnwritableSink;
+    impl ProgressSink for UnwritableSink {
+        fn funding_intent(&self, _tip: u32) -> Result<()> {
+            Err(anyhow!("disk full"))
+        }
+    }
+
+    /// Set up a reverse swap plus the client's claim of it, which several resume tests need.
+    async fn swap_with_claim(ln: &MockLn) -> (ReverseSwap, bitcoin::Transaction, [u8; 32]) {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let swap = init_reverse_swap(
+            ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            params(),
+        )
+        .await
+        .unwrap();
+        let claim_tx = build_claim_tx(
+            funding_outpoint(),
+            AMOUNT,
+            &swap.htlc_script,
+            dest(),
+            1000,
+            preimage,
+            &claim_sk,
+        )
+        .unwrap();
+        (swap, claim_tx, preimage)
+    }
+
+    /// The double-funding hole, in the shape that actually loses the money.
+    ///
+    /// A provider broadcasts its funding, crashes before recording the outpoint, and comes back
+    /// after the client has claimed. Nothing is unspent, so the UTXO set says "never funded" and
+    /// the pre-fix driver funded a second HTLC into a script whose preimage the client already
+    /// holds. They claim that one too and the provider is out the whole amount, with a hold
+    /// invoice it can settle only once.
+    ///
+    /// The intent marker is what makes this answerable, and the chain's history is what tells
+    /// "the broadcast never landed" apart from "it landed and has been spent".
+    #[tokio::test]
+    async fn a_resumed_driver_adopts_a_funding_the_counterparty_has_already_spent() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, preimage) = swap_with_claim(&ln).await;
+
+        // The chain as it looks after the client's claim confirmed: no unspent output paying the
+        // HTLC, but a history that still records the funding.
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spend(claim_tx);
+        let wallet = PanicFundWallet { refund_spk: dest() };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume {
+                funding: None,
+                funding_intent_at_height: Some(MOCK_TIP),
+                our_spends: Vec::new(),
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Claimed);
+        assert_eq!(
+            *ln.settled_preimage.lock().unwrap(),
+            Some(preimage),
+            "adopting the spent funding is what lets the provider settle and be paid"
+        );
+    }
+
+    /// Several outputs can pay the HTLC script: the address is public from the moment it is in a
+    /// `SwapAccept`. The spend builders take one input, so only one can be driven, and the one
+    /// worth driving is whichever the client claimed: its spend carries the preimage, which is
+    /// what settles the Lightning leg and pays for the swap. Cancelling the invoice instead, or
+    /// picking by depth alone, forfeits a settle already earned.
+    #[tokio::test]
+    async fn several_fundings_prefer_the_one_whose_spend_reveals_the_preimage() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, _) = swap_with_claim(&ln).await;
+        let other = OutPoint {
+            txid: Txid::from_str(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+
+        // `other` is deeper, so depth alone would pick it. Only `funding_outpoint()` is spent by
+        // a transaction carrying the preimage.
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spent_output(other, AMOUNT, claim_tx.txid())
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spend(claim_tx);
+        let history = chain.find_historical_outputs(&swap.htlc_spk).unwrap();
+        assert_eq!(history.len(), 2);
+
+        let chosen = choose_recorded_funding(&chain, &swap, &history)
+            .unwrap()
+            .expect("one of the candidates must be chosen");
+        assert_eq!(chosen, funding_outpoint());
+    }
+
+    /// Without an intent marker there is nothing to be careful about: a fresh swap whose HTLC is
+    /// unfunded funds it, exactly as before.
+    #[tokio::test]
+    async fn a_fresh_swap_still_funds_its_htlc() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, _) = swap_with_claim(&ln).await;
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spend(claim_tx);
+        let wallet = CountingWallet::new();
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Claimed);
+        assert_eq!(wallet.fund_count(), 1);
+    }
+
+    /// A funding intent that cannot be persisted stops the funding, and returns the payment.
+    ///
+    /// Broadcasting anyway would put coins into an HTLC that no restart can find, and the marker
+    /// is the only thing that would have pointed at them. Nothing is on the wire at that point,
+    /// so the client's held payment is cancelled rather than left waiting on a swap that will
+    /// never happen.
+    #[tokio::test]
+    async fn funding_stops_when_its_intent_cannot_be_recorded() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, _) = swap_with_claim(&ln).await;
+        // The claim is scripted so that a driver which funds anyway still terminates: this test
+        // is about the funding not happening, and a hang would say that far less clearly.
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spend(claim_tx);
+        let wallet = CountingWallet::new();
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &UnwritableSink,
+        )
+        .await
+        .unwrap();
+
+        match &final_state {
+            SwapState::Failed(why) => assert!(why.contains("disk full"), "got: {why}"),
+            other => panic!("expected a failed swap, got {other:?}"),
+        }
+        assert_eq!(
+            wallet.fund_count(),
+            0,
+            "nothing may be broadcast once the marker has failed to write"
+        );
+        assert!(
+            *ln.cancelled.lock().unwrap(),
+            "the client's held payment is returned, since nothing was ever committed"
+        );
+    }
+
+    /// An empty chain is not proof that the broadcast never happened.
+    ///
+    /// One Electrum server that is behind, re-indexing, or simply a different server from the one
+    /// the funding was broadcast through answers "nothing pays this script" for a funding that
+    /// exists. Funding again on that answer is the loss this whole path exists to avoid, so the
+    /// driver waits instead, and gives up only when the swap's own timeout arrives.
+    #[tokio::test]
+    async fn a_recorded_funding_that_never_appears_expires_rather_than_funding_again() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, _, _) = swap_with_claim(&ln).await;
+        // Nothing on chain, ever, and the tip is already past the swap's timeout so the watch
+        // gives up on its first pass.
+        let chain = MockChain::new().always_final().with_tip(TIMEOUT);
+        let wallet = CountingWallet::new();
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume {
+                funding: None,
+                funding_intent_at_height: Some(MOCK_TIP),
+                our_spends: Vec::new(),
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Expired);
+        assert_eq!(wallet.fund_count(), 0, "never fund on a recorded intent");
+        assert!(
+            *ln.cancelled.lock().unwrap(),
+            "giving up returns the client's payment in full"
+        );
+    }
+
+    /// A wallet whose funding call fails after the transaction is already on the wire.
+    ///
+    /// Both real wallets can do this: a lost gRPC response, a reply that will not decode. The
+    /// money has moved and the caller cannot tell, so this must take the same route as a crash in
+    /// the same place, not end the swap.
+    struct LosesTheResponseWallet {
+        refund_spk: ScriptBuf,
+        calls: Mutex<u32>,
+    }
+    impl OnchainWallet for LosesTheResponseWallet {
+        fn fund_htlc(
+            &self,
+            _htlc_spk: &ScriptBuf,
+            _amount_sat: u64,
+        ) -> swap_common::Result<OutPoint> {
+            *self.calls.lock().unwrap() += 1;
+            Err(swap_common::SwapError::Other("lost the response".into()))
+        }
+        fn receive_destination(&self) -> ScriptBuf {
+            self.refund_spk.clone()
+        }
+    }
+
+    /// A funding whose outcome is unknown is watched for, not retried and not abandoned.
+    ///
+    /// Returning an error here used to end the swap: the error is not transient, so the driver
+    /// marked the record terminal, `load_active` skipped it forever, and a funded HTLC was left
+    /// with no refund and an open hold invoice.
+    #[tokio::test]
+    async fn a_funding_whose_outcome_is_unknown_is_watched_for() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, preimage) = swap_with_claim(&ln).await;
+        // The funding did land, and the client claimed it, which is what the watch will find.
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spend(claim_tx);
+        let wallet = LosesTheResponseWallet {
+            refund_spk: dest(),
+            calls: Mutex::new(0),
+        };
+
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Claimed);
+        assert_eq!(
+            *wallet.calls.lock().unwrap(),
+            1,
+            "asked to fund exactly once"
+        );
+        assert_eq!(
+            *ln.settled_preimage.lock().unwrap(),
+            Some(preimage),
+            "the funding it could not confirm was found and settled from"
+        );
     }
 
     #[tokio::test]
@@ -980,7 +1527,11 @@ mod tests {
             &swap,
             2,
             Duration::from_millis(0),
-            Some(outpoint), // resumed: funding already known
+            // resumed: funding already known
+            &Resume {
+                funding: Some(outpoint),
+                ..Default::default()
+            },
             &(),
         )
         .await
