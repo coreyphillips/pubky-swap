@@ -347,7 +347,7 @@ async fn paying_extracts_the_preimage_and_converts_the_fee() {
 
     let result = backend(&server)
         .await
-        .pay_invoice("lnbcrt1", 999)
+        .pay_invoice("lnbcrt1", 999, None)
         .await
         .unwrap();
     assert_eq!(hex::encode(result.preimage), PREIMAGE);
@@ -380,7 +380,7 @@ async fn a_missing_preimage_is_recovered_from_the_proof() {
 
     let result = backend(&server)
         .await
-        .pay_invoice("lnbcrt1", 10_000)
+        .pay_invoice("lnbcrt1", 10_000, None)
         .await
         .unwrap();
     assert_eq!(hex::encode(result.preimage), PREIMAGE);
@@ -404,7 +404,7 @@ async fn refuses_an_amountless_invoice() {
 
     assert!(backend(&server)
         .await
-        .pay_invoice("lnbcrt1", 10_000)
+        .pay_invoice("lnbcrt1", 10_000, None)
         .await
         .is_err());
 }

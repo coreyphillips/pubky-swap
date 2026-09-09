@@ -160,7 +160,8 @@ async fn full_submarine_swap_two_nodes() {
         required_confirmations: 1,
         ..TimelockParams::default()
     };
-    let timeout = chain_p.tip_height().unwrap() + timelock.htlc_timeout_blocks;
+    let tip = chain_p.tip_height().unwrap();
+    let timeout = tip + timelock.htlc_timeout_blocks;
 
     // Provider: decode the invoice and build the HTLC the client must fund.
     let swap = init_submarine_swap(
@@ -169,9 +170,11 @@ async fn full_submarine_swap_two_nodes() {
         &client_refund_pk,
         provider_claim_sk,
         &provider_claim_pk,
+        AMOUNT_SAT,
         PROVIDER_FEE_SAT,
         2,
         100_000,
+        tip,
         timeout,
         Network::Regtest,
         timelock,

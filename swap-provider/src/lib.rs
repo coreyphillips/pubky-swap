@@ -705,15 +705,26 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         if !p.can_serve_reverse_swaps() && config.directions.contains(&SwapDirection::Reverse) {
             warn!(
                 "this beignet cannot set a hold invoice's final CLTV expiry, so reverse swaps \
-                 will not be advertised (see beignet#744). Submarine swaps are unaffected."
+                 will not be advertised (see beignet#744)."
             );
             config.directions.retain(|d| *d != SwapDirection::Reverse);
-            if config.directions.is_empty() {
-                return Err(anyhow!(
-                    "reverse swaps are the only configured direction, and this beignet cannot \
-                     serve them safely; configure submarine swaps or use an LND backend"
-                ));
-            }
+        }
+        // A submarine provider pays first and claims second, so the only thing keeping the
+        // Lightning leg from outliving the on-chain one is a bound on the payment's total CLTV
+        // expiry. Without it a client can hold the payment past its own refund height, take its
+        // coins back on chain, and settle afterwards.
+        if !p.can_serve_submarine_swaps() && config.directions.contains(&SwapDirection::Submarine) {
+            warn!(
+                "this beignet cannot bound a payment's total CLTV expiry, so submarine swaps \
+                 will not be advertised (see beignet#751)."
+            );
+            config.directions.retain(|d| *d != SwapDirection::Submarine);
+        }
+        if config.directions.is_empty() {
+            return Err(anyhow!(
+                "this beignet cannot serve either configured direction safely; use an LND \
+                 backend, or upgrade beignet"
+            ));
         }
     }
     let _ = &beignet;
@@ -1460,9 +1471,11 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         &client_refund_pk,
         claim_sk,
         &claim_pk,
+        quote.amount_sat,
         quote.fee_sat,
         ctx.onchain_fee_rate_sat_vb,
         ctx.max_routing_fee_msat,
+        tip,
         timeout_height,
         ctx.network,
         ctx.timelock,

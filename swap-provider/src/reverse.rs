@@ -686,6 +686,7 @@ mod tests {
             &self,
             _bolt11: &str,
             _max_fee_msat: u64,
+            _cltv_limit: Option<u32>,
         ) -> lightning_backend::Result<PaymentResult> {
             Err(LightningError::NotImplemented("mock".into()))
         }
