@@ -214,7 +214,22 @@ pub trait LightningBackend: Send + Sync {
     async fn cancel_hold_invoice(&self, payment_hash: [u8; 32]) -> Result<()>;
 
     /// Pay a BOLT11 invoice, returning the preimage on success.
-    async fn pay_invoice(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentResult>;
+    /// Pay a BOLT11 invoice, returning the preimage.
+    ///
+    /// `cltv_limit` bounds how far above the current tip the outgoing HTLC may expire. It is not
+    /// a preference: the payee chooses when to settle, up to that height, so it is the height
+    /// past which a swap's on-chain leg can no longer be rescued. A submarine provider passes the
+    /// budget its own claim window leaves; a client paying a hold invoice passes `None`, because
+    /// there the invoice is *meant* to be held.
+    ///
+    /// Implementations must either enforce the limit or fail. Paying anyway and hoping the route
+    /// is short is how a provider loses the on-chain leg to a payee that settles late.
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+        cltv_limit: Option<u32>,
+    ) -> Result<PaymentResult>;
 
     /// What the node knows about an outbound payment for `payment_hash`.
     ///
@@ -277,7 +292,12 @@ impl LightningBackend for StubBackend {
     async fn cancel_hold_invoice(&self, _payment_hash: [u8; 32]) -> Result<()> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
-    async fn pay_invoice(&self, _bolt11: &str, _max_fee_msat: u64) -> Result<PaymentResult> {
+    async fn pay_invoice(
+        &self,
+        _bolt11: &str,
+        _max_fee_msat: u64,
+        _cltv_limit: Option<u32>,
+    ) -> Result<PaymentResult> {
         Err(LightningError::NotImplemented(STUB.into()))
     }
     async fn payment_status(&self, _payment_hash: [u8; 32]) -> Result<PaymentStatus> {

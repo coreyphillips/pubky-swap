@@ -291,7 +291,12 @@ impl LightningBackend for LndBackend {
         Ok(())
     }
 
-    async fn pay_invoice(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentResult> {
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+        cltv_limit: Option<u32>,
+    ) -> Result<PaymentResult> {
         let mut client = self.client.lock().await;
         // routerrpc.SendPaymentV2 streams payment updates until a terminal status.
         let mut stream = client
@@ -302,6 +307,15 @@ impl LightningBackend for LndBackend {
                 // claim reveals the preimage and the provider settles.
                 timeout_seconds: 300,
                 fee_limit_msat: to_i64(max_fee_msat, "max_fee_msat")?,
+                // Zero leaves LND's own `--max-cltv-expiry` in charge, which defaults to 2016
+                // blocks: far past any swap's on-chain timeout, and therefore far past the point
+                // where a payee settling late costs the sender the on-chain leg.
+                cltv_limit: match cltv_limit {
+                    Some(limit) => i32::try_from(limit).map_err(|_| {
+                        LightningError::Backend(format!("cltv limit {limit} is out of range"))
+                    })?,
+                    None => 0,
+                },
                 ..Default::default()
             })
             .await

@@ -64,9 +64,14 @@ pub async fn init_submarine_swap(
     client_refund_pubkey: &PublicKey,
     provider_claim_key: SecretKey,
     provider_claim_pubkey: &PublicKey,
+    // What the quote said this swap is for. The invoice is the client's own document and its
+    // amount is what actually gets locked and paid, so the two have to agree before either is
+    // used for anything.
+    quoted_amount_sat: u64,
     provider_fee_sat: u64,
     fee_rate_sat_vb: u64,
     max_routing_fee_msat: u64,
+    tip: u32,
     timeout_height: u32,
     network: Network,
     timelock: TimelockParams,
@@ -91,6 +96,30 @@ pub async fn init_submarine_swap(
         ));
     }
     let invoice_amount_sat = decoded.amount_msat / 1000;
+    // The quote is what was priced, rate-limited and reserved against the risk limits; the
+    // invoice is what the swap actually runs on. Nothing compared them, so a peer could take a
+    // quote for the 10,000 sat minimum and hand back an invoice for five million: the fee was
+    // charged on the small number and the exposure was booked on it too, while the provider
+    // committed to paying the large one.
+    if invoice_amount_sat != quoted_amount_sat {
+        return Err(anyhow!(
+            "the client's invoice is for {invoice_amount_sat} sat but the quote is for \
+             {quoted_amount_sat} sat"
+        ));
+    }
+    // The outgoing Lightning HTLC has to end early enough to still claim on chain afterwards.
+    // This refuses an invoice that could never fit before a payment is attempted; the `cltv_limit`
+    // on the payment itself is what enforces it against the route.
+    if let Err(violation) = timelock::check_submarine_invoice_cltv(
+        tip,
+        timeout_height,
+        decoded.min_final_cltv_expiry,
+        &timelock,
+    ) {
+        return Err(anyhow!(
+            "the client's invoice demands too much final CLTV: {violation}"
+        ));
+    }
     let onchain_amount_sat = invoice_amount_sat
         .checked_add(provider_fee_sat)
         .ok_or_else(|| {
@@ -120,6 +149,13 @@ pub async fn init_submarine_swap(
         timelock,
     })
 }
+
+/// How many times a driver asks the node about a payment before handing control back.
+///
+/// Waiting in place is cheap (one call per poll); handing back re-runs the funding lookup, the
+/// spend lookup and the reorg guard as well. Coming back around periodically is still worth it,
+/// because those are the checks that notice a reorg underneath a payment that is taking its time.
+const PAYMENT_POLL_ITERATIONS: u32 = 30;
 
 /// Drive a submarine swap to a terminal [`SwapState`].
 ///
@@ -263,57 +299,94 @@ pub async fn drive_submarine_swap(
     //    whether a payment went out, and the two possibilities want opposite actions: paying
     //    again risks paying twice, while assuming it was paid abandons an HTLC we have already
     //    bought. The node knows, so ask it.
-    let payment = match ln
-        .payment_status(swap.payment_hash)
-        .await
-        .map_err(|e| anyhow!("payment status: {e}"))?
-    {
-        PaymentStatus::Succeeded(p) => {
-            info!("Submarine swap: the invoice was already paid; proceeding to the claim");
-            progress.invoice_paid();
-            p
-        }
-        PaymentStatus::InFlight => {
-            // Wait it out rather than launching a second attempt. The claim-window gate above
-            // bounds how long this can go on.
-            info!("Submarine swap: a payment is already in flight; waiting for it to settle");
-            sleep(poll).await;
-            return Ok(SwapState::InvoicePending);
-        }
-        PaymentStatus::Failed(reason) => {
-            warn!("Submarine swap: the invoice payment failed permanently: {reason}");
-            return Ok(SwapState::Failed(format!(
-                "invoice payment failed: {reason}"
-            )));
-        }
-        PaymentStatus::Unknown => {
-            if resume.funding.is_some() && already_attempted_payment {
-                // We recorded an intent to pay and the node has no record of it. Do not assume
-                // either way: keep polling. Paying again could pay twice; giving up would
-                // abandon an HTLC we may already have bought.
-                warn!(
-                    "Submarine swap: a payment was started but the node has no record of it; \
-                     polling rather than paying again"
-                );
+    // A payment that is in flight, or that the node cannot account for, is waited on here rather
+    // than by returning and having the whole driver re-enter. Handing back meant re-running the
+    // funding lookup, the spend lookup and the reorg guard on every two-second poll, which is
+    // several chain calls per swap per poll against a single Electrum server. Bounded, so the
+    // driver still comes back around periodically and re-checks everything it skipped.
+    let mut payment = None;
+    for _ in 0..PAYMENT_POLL_ITERATIONS {
+        match ln
+            .payment_status(swap.payment_hash)
+            .await
+            .map_err(|e| anyhow!("payment status: {e}"))?
+        {
+            PaymentStatus::Succeeded(p) => {
+                info!("Submarine swap: the invoice was already paid; proceeding to the claim");
+                progress.invoice_paid();
+                payment = Some(p);
+                break;
+            }
+            PaymentStatus::InFlight => {
+                // Wait it out rather than launching a second attempt. The claim-window gate above
+                // bounds how long this can go on.
+                info!("Submarine swap: a payment is already in flight; waiting for it to settle");
                 sleep(poll).await;
-                return Ok(SwapState::InvoicePending);
             }
-            // Record the intent before the irreversible call.
-            progress.invoice_pay_started()?;
-            match ln
-                .pay_invoice(&swap.invoice, swap.max_routing_fee_msat)
-                .await
-            {
-                Ok(p) => {
-                    progress.invoice_paid();
-                    p
+            PaymentStatus::Failed(reason) => {
+                warn!("Submarine swap: the invoice payment failed permanently: {reason}");
+                return Ok(SwapState::Failed(format!(
+                    "invoice payment failed: {reason}"
+                )));
+            }
+            PaymentStatus::Unknown => {
+                if resume.funding.is_some() && already_attempted_payment {
+                    // We recorded an intent to pay and the node has no record of it. Do not assume
+                    // either way: keep polling. Paying again could pay twice; giving up would
+                    // abandon an HTLC we may already have bought.
+                    warn!(
+                        "Submarine swap: a payment was started but the node has no record of it; \
+                         polling rather than paying again"
+                    );
+                    sleep(poll).await;
+                    continue;
                 }
-                Err(e) => {
-                    warn!("Submarine swap: invoice payment failed: {e}");
-                    return Ok(SwapState::Failed(format!("invoice payment failed: {e}")));
+
+                // Bound how far out the outgoing HTLC may expire, and refuse if there is no room
+                // for one at all.
+                //
+                // This is the half of the swap that has no on-chain guard. The payee decides when
+                // to settle, any time up to that expiry, and settling is what reveals the preimage
+                // this side needs to claim. Left unbounded, LND applies its own
+                // `--max-cltv-expiry`, 2016 blocks by default: many times any swap's on-chain
+                // timeout. A client that holds the payment until after its own refund branch
+                // opens takes its coins back on chain and then settles, collecting both legs.
+                let Some(cltv_limit) =
+                    timelock::submarine_cltv_budget(tip, swap.timeout_height, &swap.timelock)
+                else {
+                    warn!(
+                        "Submarine swap: no room to pay the invoice and still claim before the \
+                         client's refund opens at {}; not paying",
+                        swap.timeout_height
+                    );
+                    return Ok(SwapState::Failed(
+                        "no CLTV budget left to pay the invoice safely".into(),
+                    ));
+                };
+
+                // Record the intent before the irreversible call.
+                progress.invoice_pay_started()?;
+                match ln
+                    .pay_invoice(&swap.invoice, swap.max_routing_fee_msat, Some(cltv_limit))
+                    .await
+                {
+                    Ok(p) => {
+                        progress.invoice_paid();
+                        payment = Some(p);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Submarine swap: invoice payment failed: {e}");
+                        return Ok(SwapState::Failed(format!("invoice payment failed: {e}")));
+                    }
                 }
             }
         }
+    }
+    let Some(payment) = payment else {
+        // Still unresolved after the in-place budget. Hand back so the driver re-enters and
+        // re-checks the chain state it has not looked at while waiting.
+        return Ok(SwapState::InvoicePending);
     };
 
     // Defensive: the preimage from the payment must match the HTLC's hashlock.
@@ -448,6 +521,10 @@ mod tests {
         paid: Mutex<bool>,
         /// What the "node" reports about the payment, so a test can model a resumed driver.
         status: Mutex<lightning_backend::PaymentStatus>,
+        /// The CLTV bound the driver asked for, which is what stops a payee settling late.
+        cltv_limit: Mutex<Option<u32>>,
+        /// The final CLTV the decoded invoice demands.
+        min_final_cltv_expiry: u32,
     }
     impl MockLn {
         fn new(payment_hash: [u8; 32], pay_preimage: Option<[u8; 32]>) -> Self {
@@ -456,7 +533,14 @@ mod tests {
                 pay_preimage,
                 paid: Mutex::new(false),
                 status: Mutex::new(lightning_backend::PaymentStatus::Unknown),
+                cltv_limit: Mutex::new(None),
+                min_final_cltv_expiry: 80,
             }
+        }
+        /// Decode to an invoice demanding this much final CLTV.
+        fn with_min_final_cltv(mut self, blocks: u32) -> Self {
+            self.min_final_cltv_expiry = blocks;
+            self
         }
         /// Report this payment status, as a node that already knows about the payment would.
         fn with_status(self, status: lightning_backend::PaymentStatus) -> Self {
@@ -504,7 +588,9 @@ mod tests {
             &self,
             _bolt11: &str,
             _max_fee_msat: u64,
+            cltv_limit: Option<u32>,
         ) -> lightning_backend::Result<PaymentResult> {
+            *self.cltv_limit.lock().unwrap() = cltv_limit;
             *self.paid.lock().unwrap() = true;
             match self.pay_preimage {
                 Some(preimage) => Ok(PaymentResult {
@@ -524,7 +610,7 @@ mod tests {
             Ok(DecodedInvoice {
                 payment_hash: self.payment_hash,
                 amount_msat: INVOICE_SAT * 1000,
-                min_final_cltv_expiry: 80,
+                min_final_cltv_expiry: self.min_final_cltv_expiry,
                 amount_is_explicit: true,
                 expires_at_unix: 0,
             })
@@ -546,6 +632,127 @@ mod tests {
     }
 
     /// The timelock model the tests run under.
+    /// The invoice a client hands over is the client's document, and the amount on it is what
+    /// actually gets locked on chain and paid over Lightning. Nothing compared it to the quote,
+    /// so a peer could take a quote for the minimum and hand back an invoice for a hundred times
+    /// that: the fee was charged on the small number, the risk limits booked the small number,
+    /// and the provider committed to the large one.
+    #[tokio::test]
+    async fn an_invoice_that_does_not_match_the_quote_is_refused() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_refund_sk, refund_pk) = random_keypair(&secp);
+        let ln = MockLn::new([9u8; 32], None);
+
+        let err = init_submarine_swap(
+            &ln,
+            "lnbcrt-mock",
+            &refund_pk,
+            claim_sk,
+            &claim_pk,
+            // Quoted for a tenth of what the invoice asks for.
+            INVOICE_SAT / 10,
+            FEE_SAT,
+            5,
+            5_000,
+            MOCK_TIP,
+            TIMEOUT,
+            Network::Regtest,
+            params(),
+        )
+        .await;
+        let err = match err {
+            Err(e) => e,
+            // `SubmarineSwap` deliberately has no `Debug`: it holds the provider's claim key.
+            Ok(_) => panic!("an invoice that does not match the quote must be refused"),
+        };
+        assert!(
+            err.to_string().contains("but the quote is for"),
+            "got: {err}"
+        );
+    }
+
+    /// The submarine theft condition, and the mirror of the one fixed in #9.
+    ///
+    /// The provider pays first and claims second, so its outgoing HTLC has to end early enough
+    /// to still claim on chain afterwards. An invoice demanding a final CLTV past that point
+    /// lets the payee hold the payment until its own refund branch opens, take its coins back on
+    /// chain, and settle afterwards: both legs, one payer.
+    #[tokio::test]
+    async fn an_invoice_demanding_too_much_final_cltv_is_refused() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_refund_sk, refund_pk) = random_keypair(&secp);
+        // The mock decodes to a final CLTV of 80 blocks by default, which fits. Ask for one that
+        // reaches past the on-chain timeout.
+        let ln = MockLn::new([9u8; 32], None).with_min_final_cltv(TIMEOUT - MOCK_TIP);
+
+        let err = init_submarine_swap(
+            &ln,
+            "lnbcrt-mock",
+            &refund_pk,
+            claim_sk,
+            &claim_pk,
+            INVOICE_SAT,
+            FEE_SAT,
+            5,
+            5_000,
+            MOCK_TIP,
+            TIMEOUT,
+            Network::Regtest,
+            params(),
+        )
+        .await;
+        let err = match err {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("an invoice whose final CLTV outlives the on-chain leg must be refused")
+            }
+        };
+        assert!(
+            err.to_string().contains("too much final CLTV"),
+            "got: {err}"
+        );
+    }
+
+    /// And the payment itself carries the bound, because the invoice's own demand is only the
+    /// floor: the route adds its deltas on top, and nothing else stops them.
+    #[tokio::test]
+    async fn the_payment_is_bounded_by_the_claim_window() {
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let ln = MockLn::new(ph, Some(preimage));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: ONCHAIN_SAT,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume::default(),
+            false,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        let limit = ln.cltv_limit.lock().unwrap().expect("a bound must be set");
+        // Everything from the tip to the client's refund height, less the window needed to get a
+        // claim confirmed once the preimage is known.
+        assert_eq!(limit, TIMEOUT - MOCK_TIP - params().min_claim_window_blocks);
+    }
+
     fn params() -> TimelockParams {
         TimelockParams {
             htlc_timeout_blocks: TIMEOUT - MOCK_TIP,
@@ -577,9 +784,11 @@ mod tests {
             &refund_pk,
             claim_sk,
             &claim_pk,
+            INVOICE_SAT,
             FEE_SAT,
             5,
             5_000,
+            MOCK_TIP,
             TIMEOUT,
             Network::Regtest,
             params(),

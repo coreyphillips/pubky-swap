@@ -119,7 +119,11 @@ pub async fn execute_reverse_swap(
         let pay_ln = ln.clone();
         let invoice = claim.invoice.clone();
         Some(tokio::spawn(async move {
-            pay_ln.pay_invoice(&invoice, max_routing_fee_msat).await
+            // No CLTV bound: a hold invoice is meant to be held, and the client's protection is
+            // the on-chain claim it is about to make rather than an early expiry.
+            pay_ln
+                .pay_invoice(&invoice, max_routing_fee_msat, None)
+                .await
         }))
     };
 
@@ -340,7 +344,12 @@ mod tests {
         async fn cancel_hold_invoice(&self, _: [u8; 32]) -> lightning_backend::Result<()> {
             Err(LightningError::NotImplemented("mock".into()))
         }
-        async fn pay_invoice(&self, _: &str, _: u64) -> lightning_backend::Result<PaymentResult> {
+        async fn pay_invoice(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u32>,
+        ) -> lightning_backend::Result<PaymentResult> {
             *self.pay_calls.lock().unwrap() += 1;
             // Simulate the hold invoice eventually settling.
             Ok(PaymentResult {

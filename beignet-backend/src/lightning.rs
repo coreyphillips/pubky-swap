@@ -261,7 +261,22 @@ impl LightningBackend for BeignetLightningBackend {
         }
     }
 
-    async fn pay_invoice(&self, bolt11: &str, max_fee_msat: u64) -> Result<PaymentResult> {
+    async fn pay_invoice(
+        &self,
+        bolt11: &str,
+        max_fee_msat: u64,
+        cltv_limit: Option<u32>,
+    ) -> Result<PaymentResult> {
+        // `POST /invoice/pay` takes bolt11, an amount, a fee cap and a timeout, and nothing that
+        // bounds the outgoing HTLC's expiry. A caller that asks for a bound is asking because
+        // exceeding it loses money, so the honest answer is to refuse rather than to pay and
+        // hope the route is short. Filed upstream as beignet#751.
+        if let Some(limit) = cltv_limit {
+            return Err(LightningError::NotImplemented(format!(
+                "beignet cannot bound a payment's total CLTV expiry (needed: {limit} blocks), so \
+                 it cannot serve submarine swaps safely. See beignet#751."
+            )));
+        }
         let decoded = self.decode_invoice(bolt11).await?;
         if !decoded.amount_is_explicit {
             return Err(LightningError::PaymentFailed(

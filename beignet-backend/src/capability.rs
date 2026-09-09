@@ -24,6 +24,12 @@ pub struct Preflight {
     /// Without it a reverse swap cannot be made safe, so a provider drops that direction from its
     /// offer rather than advertising something it cannot honour (beignet#744).
     pub hold_invoice_supports_final_cltv: bool,
+    /// Whether `POST /invoice/pay` accepts a bound on the payment's total CLTV expiry.
+    ///
+    /// Without it a submarine swap cannot be made safe: the payee chooses when to settle, up to
+    /// whatever expiry the route happened to produce, and a payee that settles after its own
+    /// on-chain refund opens collects both legs (beignet#751).
+    pub pay_supports_cltv_limit: bool,
     /// Whether beignet's own reverse-swap provider role is switched on.
     pub swaps_role_enabled: bool,
     /// A combined daily spend limit, if the operator set one.
@@ -72,29 +78,43 @@ pub async fn probe(http: &BeignetHttp) -> Result<Preflight, BeignetError> {
         network_str: info.network,
         healthy,
         onchain_balance_sat,
-        hold_invoice_supports_final_cltv: hold_invoice_cltv_supported(http).await,
+        hold_invoice_supports_final_cltv: request_field_supported(
+            http,
+            "/paths/~1invoice~1create-hold/post/requestBody/content/application~1json/schema/properties",
+            "minFinalCltvExpiry",
+        )
+        .await,
+        pay_supports_cltv_limit: request_field_supported(
+            http,
+            "/paths/~1invoice~1pay/post/requestBody/content/application~1json/schema/properties",
+            "cltvLimit",
+        )
+        .await,
         swaps_role_enabled,
         daily_spend_limit_sat: spend.as_ref().and_then(|s| s.limit_sats),
         daily_spend_remaining_sat: spend.and_then(|s| s.remaining_sats),
     })
 }
 
-/// Read the daemon's own OpenAPI document to see whether create-hold takes a CLTV parameter.
+/// Read the daemon's own OpenAPI document to see whether a route accepts a given request field.
 ///
 /// Asking the daemon what it supports beats pinning a version: an operator can be running
-/// anything, and this answers for the daemon actually in front of us.
-async fn hold_invoice_cltv_supported(http: &BeignetHttp) -> bool {
+/// anything, and this answers for the daemon actually in front of us. An unreadable document
+/// answers "no", which is the direction that refuses a swap rather than serving one unsafely.
+async fn request_field_supported(
+    http: &BeignetHttp,
+    properties_pointer: &str,
+    field: &str,
+) -> bool {
     let spec: serde_json::Value = match http.get("/openapi.json").await {
         Ok(v) => v,
         Err(e) => {
-            warn!("could not read beignet's OpenAPI document ({e}); assuming the hold-invoice CLTV parameter is absent");
+            warn!("could not read beignet's OpenAPI document ({e}); assuming {field} is absent");
             return false;
         }
     };
-    let body = spec
-        .pointer("/paths/~1invoice~1create-hold/post/requestBody/content/application~1json/schema/properties");
-    match body {
-        Some(props) => props.get("minFinalCltvExpiry").is_some(),
+    match spec.pointer(properties_pointer) {
+        Some(props) => props.get(field).is_some(),
         None => false,
     }
 }
@@ -103,6 +123,11 @@ impl Preflight {
     /// Whether this daemon can safely serve reverse swaps.
     pub fn can_serve_reverse_swaps(&self) -> bool {
         self.hold_invoice_supports_final_cltv
+    }
+
+    /// Whether this daemon can safely serve submarine swaps.
+    pub fn can_serve_submarine_swaps(&self) -> bool {
+        self.pay_supports_cltv_limit
     }
 
     /// Report what was found, at the right severity.

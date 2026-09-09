@@ -111,6 +111,15 @@ pub enum TimelockViolation {
     /// Too few blocks remain before the counterparty's refund branch opens to risk an
     /// irreversible act.
     ClaimWindowTooShort { tip: u32, timeout: u32, need: u32 },
+    /// Our *outgoing* Lightning HTLC could outlive the on-chain leg it is paying for. This is
+    /// the submarine-swap theft condition, and the mirror of `LnExpiryTooEarly`: a payee that
+    /// holds the payment until after the on-chain refund opens can take its coins back on chain
+    /// and *then* settle, collecting both legs.
+    LnExpiryTooLate {
+        ln_expiry: u32,
+        onchain_timeout: u32,
+        latest: u32,
+    },
     /// The counterparty proposed a timeout further out than we will lock capital for.
     TimeoutTooFar { timeout: u32, tip: u32, max: u32 },
     /// The proposed timeout is already at or behind the tip.
@@ -132,6 +141,16 @@ impl fmt::Display for TimelockViolation {
                 f,
                 "lightning HTLC expires at height {ln_expiry} but the on-chain HTLC refunds at \
                  {onchain_timeout}; the lightning leg must survive to at least {need}"
+            ),
+            Self::LnExpiryTooLate {
+                ln_expiry,
+                onchain_timeout,
+                latest,
+            } => write!(
+                f,
+                "the outgoing lightning HTLC could expire as late as {ln_expiry}, but the \
+                 on-chain HTLC refunds at {onchain_timeout}; it must end by {latest} to leave \
+                 room to claim"
             ),
             Self::ClaimWindowTooShort { tip, timeout, need } => write!(
                 f,
@@ -253,6 +272,51 @@ pub fn check_submarine_before_pay(
             tip,
             timeout: timeout_height,
             need: p.min_claim_window_blocks,
+        });
+    }
+    Ok(())
+}
+
+/// The furthest out a submarine provider's outgoing Lightning HTLC may expire.
+///
+/// The payee decides when to settle, any time up to that height, and settling is what reveals the
+/// preimage the provider needs to claim on chain. So the Lightning leg has to end early enough
+/// that a claim still fits before the client's refund branch opens. Everything after that point
+/// belongs to the client: they refund on chain, then settle, and the provider has paid for
+/// nothing.
+///
+/// Returns `None` if there is no room at all, which is itself a refusal.
+pub fn submarine_cltv_budget(tip: u32, timeout_height: u32, p: &TimelockParams) -> Option<u32> {
+    timeout_height
+        .checked_sub(tip)?
+        .checked_sub(p.min_claim_window_blocks)
+        .filter(|budget| *budget > 0)
+}
+
+/// Gate on the client's invoice before a submarine provider commits to paying it.
+///
+/// `min_final_cltv_expiry` is the payee's own demand, and only the floor of what the outgoing
+/// HTLC will carry: the route adds its own deltas on top. Both are bounded by the `cltv_limit`
+/// the payment is sent with, which is what actually enforces this; refusing here means a request
+/// that could never fit is turned down before a payment is attempted rather than after.
+pub fn check_submarine_invoice_cltv(
+    tip: u32,
+    timeout_height: u32,
+    min_final_cltv_expiry: u32,
+    p: &TimelockParams,
+) -> Result<(), TimelockViolation> {
+    let budget = submarine_cltv_budget(tip, timeout_height, p).ok_or(
+        TimelockViolation::ClaimWindowTooShort {
+            tip,
+            timeout: timeout_height,
+            need: p.min_claim_window_blocks,
+        },
+    )?;
+    if min_final_cltv_expiry >= budget {
+        return Err(TimelockViolation::LnExpiryTooLate {
+            ln_expiry: tip.saturating_add(min_final_cltv_expiry),
+            onchain_timeout: timeout_height,
+            latest: tip.saturating_add(budget),
         });
     }
     Ok(())

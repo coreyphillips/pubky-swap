@@ -375,7 +375,12 @@ mod tests {
         async fn cancel_hold_invoice(&self, _: [u8; 32]) -> lightning_backend::Result<()> {
             Err(LightningError::NotImplemented("mock".into()))
         }
-        async fn pay_invoice(&self, _: &str, _: u64) -> lightning_backend::Result<PaymentResult> {
+        async fn pay_invoice(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u32>,
+        ) -> lightning_backend::Result<PaymentResult> {
             Err(LightningError::NotImplemented("mock".into()))
         }
         async fn payment_status(
