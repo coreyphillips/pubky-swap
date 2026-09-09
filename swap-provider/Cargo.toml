@@ -50,8 +50,10 @@ tower-http = { version = "0.6", features = ["set-header"], optional = true }
 swap-common = { workspace = true, features = ["test-util"] }
 # Needed to implement the async LightningBackend trait for test mocks.
 async-trait.workspace = true
-# Needed by integration tests to name these crates directly.
-bitcoin.workspace = true
+# Needed by integration tests to name these crates directly. The `bitcoinconsensus` feature
+# enables `Transaction::verify`, so a driver test can check that a claim it built is actually
+# valid against the output it spends, rather than only that a claim was broadcast.
+bitcoin = { version = "0.32", features = ["bitcoinconsensus"] }
 lightning-backend.workspace = true
 swap-client.workspace = true
 tokio.workspace = true

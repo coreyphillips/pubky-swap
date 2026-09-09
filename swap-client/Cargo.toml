@@ -42,3 +42,6 @@ rand.workspace = true
 # The scriptable ChainWatcher used by the unit tests.
 swap-common = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
+# `bitcoinconsensus` enables `Transaction::verify`, so a driver test can check that a claim it
+# built is valid against the output it spends, not merely that one was broadcast.
+bitcoin = { version = "0.32", features = ["bitcoinconsensus"] }

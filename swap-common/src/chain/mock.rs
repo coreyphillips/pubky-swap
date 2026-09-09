@@ -38,6 +38,13 @@ pub struct MockChain {
     broadcasts: Mutex<Vec<Transaction>>,
     /// When set, every broadcast after the first fails, to exercise the CPFP fallback.
     reject_replacements: Mutex<bool>,
+    /// Consumed one entry per `tip_height` call, the last repeating. Empty means `tip` is fixed.
+    ///
+    /// Blocks arrive while a driver runs, and some of what a driver decides depends on where the
+    /// tip is *at that moment*: whether there is still a window to act in, and whether a timeout
+    /// has passed. A fixed tip can only model one of those per test.
+    tips: Mutex<Vec<u32>>,
+    tip_idx: Mutex<usize>,
 }
 
 impl MockChain {
@@ -74,6 +81,15 @@ impl MockChain {
 
     pub fn with_spend(self, tx: Transaction) -> Self {
         *self.spend.lock().unwrap() = Some(tx);
+        self
+    }
+
+    /// Script the tip, one height per `tip_height` call, the last repeating.
+    ///
+    /// Use it when a driver has to see the chain advance: funding while the window is open and
+    /// then reaching the timeout, for instance, which is two different answers to the same call.
+    pub fn with_tips(self, seq: Vec<u32>) -> Self {
+        *self.tips.lock().unwrap() = seq;
         self
     }
 
@@ -126,7 +142,14 @@ impl MockChain {
 
 impl ChainWatcher for MockChain {
     fn tip_height(&self) -> Result<u32> {
-        Ok(*self.tip.lock().unwrap())
+        let tips = self.tips.lock().unwrap();
+        if tips.is_empty() {
+            return Ok(*self.tip.lock().unwrap());
+        }
+        let mut idx = self.tip_idx.lock().unwrap();
+        let height = tips[(*idx).min(tips.len() - 1)];
+        *idx += 1;
+        Ok(height)
     }
 
     fn find_funding(&self, _spk: &Script, expected_value_sat: u64) -> Result<Option<FundingUtxo>> {

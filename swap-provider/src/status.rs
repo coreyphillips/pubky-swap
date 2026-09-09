@@ -72,13 +72,32 @@ fn load_or_create_token(data_dir: &str) -> Result<String> {
     let token = hex::encode(swap_common::htlc::generate_preimage());
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("create the data directory {data_dir}"))?;
-    std::fs::write(&path, &token).with_context(|| format!("write {path:?}"))?;
-    #[cfg(unix)]
+    // Created 0600 and renamed into place, so the token never exists at any other mode.
+    //
+    // It used to be `fs::write` followed by a chmod. `fs::write` follows the umask, 0022 on a
+    // default install, so the token sat at 0644 for the window between the two calls, and it is
+    // the credential for the whole status API. Writing a temp file that is created with the mode
+    // and renaming over the target closes the window and needs no chmod: a rename does not change
+    // the mode, so there is no moment at which a wrong one is visible.
+    //
+    // The rename also tightens a loose token left by an earlier build, since it replaces the file
+    // rather than opening it.
+    let tmp = path.with_extension("tmp");
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restrict {path:?}"))?;
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp).with_context(|| format!("write {tmp:?}"))?;
+        f.write_all(token.as_bytes())
+            .with_context(|| format!("write {tmp:?}"))?;
+        f.sync_all().with_context(|| format!("write {tmp:?}"))?;
     }
+    std::fs::rename(&tmp, &path).with_context(|| format!("install {path:?}"))?;
     info!("status API token written to {}", path.display());
     Ok(token)
 }
@@ -450,6 +469,47 @@ mod tests {
             "the preimage reached the wire"
         );
         assert!(json.contains("peer"), "and the view is not simply empty");
+    }
+
+    /// The token is the credential for the whole status API, so it must never exist readable.
+    ///
+    /// It used to be written with `fs::write`, which follows the umask (0022 on a default
+    /// install, so 0644), and chmodded afterwards. Between those two calls any user on the host
+    /// could read it. Creating the file with the mode closes the window; the chmod stays, to
+    /// tighten a token an earlier build already left behind.
+    #[cfg(unix)]
+    #[test]
+    fn the_status_token_is_never_readable_by_anyone_else() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("pubky-swap-token-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(TOKEN_FILE);
+
+        let token = load_or_create_token(dir.to_str().unwrap()).unwrap();
+        assert!(!token.is_empty());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a freshly created token must be 0600, not {mode:o}"
+        );
+
+        // The same token comes back rather than being regenerated, so a supervisor that already
+        // read it keeps working across a restart.
+        assert_eq!(load_or_create_token(dir.to_str().unwrap()).unwrap(), token);
+
+        // A token an earlier build left world-readable is replaced rather than adopted, so an
+        // upgrade fixes the mode instead of inheriting it.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        load_or_create_token(dir.to_str().unwrap()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing loose token must be tightened");
+
+        // Nothing is left behind that the API would try to serve or a reader would trip over.
+        assert!(!path.with_extension("tmp").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The reason a swap failed belongs in a field, not inside the state name.

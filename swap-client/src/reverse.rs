@@ -23,6 +23,7 @@ use swap_common::onchain::{
 };
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::store::Resume;
+use swap_common::timelock::claim_start_is_safe;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -165,6 +166,18 @@ pub async fn execute_reverse_swap(
             }
             FundingSelection::None => {}
         }
+        // The provider's refund branch opens at the timeout. Past it there is nothing left to
+        // claim, and a resumed client has no `pay_task` to end this loop for it: its payment was
+        // started by a previous run, so the only other exit is the chain. Without this the loop
+        // polls forever and the swap never reaches its refund-or-give-up conclusion.
+        let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip_height: {e}"))?;
+        if !claim_start_is_safe(tip, claim.timeout_height) {
+            return Err(anyhow!(
+                "the provider's HTLC did not confirm in time: tip {tip} against a timeout at {}. \
+                 The provider refunds its own funding; nothing of ours is locked on chain.",
+                claim.timeout_height
+            ));
+        }
         // If the payment terminated before funding appeared, there's nothing to claim.
         if pay_task.as_ref().is_some_and(|t| t.is_finished()) {
             let pay_task = pay_task.expect("just checked");
@@ -181,6 +194,22 @@ pub async fn execute_reverse_swap(
         }
         sleep(poll).await;
     };
+    // Revealing the preimage is the irreversible step: it settles the provider's hold invoice
+    // whether or not our claim ever confirms. Doing it inside the provider's refund window means
+    // paying for an on-chain output the provider can take back, so the window is checked here,
+    // immediately before the reveal, and not only when the funding was first seen. Funding can
+    // confirm at the last moment, and polling itself takes blocks.
+    //
+    // `claim_start_is_safe` existed for exactly this and was called from nowhere.
+    let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip_height: {e}"))?;
+    if !claim_start_is_safe(tip, claim.timeout_height) {
+        return Err(anyhow!(
+            "the provider's HTLC confirmed too close to its refund at height {} (tip {tip}) to \
+             claim safely, so the preimage stays secret. The provider refunds its own funding \
+             and the hold invoice expires unsettled.",
+            claim.timeout_height
+        ));
+    }
     info!("Client: provider HTLC funded; claiming with the preimage");
 
     // 3. Claim the HTLC, revealing the preimage on-chain — and keep it confirming under fee
@@ -189,7 +218,11 @@ pub async fn execute_reverse_swap(
     let build = |rate: u64| {
         build_claim_tx(
             funding.outpoint,
-            claim.onchain_amount_sat,
+            // What the output holds, not what the swap was priced at. A BIP143 sighash commits
+            // to the input's value, so an overpaying provider (accepted above) would otherwise
+            // produce a signature that does not validate, and a claim that cannot be broadcast,
+            // with our Lightning payment already in flight.
+            funding.value_sat,
             &claim.htlc_script,
             claim.dest_spk.clone(),
             estimate_spend_fee(rate, claim_vsize),
@@ -429,6 +462,151 @@ mod tests {
         assert_eq!(
             extract_preimage(&broadcasts[0], &outpoint, &ph),
             Some(preimage)
+        );
+    }
+
+    /// The provider funds this HTLC, so the provider chooses its value, and a small overpayment
+    /// is accepted rather than refused. The claim then has to be signed over what is there: a
+    /// BIP143 sighash commits to the input's amount, so signing over the quoted figure produces a
+    /// transaction that cannot be broadcast, with the client's Lightning payment already in
+    /// flight and the provider's refund branch counting down.
+    ///
+    /// One sat is enough, and it costs the provider nothing to do deliberately.
+    #[tokio::test]
+    async fn the_claim_is_signed_over_what_the_provider_funded() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_r, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, 5000);
+        let htlc_spk = htlc_p2wsh_address(&script, Network::Regtest).script_pubkey();
+        let outpoint = OutPoint {
+            txid: BTxid::from_str(
+                "4444444444444444444444444444444444444444444444444444444444444444",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let dest = ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap();
+        const OVERPAID: u64 = AMOUNT + 1;
+
+        let ln: Arc<dyn LightningBackend> = Arc::new(MockLn::new(preimage));
+        let mc = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: OVERPAID,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        let chain: Arc<dyn ChainWatcher> = mc.clone();
+
+        let claim = ReverseClaim {
+            htlc_script: script,
+            htlc_spk: htlc_spk.clone(),
+            onchain_amount_sat: AMOUNT,
+            invoice: "lnbcrt-mock".into(),
+            preimage,
+            claim_key: claim_sk,
+            dest_spk: dest,
+            fee_rate_sat_vb: 5,
+            timeout_height: TIMEOUT,
+        };
+
+        execute_reverse_swap(
+            ln,
+            chain,
+            claim,
+            10_000,
+            1,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await
+        .unwrap();
+
+        let broadcasts = mc.broadcasts();
+        assert_eq!(broadcasts.len(), 1);
+        let spent = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(OVERPAID),
+            script_pubkey: htlc_spk,
+        };
+        broadcasts[0]
+            .verify(|op| (*op == outpoint).then(|| spent.clone()))
+            .expect("the claim must be valid against the output it actually spends");
+    }
+
+    /// Revealing the preimage settles the provider's hold invoice whether or not the on-chain
+    /// claim ever confirms, so it must not happen inside the provider's refund window. Funding
+    /// can confirm at the last moment, which is exactly when this matters and exactly when the
+    /// check that existed for it (`claim_start_is_safe`) was called from nowhere.
+    #[tokio::test]
+    async fn the_preimage_is_not_revealed_once_the_refund_window_has_opened() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_r, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, 5000);
+        let htlc_spk = htlc_p2wsh_address(&script, Network::Regtest).script_pubkey();
+        let outpoint = OutPoint {
+            txid: BTxid::from_str(
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let dest = ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap();
+
+        let ln: Arc<dyn LightningBackend> = Arc::new(MockLn::new(preimage));
+        // Funded and confirmed, but the tip has reached the provider's refund height.
+        let mc = Arc::new(
+            MockChain::new()
+                .with_tip(TIMEOUT)
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        let chain: Arc<dyn ChainWatcher> = mc.clone();
+
+        let claim = ReverseClaim {
+            htlc_script: script,
+            htlc_spk,
+            onchain_amount_sat: AMOUNT,
+            invoice: "lnbcrt-mock".into(),
+            preimage,
+            claim_key: claim_sk,
+            dest_spk: dest,
+            fee_rate_sat_vb: 5,
+            timeout_height: TIMEOUT,
+        };
+
+        let result = execute_reverse_swap(
+            ln,
+            chain,
+            claim,
+            10_000,
+            1,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "claiming into the refund window must refuse"
+        );
+        assert_eq!(
+            mc.broadcast_count(),
+            0,
+            "nothing may be broadcast, because broadcasting is what reveals the preimage"
         );
     }
 

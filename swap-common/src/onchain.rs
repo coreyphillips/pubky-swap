@@ -457,6 +457,57 @@ mod tests {
         verify(&tx, s.outpoint, &s.spent).expect("claim must be consensus-valid");
     }
 
+    /// The value signed over has to be the value that is there.
+    ///
+    /// A BIP143 sighash commits to the input's amount, so a claim signed over the quoted amount
+    /// of a swap whose HTLC was overpaid does not validate: the transaction is well-formed,
+    /// broadcast rejects it, and there is no second chance because by then the Lightning leg is
+    /// already settled. Both drivers accept a small overpayment by design, so both have to sign
+    /// over what they found rather than what they expected.
+    ///
+    /// This asserts the failure directly, against libbitcoinconsensus, so a driver that goes back
+    /// to passing the quoted amount has a test that says why it is wrong rather than one that
+    /// merely stops matching.
+    #[test]
+    fn a_claim_signed_over_the_wrong_value_is_rejected_by_consensus() {
+        let s = setup();
+        const OVERPAID: u64 = VALUE + 1;
+        let spent = TxOut {
+            value: Amount::from_sat(OVERPAID),
+            script_pubkey: s.spent.script_pubkey.clone(),
+        };
+
+        // What the code did: sign over the quoted amount while the output holds one sat more.
+        let wrong = build_claim_tx(
+            s.outpoint,
+            VALUE,
+            &s.redeem,
+            dest(),
+            1000,
+            s.preimage,
+            &s.claim_sk,
+        )
+        .unwrap();
+        assert!(
+            verify(&wrong, s.outpoint, &spent).is_err(),
+            "a claim signed over {VALUE} must not validate against an output holding {OVERPAID}"
+        );
+
+        // And the fix: sign over what the output actually holds.
+        let right = build_claim_tx(
+            s.outpoint,
+            OVERPAID,
+            &s.redeem,
+            dest(),
+            1000,
+            s.preimage,
+            &s.claim_sk,
+        )
+        .unwrap();
+        verify(&right, s.outpoint, &spent)
+            .expect("a claim signed over the real value must be consensus-valid");
+    }
+
     #[test]
     fn refund_tx_is_consensus_valid_at_timeout() {
         let s = setup();

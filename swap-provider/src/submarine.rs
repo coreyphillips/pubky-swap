@@ -260,18 +260,35 @@ pub async fn drive_submarine_swap(
     // to the required depth right before paying. A reorg that dropped it below that depth (or
     // orphaned it entirely) means we must not pay — otherwise we'd pay Lightning for an HTLC that
     // no longer exists. (If it was instead spent by our own earlier claim on resume, finish.)
-    match run_blocking(|| chain.outpoint_status(&swap.htlc_spk, &funding_outpoint))? {
-        Some(utxo) if utxo.confirmations >= required_confirmations => {}
-        _ => {
-            if run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))?.is_some() {
-                info!("Submarine swap: funding already spent (prior claim); done");
-                return Ok(SwapState::Claimed);
+    //
+    // This is also where the amount the claim will be signed over comes from. A BIP143 sighash
+    // commits to the input's value, so signing over anything but what the output actually holds
+    // produces a signature that does not validate and a claim that can never be broadcast. The
+    // quoted amount is not that value: an overpaying client is explicitly accepted above, and a
+    // resumed driver adopts an outpoint it has not measured. Read it from the chain, once, here.
+    let funding_value_sat =
+        match run_blocking(|| chain.outpoint_status(&swap.htlc_spk, &funding_outpoint))? {
+            Some(utxo) if utxo.confirmations >= required_confirmations => utxo.value_sat,
+            _ => {
+                if run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))?.is_some() {
+                    info!("Submarine swap: funding already spent (prior claim); done");
+                    return Ok(SwapState::Claimed);
+                }
+                warn!(
+                    "Submarine swap: funding no longer confirmed at required depth (reorg?); not \
+                     paying"
+                );
+                return Ok(SwapState::Failed(
+                    "funding reorged below required confirmations before payment".into(),
+                ));
             }
-            warn!("Submarine swap: funding no longer confirmed at required depth (reorg?); not paying");
-            return Ok(SwapState::Failed(
-                "funding reorged below required confirmations before payment".into(),
-            ));
-        }
+        };
+    if funding_value_sat != swap.onchain_amount_sat {
+        info!(
+            "Submarine swap: the HTLC holds {funding_value_sat} sat against a quoted {}; the \
+             claim is signed over what is there.",
+            swap.onchain_amount_sat
+        );
     }
 
     // Claim-window guard: paying is irreversible, but the on-chain claim that recovers the money
@@ -404,7 +421,7 @@ pub async fn drive_submarine_swap(
     let build = |rate: u64| {
         build_claim_tx(
             funding_outpoint,
-            swap.onchain_amount_sat,
+            funding_value_sat,
             &swap.htlc_script,
             dest.clone(),
             estimate_spend_fee(rate, claim_vsize),
@@ -1058,6 +1075,66 @@ mod tests {
         .unwrap();
         assert_eq!(state, SwapState::Claimed);
         assert!(*ln.paid.lock().unwrap());
+    }
+
+    /// The overpayment test above asserted the swap reached `Claimed` and stopped there, which
+    /// is why this survived: the driver did claim, with a transaction nobody could broadcast.
+    ///
+    /// The claim is signed over the value the driver was quoted, and BIP143 commits the signature
+    /// to the input's real amount. One sat of overpayment by the client, which costs them
+    /// nothing, makes the provider's claim invalid, and the provider has paid the invoice by the
+    /// time it finds out.
+    #[tokio::test]
+    async fn the_claim_is_signed_over_what_the_htlc_holds_not_what_was_quoted() {
+        let preimage = generate_preimage();
+        let ln = MockLn::new(payment_hash(&preimage), Some(preimage));
+        let (swap, _) = make_swap(&ln).await;
+        const OVERPAY: u64 = 1;
+        let funded_sat = swap.onchain_amount_sat + OVERPAY;
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: funded_sat,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            1,
+            Duration::from_millis(0),
+            &Resume::default(),
+            false,
+            &(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state, SwapState::Claimed);
+
+        // The claim went out. Whether it could ever confirm is decided by the amount its
+        // signature commits to, so that is what this checks, against real script consensus.
+        let claim = chain
+            .broadcasts()
+            .into_iter()
+            .find(|tx| {
+                tx.input
+                    .iter()
+                    .any(|i| i.previous_output == funding_outpoint())
+            })
+            .expect("the driver broadcast a claim");
+        let spent = bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(funded_sat),
+            script_pubkey: swap.htlc_spk.clone(),
+        };
+        let outpoint = funding_outpoint();
+        claim
+            .verify(|op| (*op == outpoint).then(|| spent.clone()))
+            .expect("the claim must be valid against the output it actually spends");
     }
 
     #[tokio::test]
