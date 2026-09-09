@@ -16,8 +16,9 @@ chain = ["swap-common/electrum"]
 beignet = ["dep:beignet-backend"]
 # Enable the BDK funding wallet (to fund the HTLC in a submarine swap).
 bdk-wallet = ["swap-common/bdk-wallet"]
-# Everything needed to execute a swap end-to-end from the CLI.
-full = ["lnd", "chain", "bdk-wallet"]
+# Everything needed to execute a swap end-to-end from the CLI, including ringing a provider's
+# doorbell: a provider that has never heard of us cannot find our message otherwise.
+full = ["lnd", "chain", "bdk-wallet", "iroh"]
 # Ring the provider's iroh P2P rendezvous (doorbell) so it starts polling us for the swap DM.
 iroh = ["pubky-transport/iroh"]
 

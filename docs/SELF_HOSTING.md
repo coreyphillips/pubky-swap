@@ -136,12 +136,21 @@ Your **rate** is two knobs, plus the amounts/directions you'll accept:
 The fee you charge is `base_fee + amount × fee_ppm / 1_000_000`. For example
 `--base-fee 1000 --fee-ppm 2000` (0.2%) on a 100,000-sat swap charges `1000 + 200 = 1200` sat.
 
-**Discovery (current state).** Counterparties reach you by knowing your **pubky** (printed on
-startup — share it), or by following you on the Pubky follow graph: `--broadcast-offer` pushes your
-offer to discovered followers when the daemon starts. Publishing your offer to your Pubky *profile*
-so strangers can browse/discover it (a public marketplace) is the unstarted **Marketplace layer**
-(see [`ROADMAP.md`](../ROADMAP.md), Phase 6) — for now, discovery is "share your pubky" / follow
-graph, not a directory.
+**Discovery (current state).** Counterparties reach you by knowing your **pubky**, printed on
+startup, so share it. Publishing your offer to your Pubky *profile* so strangers can browse for
+it (a public marketplace) is the unstarted **Marketplace layer** (see
+[`ROADMAP.md`](../ROADMAP.md), Phase 6). For now discovery is "share your pubky", not a directory.
+
+**How sharing your pubky actually reaches you.** Pubky's private messages live at a path derived
+from an ECDH shared secret between the two parties. That is what makes them unlinkable, and it
+also means there is no "who has written to me": a provider can only fetch messages from pubkys it
+already knows, which is its follow graph.
+
+So a counterparty announces themselves first, over an iroh peer-to-peer connection, and the
+provider then starts polling them. Both sides do this by default and `full` builds it in; there
+is nothing to configure. `--no-rendezvous-iroh` turns it off on either side, which makes a
+provider private: it will then serve only counterparties already in its follow graph, and
+`--broadcast-offer` pushes its offer to those followers at startup.
 
 ## Generic: point a provider at your LND
 

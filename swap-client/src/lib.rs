@@ -81,7 +81,13 @@ pub struct ClientConfig {
     /// Only request a quote (to check a provider's availability/rates) and exit without swapping.
     pub quote_only: bool,
     /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating, so a provider that
-    /// isn't already following us starts polling us for the swap DM. Requires the `iroh` feature.
+    /// isn't already following us starts polling us for the swap DM. Requires the `iroh` feature,
+    /// which `full` includes.
+    ///
+    /// On by default and best effort: a provider that already follows us does not need it, and one
+    /// that is not listening costs us a failed connection and a log line. Off, a provider who has
+    /// never heard of us cannot find our quote request at all, because there is no way for it to
+    /// know it should look.
     pub rendezvous_iroh: bool,
     /// Confirmations this client requires before acting, whatever the provider quotes. `0` means
     /// "use the network default" (2 on mainnet, 1 elsewhere).
@@ -137,7 +143,7 @@ impl Default for ClientConfig {
             onchain_fee_rate_sat_vb: 2,
             max_routing_fee_msat: 10_000,
             quote_only: false,
-            rendezvous_iroh: false,
+            rendezvous_iroh: true,
             min_confirmations: 0,
             max_fee_bps: 500,
             max_total_sat: 0,

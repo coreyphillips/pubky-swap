@@ -113,9 +113,12 @@ struct Cli {
     #[arg(long)]
     quote_only: bool,
 
-    /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating. Requires `iroh`.
+    /// Do not ring the provider's iroh P2P rendezvous (doorbell) before negotiating.
+    ///
+    /// Ringing is on by default: a provider that has never heard of you cannot find your quote
+    /// request otherwise. Only worth turning off for a provider you know already follows you.
     #[arg(long)]
-    rendezvous_iroh: bool,
+    no_rendezvous_iroh: bool,
 
     /// Drive any swaps a previous run left in flight, then exit without starting a new one.
     ///
@@ -225,7 +228,10 @@ impl Cli {
             max_total_sat: self.max_total_sat,
             data_dir: self.data_dir.clone(),
             quote_only: flag(self.quote_only),
-            rendezvous_iroh: flag(self.rendezvous_iroh),
+            // Inverted, because the default is on: an unpassed flag has to leave the lower
+            // configuration layers alone, which is what `flag` exists for, and only `--no-...`
+            // has anything to say.
+            rendezvous_iroh: self.no_rendezvous_iroh.then_some(false),
             resume_only: flag(self.resume_only),
         })
     }

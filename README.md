@@ -125,6 +125,7 @@ two legs.
 | `bdk-wallet` | `swap-provider` | BIP84 funding wallet over Electrum. |
 | `chain` | `swap-provider`, `swap-client` | The Electrum chain watcher. |
 | `status` | `swap-provider` | The read-only status API (adds an HTTP server). |
+| `iroh` | both | The peer-to-peer rendezvous a counterparty uses to announce itself, so a provider can be reached by someone who only has its pubky. In `full`. |
 | `full` | `swap-provider`, `swap-client` | Everything needed to execute swaps end-to-end. |
 
 Without the execution features a provider runs **negotiation-only** and rejects `SwapRequest`s.
