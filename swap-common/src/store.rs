@@ -133,6 +133,13 @@ pub struct SwapRecord {
     pub quote_total_sat: u64,
 
     // --- diagnostics ---
+    /// The lowest height at which a reorg was seen while this swap was in flight.
+    ///
+    /// Persisted because a reorg is exactly the kind of thing a process does not survive to act
+    /// on: the monitor noticed, the operator restarted, and the fact was gone. A resumed driver
+    /// reads this and re-validates rather than trusting what it wrote down before the fork.
+    #[serde(default)]
+    pub reorg_seen_at_height: Option<u32>,
     /// The most recent driver failure, for the operator.
     #[serde(default)]
     pub last_error: Option<String>,
@@ -187,6 +194,12 @@ pub struct Resume {
     pub funding_intent_at_height: Option<u32>,
     /// Claim or refund transactions an earlier run put on the wire.
     pub our_spends: Vec<Txid>,
+    /// The lowest height at which a reorg was seen while this swap was in flight.
+    ///
+    /// A recorded funding outpoint is normally taken as established, because it was: something
+    /// watched it confirm. A reorg is the one event that can make it untrue after the fact, so a
+    /// driver that sees this goes back to the chain instead of trusting what it wrote down.
+    pub reorg_seen_at_height: Option<u32>,
 }
 
 impl Resume {
@@ -230,6 +243,7 @@ impl SwapRecord {
             claim_observed_txid_hex: None,
             spend_txid_hex: None,
             our_spend_txids: Vec::new(),
+            reorg_seen_at_height: None,
             preimage_hex: None,
             dest_spk_hex: None,
             quote_total_sat: 0,
@@ -319,6 +333,7 @@ impl SwapRecord {
             funding: self.funding_outpoint(),
             funding_intent_at_height: self.funding_intent_at_height,
             our_spends: self.our_spends(),
+            reorg_seen_at_height: self.reorg_seen_at_height,
         }
     }
 

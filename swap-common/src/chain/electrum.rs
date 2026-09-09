@@ -330,6 +330,18 @@ impl ChainWatcher for ElectrumWatcher {
         Ok(Some(header.block_hash()))
     }
 
+    fn block_hashes_from(&self, start_height: u32, count: u16) -> Result<Vec<BlockHash>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // `blockchain.block.headers` returns as many as exist from `start_height` and stops at the
+        // tip, so a range that overruns simply comes back short.
+        let res = self.call("block_headers", |c| {
+            c.block_headers(start_height as usize, count as usize)
+        })?;
+        Ok(res.headers.iter().map(|h| h.block_hash()).collect())
+    }
+
     fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {
         let history = self.call("history", |c| c.script_get_history(spk))?;
         let tip = self.tip_height()?;

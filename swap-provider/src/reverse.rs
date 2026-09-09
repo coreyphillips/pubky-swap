@@ -174,18 +174,40 @@ enum FundingOutcome {
 /// two opposite things: on a fresh start nothing has been funded, and on a resume the
 /// counterparty may simply have claimed already. Funding again in that second case hands them a
 /// second HTLC they hold the preimage for, which is a total loss of the amount.
+#[allow(clippy::too_many_arguments)]
 async fn establish_funding(
     ln: &dyn LightningBackend,
     chain: &dyn ChainWatcher,
     wallet: &dyn OnchainWallet,
     swap: &ReverseSwap,
     resume: &Resume,
+    required_confirmations: u32,
     poll: Duration,
     progress: &dyn ProgressSink,
 ) -> Result<FundingOutcome> {
     // Resumed with a known outpoint: we already funded before the restart.
+    //
+    // Trusting that outpoint is right except after a reorg, which is the one thing that can undo
+    // a confirmation already observed. So when one has been seen, ask the chain whether the
+    // output is still there at the depth the swap requires, and fall through to looking for it if
+    // it is not. A funding orphaned by a reorg is usually re-mined at the same outpoint, in which
+    // case this costs one lookup and changes nothing.
     if let Some(op) = resume.funding {
-        return Ok(FundingOutcome::Funded(op));
+        let Some(fork) = resume.reorg_seen_at_height else {
+            return Ok(FundingOutcome::Funded(op));
+        };
+        let outputs = run_blocking(|| chain.find_outputs(&swap.htlc_spk))?;
+        if outputs
+            .iter()
+            .any(|u| u.outpoint == op && u.confirmations >= required_confirmations)
+        {
+            return Ok(FundingOutcome::Funded(op));
+        }
+        warn!(
+            "Reverse swap: a reorg at height {fork} left the recorded funding {op} unconfirmed; \
+             re-establishing it from the chain"
+        );
+        return await_recorded_funding(ln, chain, swap, poll, progress).await;
     }
 
     // Already funded and still unspent: adopt the existing output.
@@ -409,13 +431,23 @@ pub async fn drive_reverse_swap(
     //    double-funds. Only the branch that commits *new* funds is gated on the timelocks: once
     //    coins are already in the HTLC the money is at risk either way, and refusing there would
     //    strand it instead of driving it to a refund.
-    let funding_outpoint =
-        match establish_funding(ln, chain, wallet, swap, resume, poll, progress).await? {
-            FundingOutcome::Funded(op) => op,
-            // Refused before committing anything. The hold invoice is already cancelled, so the
-            // client's payment is returned in full.
-            FundingOutcome::Refused(state) => return Ok(state),
-        };
+    let funding_outpoint = match establish_funding(
+        ln,
+        chain,
+        wallet,
+        swap,
+        resume,
+        required_confirmations,
+        poll,
+        progress,
+    )
+    .await?
+    {
+        FundingOutcome::Funded(op) => op,
+        // Refused before committing anything. The hold invoice is already cancelled, so the
+        // client's payment is returned in full.
+        FundingOutcome::Refused(state) => return Ok(state),
+    };
     info!("Reverse swap: HTLC funded; awaiting client claim");
 
     // We funded the output ourselves, so we already know its outpoint. We do NOT separately
@@ -1192,6 +1224,7 @@ mod tests {
                 funding: None,
                 funding_intent_at_height: Some(MOCK_TIP),
                 our_spends: Vec::new(),
+                reorg_seen_at_height: None,
             },
             &(),
         )
@@ -1244,6 +1277,100 @@ mod tests {
         .unwrap()
         .expect("one of the candidates must be chosen");
         assert_eq!(chosen, funding_outpoint());
+    }
+
+    /// A recorded funding outpoint is normally taken as established, and should be: something
+    /// watched it confirm. A reorg is the one event that can undo that after the fact, and it
+    /// used to end in a log line saying the driver would re-validate, which the driver had no way
+    /// of knowing to do.
+    #[tokio::test]
+    async fn a_reorg_makes_a_driver_re_establish_its_funding() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, preimage) = swap_with_claim(&ln).await;
+
+        // The funding is gone from the UTXO set, but the history still records it and the client
+        // has claimed it. Without the marker the driver would drive a phantom outpoint; with it,
+        // it goes back to the chain, finds the real one, and settles.
+        let moved = OutPoint {
+            txid: Txid::from_str(
+                "7777777777777777777777777777777777777777777777777777777777777777",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spent_output(funding_outpoint(), AMOUNT, claim_tx.txid())
+            .with_spend(claim_tx);
+        let wallet = PanicFundWallet { refund_spk: dest() };
+
+        // Bounded: without the fix the driver watches an outpoint that does not exist and never
+        // finishes, and a hang says far less than a failure.
+        let final_state = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_reverse_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &swap,
+                2,
+                Duration::from_millis(0),
+                &Resume {
+                    // The outpoint the record believes in, which the reorg invalidated.
+                    funding: Some(moved),
+                    funding_intent_at_height: Some(MOCK_TIP),
+                    our_spends: Vec::new(),
+                    reorg_seen_at_height: Some(MOCK_TIP - 2),
+                },
+                &(),
+            ),
+        )
+        .await
+        .expect("the driver must re-establish the funding rather than watch a phantom outpoint")
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Claimed);
+        assert_eq!(
+            *ln.settled_preimage.lock().unwrap(),
+            Some(preimage),
+            "re-establishing the funding is what lets the provider settle and be paid"
+        );
+    }
+
+    /// And with no reorg on the record, a known outpoint is still taken at its word: this must
+    /// not turn every resume into a chain scan.
+    #[tokio::test]
+    async fn without_a_reorg_a_recorded_funding_is_trusted() {
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let (swap, claim_tx, _) = swap_with_claim(&ln).await;
+        let chain = MockChain::new()
+            .always_final()
+            .with_tip(MOCK_TIP)
+            .with_spend(claim_tx);
+        let wallet = PanicFundWallet { refund_spk: dest() };
+
+        // Nothing pays the script at all, so any lookup would come back empty. The driver still
+        // proceeds on its recorded outpoint.
+        let final_state = drive_reverse_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::from_millis(0),
+            &Resume {
+                funding: Some(funding_outpoint()),
+                funding_intent_at_height: None,
+                our_spends: Vec::new(),
+                reorg_seen_at_height: None,
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(final_state, SwapState::Claimed);
     }
 
     /// Without an intent marker there is nothing to be careful about: a fresh swap whose HTLC is
@@ -1347,6 +1474,7 @@ mod tests {
                 funding: None,
                 funding_intent_at_height: Some(MOCK_TIP),
                 our_spends: Vec::new(),
+                reorg_seen_at_height: None,
             },
             &(),
         )

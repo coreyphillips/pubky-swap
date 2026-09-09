@@ -502,6 +502,7 @@ mod tests {
                 funding: None,
                 funding_intent_at_height: Some(TIMEOUT - 100),
                 our_spends: Vec::new(),
+                reorg_seen_at_height: None,
             },
             &(),
         )
@@ -544,6 +545,7 @@ mod tests {
                 funding: None,
                 funding_intent_at_height: Some(TIMEOUT - 100),
                 our_spends: Vec::new(),
+                reorg_seen_at_height: None,
             },
             &(),
         )

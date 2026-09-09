@@ -210,6 +210,24 @@ impl ChainWatcher for MockChain {
         Ok(v)
     }
 
+    fn block_hashes_from(&self, start_height: u32, count: u16) -> Result<Vec<BlockHash>> {
+        let tip = *self.tip.lock().unwrap();
+        let hashes = self.block_hashes.lock().unwrap();
+        let mut out = Vec::new();
+        for h in start_height..start_height.saturating_add(u32::from(count)) {
+            if h > tip {
+                break;
+            }
+            match hashes.get(&h) {
+                Some(hash) => out.push(*hash),
+                // A height the test did not script is a gap, and the monitor must not read a gap
+                // as a changed hash. Stopping is the honest answer: the range came back short.
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
         if height > *self.tip.lock().unwrap() {
             return Ok(None);
