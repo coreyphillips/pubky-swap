@@ -329,11 +329,18 @@ impl LightningBackend for BeignetLightningBackend {
             .await
             .map_err(conv)?;
         let amount_sats = decoded.amount_sats.unwrap_or(0);
+        // Both parts are optional upstream, so an absent one leaves the expiry unknown rather
+        // than producing a plausible-looking wrong answer.
+        let expires_at_unix = match (decoded.timestamp, decoded.expiry) {
+            (Some(t), Some(e)) => t.saturating_add(e),
+            _ => 0,
+        };
         Ok(DecodedInvoice {
             payment_hash: to_32(&decoded.payment_hash, "payment hash")?,
             amount_msat: amount_sats.saturating_mul(1000),
             min_final_cltv_expiry: decoded.min_final_cltv_expiry.unwrap_or(0),
             amount_is_explicit: amount_sats > 0,
+            expires_at_unix,
         })
     }
 }

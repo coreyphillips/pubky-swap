@@ -5,6 +5,7 @@
 //! module's [`run`]. Reverse-swap *execution* (pay the hold invoice, watch the HTLC, claim
 //! with the preimage) lives in [`reverse`].
 
+pub mod resume;
 pub mod reverse;
 pub mod store;
 pub mod submarine;
@@ -19,13 +20,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
-use swap_common::store::JsonFileSwapStore;
+use swap_common::store::{JsonFileSwapStore, Resume};
 use swap_common::timelock::TimelockParams;
 use swap_common::validate::{self, ClientPolicy, DecodedHoldInvoice};
 use swap_common::wallet::OnchainWallet;
 use swap_common::{messages::*, SwapDirection, SwapState};
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::reverse::{execute_reverse_swap, ReverseClaim};
@@ -92,6 +93,13 @@ pub struct ClientConfig {
     /// A submarine swap's refund key is generated here and exists nowhere else. Losing it does
     /// not fail the swap, it makes the on-chain output unspendable by anyone, forever.
     pub data_dir: String,
+    /// Drive any swaps left in flight by a previous run, then exit without starting a new one.
+    pub resume_only: bool,
+}
+
+/// Whether this client has the backends a swap needs to execute.
+fn execution_ready(config: &ClientConfig) -> bool {
+    !config.electrum_url.is_empty() && wallet_is_configured(config)
 }
 
 /// Whether the configured wallet backend can both fund an HTLC and supply a sweep destination
@@ -120,36 +128,109 @@ fn client_policy(config: &ClientConfig, network: Network) -> ClientPolicy {
     policy
 }
 
-/// Tell the operator about swaps this client left in flight.
+/// Records what a swap did, so a later run of this client knows it.
+///
+/// One type for both directions: the markers mean the same thing on each, and two of these that
+/// drifted apart would each be right about their own half of the same bug.
+pub(crate) struct RecordProgress<'a> {
+    pub(crate) store: &'a JsonFileSwapStore,
+    pub(crate) swap_id: Uuid,
+}
+
+impl crate::submarine::FundingSink for RecordProgress<'_> {
+    fn funding_intent(&self, tip: u32) -> Result<()> {
+        store::record_funding_intent(self.store, self.swap_id, tip)
+    }
+    fn funded(&self, outpoint: bitcoin::OutPoint) {
+        if let Err(e) = store::record_funded(self.store, self.swap_id, outpoint) {
+            // Loud, because a funding whose outpoint never reached disk is exactly the case a
+            // resumed client has to go hunting for.
+            error!("FAILED TO PERSIST the funding outpoint {outpoint}: {e}");
+        }
+    }
+    fn spend_broadcast(&self, txid: bitcoin::Txid) {
+        if let Err(e) = store::record_our_spend(self.store, self.swap_id, txid) {
+            error!("FAILED TO PERSIST our own spend {txid}: {e}");
+        }
+    }
+}
+
+impl crate::reverse::ClaimSink for RecordProgress<'_> {
+    fn spend_broadcast(&self, txid: bitcoin::Txid) {
+        if let Err(e) = store::record_our_spend(self.store, self.swap_id, txid) {
+            error!("FAILED TO PERSIST our own claim {txid}: {e}");
+        }
+    }
+}
+
+/// Drive swaps this client left in flight, before starting anything new.
 ///
 /// A record here is not an inconvenience, it is money: each one holds the only key that can move
-/// the funds on this side's branch of an HTLC. Reporting them loudly is the difference between an
-/// operator recovering coins and never knowing they were at risk.
-fn report_unfinished_swaps(store: &dyn swap_common::store::SwapStore) {
-    match store::unfinished(store) {
-        Ok(records) if records.is_empty() => {}
-        Ok(records) => {
-            warn!(
-                "{} swap(s) from a previous run are still unfinished. Their branch keys are in \
-                 the data directory and are the only way to recover any committed funds; do not \
-                 delete them.",
-                records.len()
-            );
-            for rec in records {
-                warn!(
-                    "  swap {} ({:?}) with {}: state {:?}, timeout height {}, funding {}",
-                    rec.swap_id,
-                    rec.direction,
-                    rec.peer,
-                    rec.state,
-                    rec.timeout_height,
-                    rec.funding_outpoint()
-                        .map(|o| o.to_string())
-                        .unwrap_or_else(|| "none recorded".into()),
-                );
-            }
+/// the funds on this side's branch of an HTLC. This used to print them and move on, which tells
+/// an operator their coins are at risk without doing anything about it.
+///
+/// Resuming needs the execution backends, so a client that has none can only report. That is the
+/// honest limit rather than a lesser version of the same thing: without a chain watcher there is
+/// no way to see the HTLC, and without a wallet no way to refund one.
+async fn resume_unfinished_swaps(
+    store: &JsonFileSwapStore,
+    config: &ClientConfig,
+    network: Network,
+) {
+    let records = match store::unfinished(store) {
+        Ok(r) if r.is_empty() => return,
+        Ok(r) => r,
+        Err(e) => {
+            warn!("could not read persisted swaps: {e}");
+            return;
         }
-        Err(e) => warn!("could not read persisted swaps: {e}"),
+    };
+
+    if !execution_ready(config) {
+        warn!(
+            "{} swap(s) from a previous run are unfinished and this client has no execution \
+             backends configured, so they cannot be driven. Their branch keys are in the data \
+             directory and are the only way to recover any committed funds; do not delete them.",
+            records.len()
+        );
+        for rec in &records {
+            warn!(
+                "  swap {} ({:?}) with {}: state {:?}, timeout height {}, funding {}",
+                rec.swap_id,
+                rec.direction,
+                rec.peer,
+                rec.state,
+                rec.timeout_height,
+                rec.funding_outpoint()
+                    .map(|o| o.to_string())
+                    .unwrap_or_else(|| "none recorded".into()),
+            );
+        }
+        return;
+    }
+
+    let ln = match make_backend(config).await {
+        Ok(ln) => ln,
+        Err(e) => {
+            warn!("cannot resume unfinished swaps without a Lightning backend: {e}");
+            return;
+        }
+    };
+    let chain = match build_chain(config) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("cannot resume unfinished swaps without a chain watcher: {e}");
+            return;
+        }
+    };
+    // Only a submarine swap needs a wallet, so a missing one is not fatal here: the resume driver
+    // says so per swap rather than refusing to look at the reverse ones.
+    let wallet = build_wallet(config, network).await.ok();
+
+    if let Err(e) =
+        resume::resume_unfinished(store, ln, chain, wallet, config.max_routing_fee_msat).await
+    {
+        warn!("could not resume unfinished swaps: {e}");
     }
 }
 
@@ -186,7 +267,13 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     info!("Client pubky: {client_pkarr}");
 
     let store = store::open(&config.data_dir)?;
-    report_unfinished_swaps(&store);
+    // Before anything new: a swap left in flight has money in it, and starting a second one while
+    // the first is unattended is how a client ends up with two.
+    resume_unfinished_swaps(&store, &config, network).await;
+    if config.resume_only {
+        info!("--resume-only: not starting a new swap");
+        return Ok(());
+    }
     transport.add_known_peer(config.provider_pkarr.clone());
 
     // Optionally ring the provider's iroh doorbell so a provider that isn't already following us
@@ -389,9 +476,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
             payment_hash: decoded.payment_hash,
             amount_msat: decoded.amount_msat,
             amount_is_explicit: decoded.amount_is_explicit,
-            // The backend does not surface an absolute expiry; the quote's own expiry and the
-            // timeout checks above already bound how long this swap may take.
-            expires_at_unix: 0,
+            expires_at_unix: decoded.expires_at_unix,
         },
         &quote,
         &ph,
@@ -427,6 +512,10 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
     };
     info!("Paying the hold invoice and waiting to claim the on-chain HTLC...");
+    let sink = RecordProgress {
+        store: &store,
+        swap_id: client_swap_id,
+    };
     let txid = execute_reverse_swap(
         ln,
         chain,
@@ -434,6 +523,8 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         config.max_routing_fee_msat,
         required_confirmations,
         Duration::from_secs(2),
+        &Resume::default(),
+        &sink,
     )
     .await;
     match &txid {
@@ -586,9 +677,7 @@ async fn run_submarine(
         quote.total_sat,
         hex::encode(dest_spk.as_bytes()),
     )?;
-    // The intent marker goes down before the transaction goes out, so a crash in that gap leaves
-    // something pointing at the coins rather than nothing.
-    store::record_funding_intent(store, client_swap_id, tip)?;
+    let _ = tip;
     let funding = SubmarineFunding {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
@@ -600,26 +689,20 @@ async fn run_submarine(
         timeout_height: accept.timeout_block_height,
         fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
     };
-    // Record where the coins land as soon as the funding transaction exists.
-    struct RecordFunding<'a> {
-        store: &'a JsonFileSwapStore,
-        swap_id: Uuid,
-    }
-    impl crate::submarine::FundingSink for RecordFunding<'_> {
-        fn funded(&self, outpoint: bitcoin::OutPoint) {
-            if let Err(e) = store::record_funded(self.store, self.swap_id, outpoint) {
-                // Loud, because a funding whose outpoint never reached disk is exactly the case
-                // a resumed client has to go hunting for.
-                tracing::error!("FAILED TO PERSIST the funding outpoint {outpoint}: {e}");
-            }
-        }
-    }
-    let sink = RecordFunding {
+    let sink = RecordProgress {
         store,
         swap_id: client_swap_id,
     };
-    let state =
-        execute_submarine_swap(ln, chain, wallet, funding, Duration::from_secs(2), &sink).await?;
+    let state = execute_submarine_swap(
+        ln,
+        chain,
+        wallet,
+        funding,
+        Duration::from_secs(2),
+        &Resume::default(),
+        &sink,
+    )
+    .await?;
     info!("Submarine swap finished: {state:?}");
     if let Err(e) = store::record_terminal(store, client_swap_id, state.clone()) {
         warn!("could not record the swap outcome: {e}");
@@ -751,13 +834,84 @@ fn beignet_http(config: &ClientConfig) -> Result<Arc<beignet_backend::BeignetHtt
     ))
 }
 
-/// Build the Lightning backend: a beignet daemon over HTTP, or the node's own LND over gRPC.
+/// Refuse to run against a node on a different chain from the one configured.
+///
+/// The provider has had this guard since it existed; the client had none, and it is the side that
+/// funds a submarine HTLC and pays a hold invoice. A client told `--network bitcoin` while its
+/// node is on testnet does not fail cleanly: it prices, funds and pays against a chain nobody
+/// else in the swap is looking at.
+async fn check_network_agreement(ln: &dyn LightningBackend, network: Network) -> Result<()> {
+    let info = match ln.node_info().await {
+        Ok(info) => info,
+        // Not reachable yet is a different problem, and the paths that need the node report it
+        // themselves. Refusing here would turn a quote-only run into a failure.
+        Err(e) => {
+            warn!("Lightning backend not reachable for the network check: {e}");
+            return Ok(());
+        }
+    };
+    match info.chain_network.as_deref() {
+        Some(reported) => match lnd_network_to_bitcoin(reported) {
+            Some(node_net) if node_net != network => Err(anyhow!(
+                "network mismatch: this client is configured for {network:?} but its Lightning \
+                 node is on {node_net:?} ({reported}); aborting"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                warn!("the Lightning node reported an unrecognized network '{reported}'");
+                Ok(())
+            }
+        },
+        None => {
+            warn!("the Lightning node did not report a chain network; skipping the network check");
+            Ok(())
+        }
+    }
+}
+
+/// Map the network names a Lightning node reports onto `bitcoin::Network`.
+fn lnd_network_to_bitcoin(name: &str) -> Option<Network> {
+    match name {
+        "mainnet" | "bitcoin" => Some(Network::Bitcoin),
+        "testnet" | "testnet3" => Some(Network::Testnet),
+        "signet" => Some(Network::Signet),
+        "regtest" => Some(Network::Regtest),
+        _ => None,
+    }
+}
+
+/// Build the Lightning backend and refuse it if it is on the wrong chain.
+///
+/// The check is here rather than at each call site so no path can acquire a backend without it.
 async fn make_backend(config: &ClientConfig) -> Result<Arc<dyn LightningBackend>> {
+    let backend = build_backend(config).await?;
+    check_network_agreement(backend.as_ref(), parse_network(&config.network)?).await?;
+    Ok(backend)
+}
+
+/// A beignet daemon over HTTP, or the node's own LND over gRPC.
+async fn build_backend(config: &ClientConfig) -> Result<Arc<dyn LightningBackend>> {
     if config.lightning_backend == "beignet" {
         #[cfg(feature = "beignet")]
         {
+            // Ask the daemon what it is before using it. The provider has done this since the
+            // backend was added; the client skipped it, and a beignet on the wrong chain is the
+            // same hazard here as an LND on the wrong chain.
+            let http = beignet_http(config)?;
+            let network = parse_network(&config.network)?;
+            let preflight = beignet_backend::capability::probe(&http)
+                .await
+                .map_err(|e| anyhow!("beignet preflight: {e}"))?;
+            // The same check the provider makes, and fatal for the same reason: a daemon on
+            // another chain would have this client funding contracts on one and settling on
+            // another.
+            preflight.report(network).map_err(|e| anyhow!("{e}"))?;
+            info!(
+                "Connected to beignet node {} on {:?}",
+                preflight.node_id, network
+            );
             return Ok(Arc::new(beignet_backend::BeignetLightningBackend::new(
-                beignet_http(config)?,
+                http,
             )));
         }
         #[cfg(not(feature = "beignet"))]

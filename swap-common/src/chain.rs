@@ -164,6 +164,49 @@ pub enum FundingSelection {
     Multiple(Vec<FundingUtxo>),
 }
 
+/// Pick which historical output to drive, out of those that could be a swap's funding.
+///
+/// More than one is possible: an HTLC address is public from the moment it is in a `SwapAccept`,
+/// and a resumed run that funded twice would leave two. The spend builders take a single input, so
+/// only one can be driven, and the one to prefer is whichever the counterparty claimed: its spend
+/// carries the preimage, which is what settles the Lightning leg.
+///
+/// `Ok(None)` means nothing here could be this swap's funding.
+pub fn select_recorded_funding(
+    chain: &dyn ChainWatcher,
+    htlc_spk: &Script,
+    payment_hash: &[u8; 32],
+    expected_sat: u64,
+    history: &[HistoricalOutput],
+) -> Result<Option<OutPoint>> {
+    let mut candidates: Vec<&HistoricalOutput> = history
+        .iter()
+        .filter(|h| h.value_sat == expected_sat)
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    // Deepest first, so the choice does not change with the order a server happens to return.
+    candidates.sort_by(|a, b| {
+        b.confirmations
+            .cmp(&a.confirmations)
+            .then_with(|| a.outpoint.txid.cmp(&b.outpoint.txid))
+            .then_with(|| a.outpoint.vout.cmp(&b.outpoint.vout))
+    });
+
+    if candidates.len() > 1 {
+        for c in &candidates {
+            let Some(tx) = chain.find_spend(htlc_spk, &c.outpoint)? else {
+                continue;
+            };
+            if crate::onchain::extract_preimage(&tx, &c.outpoint, payment_hash).is_some() {
+                return Ok(Some(c.outpoint));
+            }
+        }
+    }
+    Ok(Some(candidates[0].outpoint))
+}
+
 /// How much overpayment to accept before treating it as a mistake.
 pub const DEFAULT_MAX_OVERPAY_SAT: u64 = 10_000;
 

@@ -9,19 +9,22 @@
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{ScriptBuf, Txid};
-use lightning_backend::LightningBackend;
+use lightning_backend::{LightningBackend, PaymentStatus};
 use std::sync::Arc;
 use std::time::Duration;
-use swap_common::chain::{run_blocking, ChainWatcher};
+use swap_common::chain::{
+    run_blocking, select_funding, ChainWatcher, FundingSelection, DEFAULT_MAX_OVERPAY_SAT,
+};
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
-use swap_common::htlc::Preimage;
+use swap_common::htlc::{payment_hash, Preimage};
 use swap_common::onchain::{
     build_claim_tx, estimate_spend_fee, fee_rate_cap, spend_vsize, ABSOLUTE_MAX_FEE_RATE_SAT_VB,
     CLAIM_FEE_TARGET_BLOCKS, DEFAULT_MAX_FEE_BPS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
+use swap_common::store::Resume;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Everything the client needs (from its own state + the provider's `SwapAccept`) to execute
 /// a reverse swap.
@@ -50,10 +53,27 @@ pub struct ReverseClaim {
     pub fee_rate_sat_vb: u64,
 }
 
+impl ReverseClaim {
+    /// The hash the hold invoice is against, derived from the preimage this side holds.
+    pub fn payment_hash(&self) -> [u8; 32] {
+        payment_hash(&self.preimage)
+    }
+}
+
+/// Notified as the client's reverse swap progresses, so what it did reaches disk.
+pub trait ClaimSink: Send + Sync {
+    /// A claim we are about to put on the wire, reported *before* the broadcast so a later run
+    /// knows the transaction is its own rather than reading it as the provider's refund.
+    fn spend_broadcast(&self, _txid: Txid) {}
+}
+
+impl ClaimSink for () {}
+
 /// Execute the client side of a reverse swap, returning the claim txid on success.
 ///
 /// [`ChainWatcher`] calls are blocking, so they are wrapped in [`run_blocking`] to avoid stalling
 /// the async runtime. `poll` is injected for testability.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_reverse_swap(
     ln: Arc<dyn LightningBackend>,
     chain: Arc<dyn ChainWatcher>,
@@ -61,25 +81,89 @@ pub async fn execute_reverse_swap(
     max_routing_fee_msat: u64,
     required_confirmations: u32,
     poll: Duration,
+    // What a previous run of this swap already did. `Resume::default()` on a fresh start.
+    resume: &Resume,
+    progress: &dyn ClaimSink,
 ) -> Result<Txid> {
-    // 1. Start paying the hold invoice. It stays in-flight (held) until the provider settles
-    //    it — which only happens after we claim on-chain and reveal the preimage.
-    let pay_ln = ln.clone();
-    let invoice = claim.invoice.clone();
-    let pay_task =
-        tokio::spawn(async move { pay_ln.pay_invoice(&invoice, max_routing_fee_msat).await });
-
-    // 2. Wait for the provider to fund + confirm the on-chain HTLC.
-    let funding = loop {
-        let found = run_blocking(|| chain.find_funding(&claim.htlc_spk, claim.onchain_amount_sat))
-            .map_err(|e| anyhow!("find_funding: {e}"))?;
-        if let Some(u) = found {
-            if u.confirmations >= required_confirmations {
-                break u;
+    // 1. Start paying the hold invoice, unless a previous run already did.
+    //
+    // Asking the node first is the whole of the resume story on this side: a payment that is
+    // in flight or already settled must not be started again, and the node is the only thing
+    // that knows. The invoice is held either way until the provider settles it, which only
+    // happens after we claim on-chain and reveal the preimage.
+    let already_paying = if resume.is_fresh() {
+        false
+    } else {
+        match ln.payment_status(claim.payment_hash()).await {
+            Ok(PaymentStatus::Succeeded { .. }) => {
+                info!("Client: the hold invoice was already paid by an earlier run");
+                true
+            }
+            Ok(PaymentStatus::InFlight) => {
+                info!("Client: a payment for this invoice is still in flight");
+                true
+            }
+            Ok(PaymentStatus::Failed(_)) | Ok(PaymentStatus::Unknown) => false,
+            Err(e) => {
+                // Not knowing is not a reason to pay again: the on-chain HTLC is what this run
+                // is here for, and paying twice is the one mistake with no way back.
+                warn!("Client: could not read the payment's status ({e}); not paying again");
+                true
             }
         }
+    };
+
+    let pay_task = if already_paying {
+        None
+    } else {
+        let pay_ln = ln.clone();
+        let invoice = claim.invoice.clone();
+        Some(tokio::spawn(async move {
+            pay_ln.pay_invoice(&invoice, max_routing_fee_msat).await
+        }))
+    };
+
+    // 2. Wait for the provider to fund + confirm the on-chain HTLC.
+    //
+    // Classify what pays the script rather than asking for an exact value. The HTLC address is
+    // public from the moment it is in the `SwapAccept`, so an underpayment, an overpayment and a
+    // double payment all happen, and a single "not funded yet" answer for all of them means
+    // waiting out the whole timeout with a Lightning payment held.
+    let funding = loop {
+        let outputs = run_blocking(|| chain.find_outputs(&claim.htlc_spk))
+            .map_err(|e| anyhow!("find_outputs: {e}"))?;
+        match select_funding(&outputs, claim.onchain_amount_sat, DEFAULT_MAX_OVERPAY_SAT) {
+            FundingSelection::Exact(u) | FundingSelection::Overpaid { utxo: u, .. } => {
+                if u.confirmations >= required_confirmations {
+                    break u;
+                }
+            }
+            FundingSelection::Underpaid { got_sat } => {
+                return Err(anyhow!(
+                    "the provider's HTLC holds {got_sat} sat against the {} the swap is priced \
+                     on; not revealing the preimage for it",
+                    claim.onchain_amount_sat
+                ));
+            }
+            FundingSelection::ExcessiveOverpay { got_sat } => {
+                return Err(anyhow!(
+                    "the provider's HTLC holds {got_sat} sat against an expected {}, far beyond \
+                     tolerance; not claiming it",
+                    claim.onchain_amount_sat
+                ));
+            }
+            FundingSelection::Multiple(utxos) => {
+                return Err(anyhow!(
+                    "{} separate outputs pay the HTLC address; the claim builder takes one input, \
+                     so this is left alone",
+                    utxos.len()
+                ));
+            }
+            FundingSelection::None => {}
+        }
         // If the payment terminated before funding appeared, there's nothing to claim.
-        if pay_task.is_finished() {
+        if pay_task.as_ref().is_some_and(|t| t.is_finished()) {
+            let pay_task = pay_task.expect("just checked");
             let res = pay_task.await.map_err(|e| anyhow!("pay task join: {e}"))?;
             // Report why it ended, not the whole result: a successful `PaymentResult` carries
             // the preimage, and this string reaches the logs.
@@ -129,17 +213,15 @@ pub async fn execute_reverse_swap(
         poll,
         FINALITY_DEPTH,
         deadline,
-    );
+    )
+    .with_known_ours(resume.our_spends.clone());
     let txid = match confirm_or_bump(
         chain.as_ref(),
         &claim.htlc_spk,
         funding.outpoint,
         &cfg,
         None,
-        // Nowhere to record it yet: the client runs a swap to completion in one process and has
-        // no resume path, so there is no later run to tell that this transaction was its own.
-        // That is the gap being closed next, and this is where it hooks in.
-        &|_| {},
+        &|txid| progress.spend_broadcast(txid),
         build,
     )
     .await
@@ -166,14 +248,22 @@ pub async fn execute_reverse_swap(
 
     // 4. The provider sees our claim, recovers the preimage, and settles the invoice — which
     //    completes our payment.
-    let payment = pay_task
-        .await
-        .map_err(|e| anyhow!("pay task join: {e}"))?
-        .map_err(|e| anyhow!("invoice payment failed: {e}"))?;
-    info!(
-        "Client: hold invoice settled (routing fee {} msat)",
-        payment.fee_msat
-    );
+    match pay_task {
+        Some(task) => {
+            let payment = task
+                .await
+                .map_err(|e| anyhow!("pay task join: {e}"))?
+                .map_err(|e| anyhow!("invoice payment failed: {e}"))?;
+            info!(
+                "Client: hold invoice settled (routing fee {} msat)",
+                payment.fee_msat
+            );
+        }
+        // An earlier run started the payment, so there is no task here to wait on. The claim is
+        // on chain and the preimage is public, which is what settles it; the operator's node is
+        // where that shows up.
+        None => info!("Client: claim confirmed; the payment started earlier will settle from it"),
+    }
 
     Ok(txid)
 }
@@ -200,6 +290,24 @@ mod tests {
 
     struct MockLn {
         preimage: [u8; 32],
+        /// What the node says about a payment for this hash, and how many times it was asked to
+        /// make one.
+        status: lightning_backend::PaymentStatus,
+        pay_calls: std::sync::Mutex<u32>,
+    }
+
+    impl MockLn {
+        fn new(preimage: [u8; 32]) -> Self {
+            Self {
+                preimage,
+                status: lightning_backend::PaymentStatus::Unknown,
+                pay_calls: std::sync::Mutex::new(0),
+            }
+        }
+        fn with_status(mut self, status: lightning_backend::PaymentStatus) -> Self {
+            self.status = status;
+            self
+        }
     }
     #[async_trait::async_trait]
     impl LightningBackend for MockLn {
@@ -233,6 +341,7 @@ mod tests {
             Err(LightningError::NotImplemented("mock".into()))
         }
         async fn pay_invoice(&self, _: &str, _: u64) -> lightning_backend::Result<PaymentResult> {
+            *self.pay_calls.lock().unwrap() += 1;
             // Simulate the hold invoice eventually settling.
             Ok(PaymentResult {
                 preimage: self.preimage,
@@ -243,7 +352,7 @@ mod tests {
             &self,
             _ph: [u8; 32],
         ) -> lightning_backend::Result<lightning_backend::PaymentStatus> {
-            Ok(lightning_backend::PaymentStatus::Unknown)
+            Ok(self.status.clone())
         }
         async fn decode_invoice(&self, _: &str) -> lightning_backend::Result<DecodedInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
@@ -268,7 +377,7 @@ mod tests {
         };
         let dest = ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap();
 
-        let ln: Arc<dyn LightningBackend> = Arc::new(MockLn { preimage });
+        let ln: Arc<dyn LightningBackend> = Arc::new(MockLn::new(preimage));
         let mc = Arc::new(
             MockChain::new()
                 .with_funding(FundingUtxo {
@@ -292,9 +401,18 @@ mod tests {
             timeout_height: TIMEOUT,
         };
 
-        execute_reverse_swap(ln, chain, claim, 10_000, 1, Duration::from_millis(0))
-            .await
-            .unwrap();
+        execute_reverse_swap(
+            ln,
+            chain,
+            claim,
+            10_000,
+            1,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await
+        .unwrap();
 
         // A claim carrying the preimage was broadcast at the funding outpoint.
         let broadcasts = mc.broadcasts();
@@ -303,5 +421,140 @@ mod tests {
             extract_preimage(&broadcasts[0], &outpoint, &ph),
             Some(preimage)
         );
+    }
+
+    /// A resumed reverse client must not pay the hold invoice again.
+    ///
+    /// The first run's payment is held against the same hash, and a second one is a second
+    /// payment: the provider settles once, on a preimage that is about to become public, and the
+    /// other is left to time out through whatever route it took. The node is the only thing that
+    /// knows a payment is in flight, so a resumed run asks it.
+    #[tokio::test]
+    async fn a_resumed_client_does_not_pay_the_invoice_twice() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_r, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, 5000);
+        let htlc_spk = htlc_p2wsh_address(&script, Network::Regtest).script_pubkey();
+        let outpoint = OutPoint {
+            txid: BTxid::from_str(
+                "3333333333333333333333333333333333333333333333333333333333333333",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+
+        let ln =
+            Arc::new(MockLn::new(preimage).with_status(lightning_backend::PaymentStatus::InFlight));
+        let mc = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+
+        let claim = ReverseClaim {
+            htlc_script: script,
+            htlc_spk,
+            onchain_amount_sat: AMOUNT,
+            invoice: "lnbcrt-mock".into(),
+            preimage,
+            claim_key: claim_sk,
+            dest_spk: ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap(),
+            fee_rate_sat_vb: 5,
+            timeout_height: TIMEOUT,
+        };
+
+        execute_reverse_swap(
+            ln.clone(),
+            mc.clone(),
+            claim,
+            10_000,
+            1,
+            Duration::from_millis(0),
+            &Resume {
+                funding: Some(outpoint),
+                funding_intent_at_height: None,
+                our_spends: Vec::new(),
+            },
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            *ln.pay_calls.lock().unwrap(),
+            0,
+            "a payment already in flight must not be started again"
+        );
+        // And it still claimed, which is the point: the claim is what settles the held payment.
+        assert_eq!(mc.broadcasts().len(), 1);
+    }
+
+    /// The client used to look for an output of exactly the right value, so a provider funding a
+    /// slightly different amount looked like "not funded yet" and the client waited out the whole
+    /// timeout with its Lightning payment held. Classifying says what is wrong instead.
+    #[tokio::test]
+    async fn an_underfunded_htlc_is_refused_rather_than_waited_out() {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_r, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, 5000);
+        let htlc_spk = htlc_p2wsh_address(&script, Network::Regtest).script_pubkey();
+
+        let ln = Arc::new(MockLn::new(preimage));
+        let mc = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint: OutPoint {
+                        txid: BTxid::from_str(
+                            "3333333333333333333333333333333333333333333333333333333333333333",
+                        )
+                        .unwrap(),
+                        vout: 0,
+                    },
+                    value_sat: AMOUNT - 1,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+
+        let claim = ReverseClaim {
+            htlc_script: script,
+            htlc_spk,
+            onchain_amount_sat: AMOUNT,
+            invoice: "lnbcrt-mock".into(),
+            preimage,
+            claim_key: claim_sk,
+            dest_spk: ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap(),
+            fee_rate_sat_vb: 5,
+            timeout_height: TIMEOUT,
+        };
+
+        let err = execute_reverse_swap(
+            ln,
+            mc.clone(),
+            claim,
+            10_000,
+            1,
+            Duration::from_millis(0),
+            &Resume::default(),
+            &(),
+        )
+        .await
+        .expect_err("an underfunded HTLC must be refused");
+
+        assert!(
+            err.to_string().contains("not revealing the preimage"),
+            "got: {err}"
+        );
+        assert!(mc.broadcasts().is_empty(), "nothing was claimed");
     }
 }

@@ -119,6 +119,16 @@ pub fn record_funded(
     store.put(&rec).context("persist the funding outpoint")
 }
 
+/// Note a claim or refund this client is about to broadcast.
+///
+/// Written before the broadcast, so a later run recognises the transaction as its own instead of
+/// reading it as the counterparty's spend and abandoning a swap it was winning.
+pub fn record_our_spend(store: &dyn SwapStore, swap_id: Uuid, txid: bitcoin::Txid) -> Result<()> {
+    let mut rec = load(store, swap_id)?;
+    rec.note_our_spend(txid);
+    store.put(&rec).context("persist the broadcast spend")
+}
+
 /// Record a terminal outcome, keeping the record for audit.
 pub fn record_terminal(store: &dyn SwapStore, swap_id: Uuid, state: SwapState) -> Result<()> {
     let mut rec = load(store, swap_id)?;

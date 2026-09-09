@@ -20,7 +20,7 @@ use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
 use lightning_backend::{HoldInvoiceRequest, InvoiceState, LightningBackend};
 use std::time::Duration;
-use swap_common::chain::{run_blocking, ChainWatcher};
+use swap_common::chain::{run_blocking, select_recorded_funding, ChainWatcher};
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
 use swap_common::onchain::{
@@ -75,22 +75,7 @@ pub trait ProgressSink: Send + Sync {
 
 impl ProgressSink for () {}
 
-/// What a restarted driver knows about a swap that was already in flight.
-///
-/// Every field is something the record wrote down *before* an irreversible act. A fresh start
-/// passes [`Resume::default`] and the drivers behave exactly as they did before any of this
-/// existed; the fields only ever narrow what a resumed driver is willing to do.
-#[derive(Debug, Clone, Default)]
-pub struct Resume {
-    /// The HTLC funding outpoint, once it was known.
-    pub funding: Option<OutPoint>,
-    /// The tip height at which a funding broadcast was about to be attempted, still set because
-    /// no outpoint was ever recorded for it. Means "a funding may exist; go and look", and it is
-    /// enough on its own: a driver that sees it will never fund, however empty the chain looks.
-    pub funding_intent_at_height: Option<u32>,
-    /// Claim or refund transactions an earlier run put on the wire.
-    pub our_spends: Vec<Txid>,
-}
+pub use swap_common::store::Resume;
 
 /// State describing one provider-side reverse swap.
 pub struct ReverseSwap {
@@ -330,7 +315,15 @@ async fn await_recorded_funding(
         }
 
         let history = run_blocking(|| chain.find_historical_outputs(&swap.htlc_spk))?;
-        if let Some(op) = choose_recorded_funding(chain, swap, &history)? {
+        if let Some(op) = run_blocking(|| {
+            select_recorded_funding(
+                chain,
+                &swap.htlc_spk,
+                &swap.payment_hash,
+                swap.onchain_amount_sat,
+                &history,
+            )
+        })? {
             warn!(
                 "Reverse swap: the recorded funding is on chain at {op} and has been spent; \
                  adopting it rather than funding again"
@@ -357,50 +350,6 @@ async fn await_recorded_funding(
         }
         sleep(watch_poll).await;
     }
-}
-
-/// Pick which historical output to drive, out of those that could be this swap's funding.
-///
-/// More than one is possible: the HTLC address is public from the moment it is in a `SwapAccept`,
-/// and a resumed run that funded twice would leave two. The spend builders take a single input, so
-/// only one can be driven, and the one to prefer is whichever the counterparty claimed: its spend
-/// carries the preimage, which is what settles the Lightning leg and pays for the swap.
-fn choose_recorded_funding(
-    chain: &dyn ChainWatcher,
-    swap: &ReverseSwap,
-    history: &[swap_common::chain::HistoricalOutput],
-) -> Result<Option<OutPoint>> {
-    let mut candidates: Vec<_> = history
-        .iter()
-        .filter(|h| h.value_sat == swap.onchain_amount_sat)
-        .collect();
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    // Deepest first, so the choice does not change with the order a server happens to return.
-    candidates.sort_by(|a, b| {
-        b.confirmations
-            .cmp(&a.confirmations)
-            .then_with(|| a.outpoint.txid.cmp(&b.outpoint.txid))
-            .then_with(|| a.outpoint.vout.cmp(&b.outpoint.vout))
-    });
-
-    if candidates.len() > 1 {
-        warn!(
-            "Reverse swap: {} outputs have paid the HTLC script; preferring one whose spend \
-             reveals the preimage",
-            candidates.len()
-        );
-        for c in &candidates {
-            let Some(tx) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &c.outpoint))? else {
-                continue;
-            };
-            if extract_preimage(&tx, &c.outpoint, &swap.payment_hash).is_some() {
-                return Ok(Some(c.outpoint));
-            }
-        }
-    }
-    Ok(Some(candidates[0].outpoint))
 }
 
 /// Cancel the hold invoice, logging rather than failing.
@@ -1284,9 +1233,15 @@ mod tests {
         let history = chain.find_historical_outputs(&swap.htlc_spk).unwrap();
         assert_eq!(history.len(), 2);
 
-        let chosen = choose_recorded_funding(&chain, &swap, &history)
-            .unwrap()
-            .expect("one of the candidates must be chosen");
+        let chosen = select_recorded_funding(
+            &chain,
+            &swap.htlc_spk,
+            &swap.payment_hash,
+            swap.onchain_amount_sat,
+            &history,
+        )
+        .unwrap()
+        .expect("one of the candidates must be chosen");
         assert_eq!(chosen, funding_outpoint());
     }
 

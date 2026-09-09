@@ -6,8 +6,8 @@ use swap_common::SwapDirection;
 #[derive(Parser, Debug)]
 #[command(name = "swap-client", version, about)]
 struct Cli {
-    /// Provider's pubky.
-    provider: String,
+    /// Provider's pubky. Not needed with --resume-only.
+    provider: Option<String>,
 
     /// Pubky recovery file path (mutually exclusive with --recovery-phrase).
     recovery_file: Option<String>,
@@ -26,9 +26,9 @@ struct Cli {
     #[arg(long, default_value = "reverse")]
     direction: String,
 
-    /// Amount in satoshis.
+    /// Amount in satoshis. Not needed with --resume-only.
     #[arg(long)]
-    amount: u64,
+    amount: Option<u64>,
 
     /// LND gRPC endpoint used to pay the hold invoice (reverse-swap execution).
     #[arg(long, default_value = "https://127.0.0.1:10009")]
@@ -115,6 +115,14 @@ struct Cli {
     /// isn't already following us starts polling us. Requires a build with `--features iroh`.
     #[arg(long)]
     rendezvous_iroh: bool,
+
+    /// Drive any swaps a previous run left in flight, then exit without starting a new one.
+    ///
+    /// This is the recovery path. A swap that was interrupted still has money in it: the client's
+    /// own coins in a submarine swap's HTLC, or a Lightning payment held against a reverse swap's
+    /// HTLC that only this client can claim. Neither needs the provider to be reachable.
+    #[arg(long)]
+    resume_only: bool,
 }
 
 fn parse_direction(s: &str) -> anyhow::Result<SwapDirection> {
@@ -146,14 +154,30 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // A resume needs nothing from the provider: everything a swap needs to finish is already on
+    // disk, which is the point of writing it there.
+    let (provider_pkarr, amount_sat) = if cli.resume_only {
+        (cli.provider.unwrap_or_default(), cli.amount.unwrap_or(0))
+    } else {
+        match (cli.provider, cli.amount) {
+            (Some(p), Some(a)) => (p, a),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "a swap needs <provider> and --amount; pass --resume-only to finish swaps a \
+                     previous run left in flight instead"
+                ))
+            }
+        }
+    };
+
     let config = ClientConfig {
         recovery_method,
         recovery_value,
         passphrase: cli.pass,
         network: cli.network,
-        provider_pkarr: cli.provider,
+        provider_pkarr,
         direction: parse_direction(&cli.direction)?,
-        amount_sat: cli.amount,
+        amount_sat,
         lightning_backend: cli.lightning,
         beignet_url: cli.beignet_url,
         beignet_token: cli.beignet_token,
@@ -176,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         max_total_sat: cli.max_total_sat,
         data_dir: cli.data_dir,
         rendezvous_iroh: cli.rendezvous_iroh,
+        resume_only: cli.resume_only,
     };
 
     run(config).await
