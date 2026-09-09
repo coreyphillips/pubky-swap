@@ -164,6 +164,8 @@ mod tests {
             valid_until_unix: 0,
             onchain_fee_sat,
             fee_rate_sat_vb: 5,
+            protocol_version: swap_common::messages::PROTOCOL_VERSION,
+            features: Vec::new(),
         };
 
         // Quiet mempool: the configured minimum stands.

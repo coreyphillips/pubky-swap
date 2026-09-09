@@ -47,6 +47,14 @@ pub enum SwapRole {
 /// debugging a stuck swap.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SwapRecord {
+    /// The shape this record was written in.
+    ///
+    /// Every optional field here is `#[serde(default)]`, which is what lets an old record load
+    /// into a new build. It is also what makes a *renamed* field load silently as its default,
+    /// so a record holding a funding outpoint could come back holding none. This is the version
+    /// that would make that loud instead.
+    #[serde(default = "current_record_version")]
+    pub record_version: u16,
     pub swap_id: Uuid,
     /// Which side wrote this record. Absent on records written before roles existed, which were
     /// all the provider's.
@@ -209,6 +217,15 @@ impl Resume {
     }
 }
 
+/// The record shape this build writes.
+pub const RECORD_VERSION: u16 = 1;
+
+/// A record written before versioning is version 0, and every field it lacks is one this build
+/// added with a default. That is exactly the compatibility `#[serde(default)]` already provides.
+fn current_record_version() -> u16 {
+    0
+}
+
 /// How many of our own claim/refund txids a record keeps.
 ///
 /// Escalation replaces a transaction rather than adding one, so only the most recent handful can
@@ -220,6 +237,7 @@ impl SwapRecord {
     /// Zeroed progress/diagnostic fields, so a constructor can name only the swap's own details.
     pub fn new_progress() -> Self {
         Self {
+            record_version: RECORD_VERSION,
             swap_id: Uuid::nil(),
             role: SwapRole::Provider,
             direction: SwapDirection::Reverse,

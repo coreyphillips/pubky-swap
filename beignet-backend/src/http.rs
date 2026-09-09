@@ -70,7 +70,12 @@ impl BeignetConfig {
     }
 }
 
-/// beignet answers every call with the same envelope.
+/// Fetch a route that answers with a bare document rather than the usual envelope.
+///
+/// There is exactly one: `GET /openapi.json` returns the specification itself, since it is meant
+/// to be readable by tools that know nothing about this API's conventions. Putting it through
+/// the envelope decoder fails, and the caller that reads it is the startup capability probe,
+/// whose failure mode is answering "no" to every question.
 #[derive(serde::Deserialize)]
 struct Envelope<T> {
     ok: bool,
@@ -89,9 +94,13 @@ struct EnvelopeError {
 pub enum Retry {
     /// Safe to repeat: reading, or a write whose effect is the same twice.
     Safe,
-    /// Never repeat. `POST /send` is the case that matters: beignet does not honour
-    /// `X-Idempotency-Key` on it, so a lost response is indistinguishable from a lost request,
-    /// and repeating it would spend the money twice.
+    /// Never repeat. `POST /send` is the case that matters: a lost response is
+    /// indistinguishable from a lost request, and repeating it would spend the money twice.
+    ///
+    /// beignet honours `X-Idempotency-Key` on `/send` since 0.15.0, which would make a retry
+    /// safe against a daemon new enough. This stays as it is anyway, because the callers no
+    /// longer need it: a funding whose outcome is unknown is now watched for on chain rather
+    /// than attempted again, which is correct whatever the daemon in front of us supports.
     Never,
 }
 
@@ -146,6 +155,40 @@ impl BeignetHttp {
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, BeignetError> {
         self.send(reqwest::Method::GET, path, None::<&()>, Retry::Safe, None)
             .await
+    }
+
+    /// Fetch a route that answers with a bare document rather than the usual envelope.
+    ///
+    /// See the note above `Envelope`: `GET /openapi.json` is the only one, and reading it through
+    /// the envelope decoder fails on every real daemon.
+    pub async fn get_unenveloped<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<T, BeignetError> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .send()
+            .await
+            .map_err(|e| BeignetError::Transport(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| BeignetError::Transport(format!("reading the body: {e}")))?;
+        if !(200..300).contains(&status) {
+            return Err(BeignetError::Api(BeignetApiError {
+                http_status: status,
+                code: "HTTP_ERROR".into(),
+                message: text.chars().take(200).collect::<String>(),
+            }));
+        }
+        serde_json::from_str(&text).map_err(|e| {
+            BeignetError::Decode(format!(
+                "HTTP {status} body did not parse ({e}): {}",
+                text.chars().take(200).collect::<String>()
+            ))
+        })
     }
 
     pub async fn post<B: Serialize, T: DeserializeOwned>(

@@ -106,7 +106,10 @@ async fn request_field_supported(
     properties_pointer: &str,
     field: &str,
 ) -> bool {
-    let spec: serde_json::Value = match http.get("/openapi.json").await {
+    // Unenveloped: this one route answers with the specification itself. Reading it through the
+    // envelope decoder fails on every real daemon, and this function's failure mode is answering
+    // "no" to every capability question, which silently drops both swap directions.
+    let spec: serde_json::Value = match http.get_unenveloped("/openapi.json").await {
         Ok(v) => v,
         Err(e) => {
             warn!("could not read beignet's OpenAPI document ({e}); assuming {field} is absent");

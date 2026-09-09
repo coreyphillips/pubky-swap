@@ -38,6 +38,27 @@ pub enum SwapMessage {
     Reject(Reject),
 }
 
+/// The wire protocol this build speaks.
+///
+/// Bumped when a change would make one side act on a message the other meant differently. Adding
+/// an optional field is not that: `#[serde(default)]` already carries those, and the codebase has
+/// used it that way from the start. What it is for is the change that cannot be expressed as an
+/// absent field, and `CoopSignature`'s deliberately opaque payload is the one already on the
+/// roadmap.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Versions this build can complete a swap against.
+///
+/// Version 0 is every build before versioning existed, which sends no version at all and is
+/// otherwise wire-compatible with this one. Treating an absent field as 0 rather than as an error
+/// is what lets that keep working.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u16 = 0;
+
+/// Whether a counterparty's protocol version is one this build can complete a swap against.
+pub fn protocol_version_supported(version: u16) -> bool {
+    (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
+}
+
 /// A provider's advertised swap capabilities and rates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapOffer {
@@ -72,6 +93,18 @@ pub struct SwapOffer {
     /// quote assumes.
     #[serde(default)]
     pub fee_rate_sat_vb: u64,
+    /// The wire protocol this provider speaks. Absent means 0: a build from before versioning.
+    ///
+    /// Compatibility was inferred from which fields happened to be present, and there is even a
+    /// comment in `validate` acknowledging it ("a v0 provider sends neither part, which is why
+    /// this only binds when at least one is present"). That works for exactly one change and then
+    /// stops: two absent-field conventions layered on each other cannot be told apart.
+    #[serde(default)]
+    pub protocol_version: u16,
+    /// Optional capabilities this provider has, for changes that are additive rather than
+    /// breaking. Unknown entries are ignored, which is the point.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 /// A quoted fee, split so the client can see what it is paying for.
@@ -133,6 +166,15 @@ pub struct QuoteRequest {
     pub client_pkarr: String,
     pub direction: SwapDirection,
     pub amount_sat: u64,
+    /// The wire protocol this client speaks. Absent means 0: a build from before versioning.
+    ///
+    /// This is the first message a client sends, so it is where a mismatch costs least: nothing
+    /// has been quoted, nothing reserved, and no key generated.
+    #[serde(default)]
+    pub protocol_version: u16,
+    /// Optional capabilities this client has. Unknown entries are ignored.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +200,12 @@ pub struct Quote {
     pub htlc_timeout_blocks: u32,
     pub required_confirmations: u32,
     pub valid_until_unix: u64,
+    /// The wire protocol this provider speaks. Absent means 0.
+    ///
+    /// Also on `SwapOffer`, and the check belongs on both: an offer is what a client will read
+    /// once discovery exists, and a quote is what it reads today.
+    #[serde(default)]
+    pub protocol_version: u16,
 }
 
 impl Quote {
@@ -246,7 +294,39 @@ mod tests {
             valid_until_unix: 0,
             onchain_fee_sat: 0,
             fee_rate_sat_vb: 0,
+            protocol_version: PROTOCOL_VERSION,
+            features: Vec::new(),
         }
+    }
+
+    /// Compatibility used to be inferred from which fields were present, which works for exactly
+    /// one change: two absent-field conventions layered on each other cannot be told apart. A
+    /// counterparty from before versioning sends no version at all, and reads as 0.
+    #[test]
+    fn a_message_without_a_version_reads_as_the_one_before_versioning() {
+        let json = serde_json::json!({
+            "offer_id": "00000000-0000-0000-0000-000000000000",
+            "client_pkarr": "client",
+            "direction": "submarine",
+            "amount_sat": 50_000
+        });
+        let req: QuoteRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.protocol_version, 0);
+        assert!(req.features.is_empty());
+        assert!(
+            protocol_version_supported(req.protocol_version),
+            "a build from before versioning is still one we can swap with"
+        );
+    }
+
+    #[test]
+    fn a_version_from_the_future_is_not_supported() {
+        assert!(protocol_version_supported(PROTOCOL_VERSION));
+        assert!(protocol_version_supported(MIN_SUPPORTED_PROTOCOL_VERSION));
+        assert!(
+            !protocol_version_supported(PROTOCOL_VERSION + 1),
+            "a counterparty speaking something newer may mean any field differently"
+        );
     }
 
     #[test]
@@ -297,6 +377,7 @@ mod tests {
             htlc_timeout_blocks: 144,
             required_confirmations: 1,
             valid_until_unix: 1_000,
+            protocol_version: PROTOCOL_VERSION,
         };
         assert!(!q.is_expired(999));
         assert!(q.is_expired(1_000));
