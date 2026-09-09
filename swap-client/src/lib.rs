@@ -339,6 +339,17 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     }
     transport.add_known_peer(config.provider_pkarr.clone());
 
+    // Everything already in this conversation belongs to an earlier run, and none of it is the
+    // answer to a question this one has not asked yet. Without this, a second run against the same
+    // provider reads the previous run's quote out of the conversation history and refuses it as
+    // expired, having never looked at the reply to the request it actually sent.
+    if let Err(e) = transport
+        .mark_conversation_seen(&config.provider_pkarr)
+        .await
+    {
+        warn!("could not read the existing conversation with the provider ({e}); a reply from an earlier run may be picked up instead of this one's");
+    }
+
     // Optionally ring the provider's iroh doorbell so a provider that isn't already following us
     // starts polling us for the swap DM below.
     maybe_ring_provider(&config).await;
