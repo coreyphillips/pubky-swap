@@ -355,6 +355,13 @@ struct IssuedQuote {
     expires_at_unix: u64,
 }
 
+/// The advertised offer, which does not exist for the first moments of a run.
+///
+/// Empty until the backends have been probed and it can be priced. That window used to be
+/// invisible because nothing could ask about it; the status API can, and it exists precisely to
+/// answer while the daemon is still working out whether it can serve anything.
+pub type SharedOffer = Arc<RwLock<Option<SwapOffer>>>;
+
 /// Shared execution context handed to message handlers and spawned driver tasks.
 #[derive(Clone)]
 struct ExecCtx {
@@ -619,7 +626,7 @@ fn spawn_offer_refresher(
     provider_pkarr: &str,
     network: Network,
     lightning_node_id: Option<String>,
-    offer: Arc<RwLock<SwapOffer>>,
+    offer: SharedOffer,
 ) {
     let ctx = ctx.clone();
     let config = config.clone();
@@ -643,7 +650,7 @@ fn spawn_offer_refresher(
             };
             let changed = {
                 let current = offer.read().await;
-                current.onchain_fee_sat != fresh.onchain_fee_sat
+                current.as_ref().map(|o| o.onchain_fee_sat) != Some(fresh.onchain_fee_sat)
             };
             if changed {
                 info!(
@@ -653,7 +660,7 @@ fn spawn_offer_refresher(
                     fresh.effective_min_amount_sat()
                 );
             }
-            *offer.write().await = fresh;
+            *offer.write().await = Some(fresh);
         }
     });
 }
@@ -690,6 +697,29 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     };
     let provider_pkarr = transport.public_key_string();
     info!("Provider pubky: {provider_pkarr}");
+
+    // Everything the status API needs, built before anything that talks to a network.
+    //
+    // The order matters more than it looks. Probing the backends is where a start can take half a
+    // minute: an Electrum server that is down answers with a timeout, not a refusal. That is
+    // exactly the moment an operator opens the dashboard, and until this moved the dashboard had
+    // nothing to ask, because the API started after the probes it was needed to report on.
+    let store: Arc<dyn SwapStore> = Arc::new(
+        JsonFileSwapStore::new(format!("{}/swaps", config.data_dir)).context("open swap store")?,
+    );
+    let risk = risk::RiskManager::new(risk_limits(&config));
+    let offer: SharedOffer = Arc::new(RwLock::new(None));
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(feature = "status")]
+    status::spawn(status::State {
+        config: Arc::new(config.clone()),
+        store: store.clone(),
+        risk: risk.clone(),
+        offer: offer.clone(),
+        ready: ready.clone(),
+        provider_pkarr: provider_pkarr.clone(),
+    })
+    .await?;
 
     // Lightning backend (real with `--features lnd`, else a stub).
     let ln = make_backend(&config).await;
@@ -778,10 +808,6 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         );
     }
 
-    let store: Arc<dyn SwapStore> = Arc::new(
-        JsonFileSwapStore::new(format!("{}/swaps", config.data_dir)).context("open swap store")?,
-    );
-
     let transport = Arc::new(transport);
     let ctx = ExecCtx {
         transport: transport.clone(),
@@ -797,10 +823,12 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         quote_ttl_secs: config.quote_ttl_secs,
         quotes: Arc::new(Mutex::new(HashMap::new())),
         store,
-        risk: risk::RiskManager::new(risk_limits(&config)),
+        risk,
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
     };
+    // The daemon has worked out what it can do; tell anything watching.
+    ready.store(capable, std::sync::atomic::Ordering::Relaxed);
 
     // Resume any swaps that were in flight when we last shut down / crashed.
     resume_swaps(&ctx);
@@ -819,30 +847,27 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     // It carries `valid_until_unix`, computed from the quote TTL, so an offer built once went
     // stale after `quote_ttl_secs` and stayed that way for the life of the process. It also
     // carries a fee estimate, which is only meaningful if it tracks the mempool.
-    let offer = Arc::new(RwLock::new(build_offer(
-        &config,
-        &provider_pkarr,
-        network,
-        lightning_node_id.clone(),
-        offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb),
-    )?));
     {
-        let o = offer.read().await;
+        let built = build_offer(
+            &config,
+            &provider_pkarr,
+            network,
+            lightning_node_id.clone(),
+            offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb),
+        )?;
         info!(
             "Advertising offer {} ({}..{} sat, dirs: {:?}); on-chain cost priced at {} sat at \
              {} sat/vB, so the effective minimum is {} sat",
-            o.offer_id,
-            o.min_amount_sat,
-            o.max_amount_sat,
-            o.directions,
-            o.onchain_fee_sat,
-            o.fee_rate_sat_vb,
-            o.effective_min_amount_sat()
+            built.offer_id,
+            built.min_amount_sat,
+            built.max_amount_sat,
+            built.directions,
+            built.onchain_fee_sat,
+            built.fee_rate_sat_vb,
+            built.effective_min_amount_sat()
         );
+        *offer.write().await = Some(built);
     }
-    // The status API, if one is configured. After the offer exists, since it serves it.
-    #[cfg(feature = "status")]
-    status::spawn(&ctx, offer.clone(), &config, &provider_pkarr).await?;
 
     spawn_offer_refresher(
         &ctx,
@@ -858,7 +883,9 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     }
     if config.broadcast_offer {
         for peer in transport.get_known_peers() {
-            let current = offer.read().await.clone();
+            let Some(current) = offer.read().await.clone() else {
+                break;
+            };
             if let Err(e) = transport.send(&peer, &SwapMessage::Offer(current)).await {
                 debug!("failed to send offer to {peer}: {e}");
             }
@@ -872,7 +899,12 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             .await
             .unwrap_or_default();
         for (sender, msg) in messages {
-            let current = offer.read().await.clone();
+            // No offer yet means the daemon is still working out what it can serve. Nothing to
+            // quote against, so nothing to answer; the message stays unprocessed and comes round
+            // again on the next poll.
+            let Some(current) = offer.read().await.clone() else {
+                continue;
+            };
             if let Err(e) = handle_message(&ctx, &current, &sender, msg).await {
                 warn!("error handling message from {sender}: {e}");
             }

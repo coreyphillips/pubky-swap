@@ -24,22 +24,32 @@
 //! the preimage. Every response is built from a view type that has no field for either, so the
 //! secret cannot reach the wire through a struct someone later adds a `Serialize` to.
 
-use crate::{risk, ExecCtx, ProviderConfig};
+use crate::{risk, ProviderConfig, SharedOffer};
 use anyhow::{Context, Result};
-use axum::extract::State;
+use axum::extract::State as Extract;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use swap_common::store::SwapRecord;
-use swap_common::{messages::SwapOffer, SwapState};
+use swap_common::SwapState;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// The file the token lives in, under the data directory.
 const TOKEN_FILE: &str = "status.token";
+
+/// How often the health report is recomputed.
+///
+/// It is not computed per request. Every check in it is a network call, some against a node that
+/// answers a timeout rather than a refusal when it is down, so serving it on demand would make a
+/// dashboard's poll take thirty seconds and would have it reconnecting to LND every few seconds
+/// for as long as anyone had the page open.
+const HEALTH_REFRESH: Duration = Duration::from_secs(15);
 
 /// How many finished swaps `/swaps` reports, newest first.
 ///
@@ -73,36 +83,48 @@ fn load_or_create_token(data_dir: &str) -> Result<String> {
     Ok(token)
 }
 
+/// What the status API reports on.
+///
+/// Deliberately not the execution context. This reports *on* the daemon rather than being part of
+/// it, and building it out of parts rather than out of `ExecCtx` is what lets it start before the
+/// backends are probed. Everything here exists before anything talks to a network.
+pub(crate) struct State {
+    pub config: Arc<ProviderConfig>,
+    pub store: Arc<dyn swap_common::store::SwapStore>,
+    pub risk: Arc<risk::RiskManager>,
+    pub offer: SharedOffer,
+    /// Set once the daemon has worked out whether it can execute swaps. False until then, which
+    /// is the honest answer while it is still finding out.
+    pub ready: Arc<AtomicBool>,
+    pub provider_pkarr: String,
+}
+
+/// The last health report, and when it was taken.
+type CachedHealth = Arc<RwLock<Option<(crate::preflight::Report, u64)>>>;
+
 #[derive(Clone)]
 struct Api {
-    ctx: ExecCtx,
-    offer: Arc<RwLock<SwapOffer>>,
-    config: Arc<ProviderConfig>,
-    provider_pkarr: String,
+    state: Arc<State>,
     token: String,
+    health: CachedHealth,
 }
 
 /// Start the status API, if one is configured.
 ///
 /// A bind failure is fatal rather than a warning: an operator who asked for a status API and did
 /// not get one would find out from a dashboard that says nothing is wrong.
-pub(crate) async fn spawn(
-    ctx: &ExecCtx,
-    offer: Arc<RwLock<SwapOffer>>,
-    config: &ProviderConfig,
-    provider_pkarr: &str,
-) -> Result<()> {
-    let Some(addr) = config.status_addr.clone().filter(|a| !a.is_empty()) else {
+pub(crate) async fn spawn(state: State) -> Result<()> {
+    let Some(addr) = state.config.status_addr.clone().filter(|a| !a.is_empty()) else {
         return Ok(());
     };
-    let token = load_or_create_token(&config.data_dir)?;
+    let token = load_or_create_token(&state.config.data_dir)?;
     let api = Api {
-        ctx: ctx.clone(),
-        offer,
-        config: Arc::new(config.clone()),
-        provider_pkarr: provider_pkarr.to_string(),
+        state: Arc::new(state),
         token,
+        health: Arc::new(RwLock::new(None)),
     };
+    let data_dir = api.state.config.data_dir.clone();
+    spawn_health_refresher(api.clone());
 
     let router = Router::new()
         .route("/health", get(health))
@@ -116,10 +138,7 @@ pub(crate) async fn spawn(
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind the status API to {addr}"))?;
-    info!(
-        "status API on http://{addr} (token in {}/{TOKEN_FILE})",
-        config.data_dir
-    );
+    info!("status API on http://{addr} (token in {data_dir}/{TOKEN_FILE})");
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router).await {
             warn!("status API stopped: {e}");
@@ -212,9 +231,28 @@ struct CheckView {
     remedy: Option<String>,
 }
 
-async fn health(State(api): State<Api>, headers: axum::http::HeaderMap) -> Response {
+/// Recompute the health report on a timer, starting immediately.
+fn spawn_health_refresher(api: Api) {
+    tokio::spawn(async move {
+        loop {
+            let report = crate::preflight::diagnose(&api.state.config).await;
+            *api.health.write().await = Some((report, crate::now_unix()));
+            tokio::time::sleep(HEALTH_REFRESH).await;
+        }
+    });
+}
+
+async fn health(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
-    let report = crate::preflight::diagnose(&api.config).await;
+    // The first report can take as long as the slowest backend takes to answer, and until it
+    // lands there is nothing to say. Saying so beats blocking the caller for a timeout.
+    let Some((report, checked_at_unix)) = api.health.read().await.clone() else {
+        return Json(serde_json::json!({
+            "checking": true,
+            "detail": "the first health check has not finished yet",
+        }))
+        .into_response();
+    };
     let checks: Vec<CheckView> = report
         .checks
         .iter()
@@ -234,29 +272,40 @@ async fn health(State(api): State<Api>, headers: axum::http::HeaderMap) -> Respo
         "failures": report.failures(),
         "warnings": report.warnings(),
         "checks": checks,
+        // So a dashboard can say how fresh this is rather than implying it is live.
+        "checked_at_unix": checked_at_unix,
+        "refresh_secs": HEALTH_REFRESH.as_secs(),
     }))
     .into_response()
 }
 
-async fn status(State(api): State<Api>, headers: axum::http::HeaderMap) -> Response {
+async fn status(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
-    let offer = api.offer.read().await;
+    // `null` while the daemon is still working out what it can serve, which is a state the
+    // dashboard shows rather than an error it reports.
+    let directions = api
+        .state
+        .offer
+        .read()
+        .await
+        .as_ref()
+        .map(|o| o.directions.clone());
     Json(serde_json::json!({
-        "pubky": api.provider_pkarr,
-        "network": api.config.network,
+        "pubky": api.state.provider_pkarr,
+        "network": api.state.config.network,
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": swap_common::messages::PROTOCOL_VERSION,
-        "capable": api.ctx.capable,
-        "directions": offer.directions,
-        "in_flight": api.ctx.risk.in_flight(),
-        "committed_sat": api.ctx.risk.committed_sat(),
+        "capable": api.state.ready.load(Ordering::Relaxed),
+        "directions": directions,
+        "in_flight": api.state.risk.in_flight(),
+        "committed_sat": api.state.risk.committed_sat(),
     }))
     .into_response()
 }
 
-async fn swaps(State(api): State<Api>, headers: axum::http::HeaderMap) -> Response {
+async fn swaps(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
-    let store = api.ctx.store.clone();
+    let store = api.state.store.clone();
     let all = match store.load_all() {
         Ok(r) => r,
         Err(e) => {
@@ -284,9 +333,9 @@ async fn swaps(State(api): State<Api>, headers: axum::http::HeaderMap) -> Respon
     .into_response()
 }
 
-async fn limits(State(api): State<Api>, headers: axum::http::HeaderMap) -> Response {
+async fn limits(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
-    let risk = &api.ctx.risk;
+    let risk = &api.state.risk;
     let limits: &risk::RiskLimits = risk.limits();
     Json(serde_json::json!({
         "committed_sat": risk.committed_sat(),
@@ -302,15 +351,15 @@ async fn limits(State(api): State<Api>, headers: axum::http::HeaderMap) -> Respo
     .into_response()
 }
 
-async fn offer_route(State(api): State<Api>, headers: axum::http::HeaderMap) -> Response {
+async fn offer_route(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
-    let offer = api.offer.read().await.clone();
+    let offer = api.state.offer.read().await.clone();
     Json(offer).into_response()
 }
 
-async fn earnings(State(api): State<Api>, headers: axum::http::HeaderMap) -> Response {
+async fn earnings(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
-    let all = match api.ctx.store.load_all() {
+    let all = match api.state.store.load_all() {
         Ok(r) => r,
         Err(e) => {
             return (
