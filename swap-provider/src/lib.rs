@@ -988,12 +988,26 @@ async fn make_backend(config: &ProviderConfig) -> Arc<dyn LightningBackend> {
         {
             match beignet_http(config) {
                 Ok(http) => return Arc::new(BeignetLightningBackend::new(http)),
-                Err(e) => warn!("beignet client could not be built ({e}); falling back to stub"),
+                Err(e) => {
+                    warn!("beignet client could not be built ({e}); falling back to stub");
+                    // The reason travels with the stub. Everything downstream, the health check
+                    // included, reports whatever the backend says, and a generic answer sends an
+                    // operator looking in the wrong place.
+                    return Arc::new(StubBackend::with_reason(format!(
+                        "the beignet client could not be built: {e}"
+                    )));
+                }
             }
         }
         #[cfg(not(feature = "beignet"))]
-        warn!("--lightning beignet needs a build with --features beignet; falling back to stub");
-        return Arc::new(StubBackend::new());
+        {
+            warn!(
+                "--lightning beignet needs a build with --features beignet; falling back to stub"
+            );
+            return Arc::new(StubBackend::with_reason(
+                "this build has no beignet backend; rebuild with --features beignet",
+            ));
+        }
     }
 
     let lnd_config = LndConfig {
@@ -1003,16 +1017,24 @@ async fn make_backend(config: &ProviderConfig) -> Arc<dyn LightningBackend> {
     };
     #[cfg(feature = "lnd")]
     {
+        let address = lnd_config.address.clone();
         match LndBackend::connect(lnd_config).await {
-            Ok(b) => return Arc::new(b),
-            Err(e) => warn!("LND connect failed ({e}); falling back to stub backend"),
+            Ok(b) => Arc::new(b),
+            Err(e) => {
+                warn!("LND connect failed ({e}); falling back to stub backend");
+                Arc::new(StubBackend::with_reason(format!(
+                    "could not connect to LND at {address}: {e}"
+                )))
+            }
         }
     }
     #[cfg(not(feature = "lnd"))]
     {
         let _ = lnd_config;
+        Arc::new(StubBackend::with_reason(
+            "this build has no LND backend; rebuild with --features lnd (or full)",
+        ))
     }
-    Arc::new(StubBackend::new())
 }
 
 #[cfg(feature = "chain")]
