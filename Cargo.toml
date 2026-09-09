@@ -26,6 +26,9 @@ bitcoin = "0.32"
 # Pubky & Pkarr (same versions proven in bitcoin-batch-coordinator)
 pubky-messenger = { version = "0.3.0" }
 pkarr = "3.10"
+# Recovery-file decryption, for the iroh identity. One `pkarr` resolves across this and
+# pubky-messenger, so their `Keypair` is the same type and the secret is the same secret.
+pubky-common = "0.3"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
