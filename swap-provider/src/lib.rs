@@ -502,6 +502,16 @@ impl ProgressSink for StoreProgress {
     }
 }
 
+/// How often the reorg monitor samples the chain.
+const REORG_POLL: Duration = Duration::from_secs(30);
+
+/// Height-to-hash samples the reorg monitor retains. Well past any plausible reorg depth, and now
+/// cheap to verify: the whole watched window is read in one request.
+const REORG_CHECKPOINTS: usize = 200;
+
+/// Consecutive failed reorg samples before the operator is told the detector is off.
+const REORG_FAILURES_BEFORE_ALARM: u32 = 3;
+
 /// How long a terminal swap record is kept before the background sweeper removes it.
 const TERMINAL_RECORD_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
@@ -1643,37 +1653,100 @@ fn spawn_reorg_monitor(ctx: &ExecCtx) {
     };
     let store = ctx.store.clone();
     tokio::spawn(async move {
-        let mut monitor = swap_common::reorg::ReorgMonitor::new(100);
+        let mut monitor = swap_common::reorg::ReorgMonitor::new(REORG_CHECKPOINTS);
+        let mut consecutive_failures: u32 = 0;
         loop {
             match run_blocking(|| monitor.observe(chain.as_ref())) {
                 Ok(Some(fork)) => {
+                    consecutive_failures = 0;
                     warn!("chain reorg detected at height {fork}; re-validating in-flight swaps");
-                    if let Ok(records) = store.load_active() {
-                        for rec in records {
-                            let (Some(op), Ok(spk)) = (rec.funding_outpoint(), rec.htlc_spk())
-                            else {
-                                continue;
-                            };
-                            let still_funded = matches!(
-                                run_blocking(|| chain.find_funding(&spk, rec.onchain_amount_sat)),
-                                Ok(Some(ref u)) if u.outpoint == op
-                            );
-                            if !still_funded {
-                                warn!(
-                                    "swap {}: recorded funding {op} not found at required depth \
-                                     after the reorg; its driver will re-validate before acting",
-                                    rec.swap_id
-                                );
-                            }
-                        }
+                    // The drivers poll every two seconds, so the marker this writes is picked
+                    // up almost immediately without a wake-up channel to keep in sync.
+                    react_to_reorg(chain.as_ref(), store.as_ref(), fork);
+                }
+                Ok(None) => consecutive_failures = 0,
+                Err(e) => {
+                    // A monitor that cannot read the chain is a monitor that is off, and it used
+                    // to say so at `debug!`: an Electrum server that had been unreachable for
+                    // hours left reorg detection silently disabled. Say it once, loudly, and
+                    // then stop repeating it.
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    if consecutive_failures == REORG_FAILURES_BEFORE_ALARM {
+                        error!(
+                            "reorg detection has failed {consecutive_failures} times in a row \
+                             ({e}). Until the chain backend answers again, a reorg affecting a \
+                             live swap will not be noticed."
+                        );
+                    } else {
+                        debug!("reorg monitor: {e}");
                     }
                 }
-                Ok(None) => {}
-                Err(e) => debug!("reorg monitor: {e}"),
             }
-            sleep(Duration::from_secs(30)).await;
+            sleep(REORG_POLL).await;
         }
     });
+}
+
+/// Record a reorg against every swap it could have affected, and put back anything of ours that
+/// left the chain with it.
+///
+/// This used to end in a log line. The per-swap drivers do re-validate a great deal on their own,
+/// but two things only this can do: write the fact down, so a restart in the window inherits it,
+/// and re-broadcast a *funding* transaction, which no driver watches once its outpoint is known
+/// and which has no fee-bump loop of its own.
+fn react_to_reorg(chain: &dyn ChainWatcher, store: &dyn SwapStore, fork: u32) {
+    let records = match store.load_active() {
+        Ok(r) => r,
+        Err(e) => {
+            error!("reorg at {fork}: could not read in-flight swaps to re-validate them: {e}");
+            return;
+        }
+    };
+    for mut rec in records {
+        let Ok(spk) = rec.htlc_spk() else { continue };
+        let swap_id = rec.swap_id;
+
+        // Write the fact down first. Everything below is a best effort against a chain that may
+        // still be settling; the marker is what survives if this process does not.
+        rec.reorg_seen_at_height = Some(match rec.reorg_seen_at_height {
+            Some(seen) => seen.min(fork),
+            None => fork,
+        });
+        rec.updated_at_unix = now_unix();
+        if let Err(e) = store.put(&rec) {
+            error!("reorg at {fork}: could not mark swap {swap_id}: {e}");
+        }
+
+        let Some(op) = rec.funding_outpoint() else {
+            continue;
+        };
+        // Classify rather than asking for an exact value. The old check used `find_funding`,
+        // which matches the amount exactly and ignores depth, so an accepted overpayment always
+        // reported as "gone after the reorg" and the log said "at required depth" about a
+        // question it had not asked.
+        let outputs = match run_blocking(|| chain.find_outputs(&spk)) {
+            Ok(o) => o,
+            Err(e) => {
+                warn!("reorg at {fork}: could not re-read the funding of swap {swap_id}: {e}");
+                continue;
+            }
+        };
+        let still_funded = outputs
+            .iter()
+            .any(|u| u.outpoint == op && u.confirmations >= rec.required_confirmations);
+        if still_funded {
+            continue;
+        }
+
+        // The funding is not where the record says it is. The marker above is what makes that
+        // actionable: a driver reading it stops treating its recorded outpoint as established and
+        // goes back to the chain, which is the only thing that knows where the funding ended up.
+        warn!(
+            "reorg at {fork}: swap {swap_id}'s funding {op} is no longer confirmed to depth {}; \
+             its driver will re-establish it from the chain rather than trust the record",
+            rec.required_confirmations
+        );
+    }
 }
 
 /// On startup, re-spawn drivers for any swaps that were in flight at the last shutdown/crash.

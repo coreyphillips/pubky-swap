@@ -490,6 +490,7 @@ mod tests {
                 funding: Some(outpoint),
                 funding_intent_at_height: None,
                 our_spends: Vec::new(),
+                reorg_seen_at_height: None,
             },
             &(),
         )

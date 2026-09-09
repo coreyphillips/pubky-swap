@@ -131,6 +131,16 @@ pub trait ChainWatcher: Send + Sync {
     /// switched off, which is not something to arrive at by forgetting a method.
     fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>>;
 
+    /// Block hashes for `count` consecutive heights starting at `start_height`, in order.
+    ///
+    /// The batch form exists because reorg detection is the one thing here that reads many
+    /// heights at once. Asking one at a time meant two round trips per height against a server
+    /// that is usually shared and often rate-limited, which is enough that a monitor watching a
+    /// useful depth costs more than it is worth and gets configured down to a useless one.
+    ///
+    /// Returns fewer than `count` entries when the range runs past the tip, and never pads.
+    fn block_hashes_from(&self, start_height: u32, count: u16) -> Result<Vec<BlockHash>>;
+
     /// Cheap liveness probe, used by startup checks to fail loudly on an unreachable backend
     /// rather than at the first swap.
     fn health_check(&self) -> Result<()> {
