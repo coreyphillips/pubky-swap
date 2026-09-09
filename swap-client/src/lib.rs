@@ -293,6 +293,8 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         client_pkarr: client_pkarr.clone(),
         direction: config.direction,
         amount_sat: config.amount_sat,
+        protocol_version: swap_common::messages::PROTOCOL_VERSION,
+        features: Vec::new(),
     };
     transport
         .send(

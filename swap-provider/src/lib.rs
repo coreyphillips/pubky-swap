@@ -1112,6 +1112,8 @@ fn build_offer(
         valid_until_unix: now_unix().saturating_add(config.quote_ttl_secs),
         onchain_fee_sat,
         fee_rate_sat_vb,
+        protocol_version: PROTOCOL_VERSION,
+        features: Vec::new(),
     }
 }
 
@@ -1125,6 +1127,21 @@ async fn handle_message(
         SwapMessage::QuoteRequest(req) => {
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
                 return Ok(());
+            }
+            // The cheapest place to find a mismatch: nothing is quoted, nothing reserved, and no
+            // key generated. Finding it later means finding it with money already committed.
+            if !protocol_version_supported(req.protocol_version) {
+                return reject(
+                    &ctx.transport,
+                    sender,
+                    None,
+                    None,
+                    &format!(
+                        "protocol version {} is not supported (this provider speaks {}..={})",
+                        req.protocol_version, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
+                    ),
+                )
+                .await;
             }
             if !offer.supports(req.direction) {
                 return reject(&ctx.transport, sender, None, None, "unsupported direction").await;
@@ -1148,6 +1165,7 @@ async fn handle_message(
                 htlc_timeout_blocks: offer.htlc_timeout_blocks,
                 required_confirmations: offer.required_confirmations,
                 valid_until_unix: expires_at_unix,
+                protocol_version: PROTOCOL_VERSION,
             };
             {
                 let mut quotes = ctx.quotes.lock().await;

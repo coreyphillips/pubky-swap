@@ -74,6 +74,11 @@ impl ClientPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     QuoteIdMissing,
+    /// The counterparty speaks a wire protocol this build does not.
+    UnsupportedProtocolVersion {
+        got: u16,
+        max: u16,
+    },
     OfferMismatch {
         got: String,
         want: String,
@@ -147,6 +152,10 @@ impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::QuoteIdMissing => write!(f, "quote carries no id"),
+            Self::UnsupportedProtocolVersion { got, max } => write!(
+                f,
+                "the provider speaks wire protocol {got}, and this build speaks at most {max}"
+            ),
             Self::OfferMismatch { got, want } => {
                 write!(f, "quote is for offer {got}, not the requested {want}")
             }
@@ -253,6 +262,14 @@ pub fn validate_quote(
 ) -> Result<(), ValidationError> {
     if quote.quote_id.is_nil() {
         return Err(ValidationError::QuoteIdMissing);
+    }
+    // Before anything is derived from the quote. A provider speaking a protocol this build does
+    // not know may mean any field differently, and every check below reads those fields.
+    if !crate::messages::protocol_version_supported(quote.protocol_version) {
+        return Err(ValidationError::UnsupportedProtocolVersion {
+            got: quote.protocol_version,
+            max: crate::messages::PROTOCOL_VERSION,
+        });
     }
     // A nil offer id in the request means "your current offer", so only a named one binds.
     if !request.offer_id.is_nil() && quote.offer_id != request.offer_id {
@@ -502,6 +519,8 @@ mod tests {
             client_pkarr: "client".into(),
             direction,
             amount_sat: AMOUNT,
+            protocol_version: crate::messages::PROTOCOL_VERSION,
+            features: Vec::new(),
         }
     }
 
@@ -519,7 +538,35 @@ mod tests {
             htlc_timeout_blocks: 144,
             required_confirmations: 2,
             valid_until_unix: NOW + 300,
+            protocol_version: crate::messages::PROTOCOL_VERSION,
         }
+    }
+
+    /// Every check below `validate_quote`'s version gate reads a field whose meaning the version
+    /// defines, so the gate has to come first.
+    #[test]
+    fn a_quote_from_a_newer_protocol_is_refused() {
+        let req = request(SwapDirection::Reverse);
+        let mut q = quote(SwapDirection::Reverse);
+        q.offer_id = req.offer_id;
+        q.protocol_version = crate::messages::PROTOCOL_VERSION + 1;
+        assert_eq!(
+            validate_quote(&q, &req, NOW, &policy()),
+            Err(ValidationError::UnsupportedProtocolVersion {
+                got: crate::messages::PROTOCOL_VERSION + 1,
+                max: crate::messages::PROTOCOL_VERSION,
+            })
+        );
+    }
+
+    /// And one from before versioning is still fine, which is the whole reason absent means 0.
+    #[test]
+    fn a_quote_from_before_versioning_is_accepted() {
+        let req = request(SwapDirection::Reverse);
+        let mut q = quote(SwapDirection::Reverse);
+        q.offer_id = req.offer_id;
+        q.protocol_version = 0;
+        assert!(validate_quote(&q, &req, NOW, &policy()).is_ok());
     }
 
     fn accept(q: &Quote) -> SwapAccept {

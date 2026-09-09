@@ -288,8 +288,21 @@ impl Transport {
                     parsed.push(parsed_msg);
                 }
                 Err(e) => {
-                    // Not necessarily an error: could be a different message type.
-                    debug!("could not parse message from {peer_pkarr} as expected type: {e}");
+                    // Mark it seen anyway. Deserialization is deterministic, so a message that
+                    // does not parse now will not parse on the next poll either, and leaving it
+                    // unmarked meant re-fetching and re-failing on it forever. That is the shape
+                    // a counterparty running something newer takes: one message this build does
+                    // not understand, retried until the peer is evicted.
+                    warn!(
+                        "discarding a message from {peer_pkarr} that this build cannot parse \
+                         ({e}); the sender may be running a newer protocol"
+                    );
+                    if let Ok(mut processed) = self.processed_messages.write() {
+                        if processed.len() >= MAX_PROCESSED_IDS {
+                            processed.clear();
+                        }
+                        processed.insert(message_id);
+                    }
                 }
             }
         }
