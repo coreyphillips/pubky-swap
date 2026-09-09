@@ -18,8 +18,10 @@ chain = ["swap-common/electrum"]
 status = ["dep:axum", "dep:tower-http"]
 # Use a beignet daemon for Lightning and/or the on-chain wallet. Needs no protoc.
 beignet = ["dep:beignet-backend"]
-# Everything needed to actually execute swaps end-to-end.
-full = ["lnd", "bdk-wallet", "chain", "status"]
+# Everything needed to actually execute swaps end-to-end, and to be reached by someone who has
+# only been handed your pubky. `iroh` is in here rather than opt-in because without it a provider
+# can only receive from pubkys it already follows: see the doorbell note on `rendezvous_iroh`.
+full = ["lnd", "bdk-wallet", "chain", "status", "iroh"]
 # Learn interested client pubkys over the iroh P2P rendezvous (doorbell) instead of only the
 # follow graph. See pubky-transport's `p2p` module.
 iroh = ["pubky-transport/iroh"]

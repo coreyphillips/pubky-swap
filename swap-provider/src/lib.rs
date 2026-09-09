@@ -8,6 +8,16 @@
 //! sending the client a final `SwapStatusUpdate`. Without those pieces it stays
 //! negotiation-only and rejects `SwapRequest`s.
 
+// `rendezvous_iroh` is on by default, and without the `iroh` feature it is a setting with nothing
+// behind it: the provider would be reachable only by pubkys it already follows, which on a fresh
+// install is nobody. `full` is what the Umbrel image and every doc build, so the two travel
+// together, and this fires the moment someone separates them.
+#[cfg(all(feature = "full", not(feature = "iroh")))]
+compile_error!(
+    "`full` must include `iroh`: without it the provider answers no doorbell and can only be \
+     reached by pubkys it already follows."
+);
+
 pub mod preflight;
 pub mod pricing;
 pub mod reverse;
@@ -138,7 +148,16 @@ pub struct ProviderConfig {
     pub status_addr: Option<String>,
     /// Accept iroh P2P rendezvous connections (the "doorbell"): a client that knows our pubky can
     /// connect and be added to the poll set without a pre-existing follow. Requires the `iroh`
-    /// build feature.
+    /// build feature, which `full` includes.
+    ///
+    /// On by default, because off is a provider nobody new can reach. Pubky's private messages
+    /// live at a path derived from an ECDH shared secret between the two parties: unlinkable by
+    /// design, and therefore not enumerable, so `receive_all` can only poll pubkys already in the
+    /// peer set. That set comes from the follow graph. Someone handed only our pubky, which is
+    /// exactly what the docs tell them to ask for, writes into a conversation nothing will ever
+    /// look in. The doorbell is how they say "look at me" first.
+    ///
+    /// Set it false to run as a private provider that serves only counterparties it follows.
     pub rendezvous_iroh: bool,
 }
 
@@ -191,7 +210,7 @@ impl Default for ProviderConfig {
             data_dir: "./pubky-swap-data".to_string(),
             wallet_backend: "bdk".to_string(),
             peer_idle_ttl_secs: 3600,
-            rendezvous_iroh: false,
+            rendezvous_iroh: true,
             status_addr: None,
         }
     }
@@ -2132,6 +2151,22 @@ mod tests {
         assert!(!is_transient(&anyhow!("a bare string error")));
     }
     use super::*;
+
+    /// A provider that does not answer its doorbell can only be reached by someone it already
+    /// follows, which is nobody on a fresh install.
+    ///
+    /// Pubky's private messages live at a path derived from an ECDH shared secret, so they are
+    /// unlinkable and therefore not enumerable: `receive_all` can only poll pubkys already in the
+    /// peer set, and that set comes from the follow graph. Everything the project tells a user to
+    /// do, "share the pubky it prints", depends on the rendezvous being on. It was off, and the
+    /// feature that implements it was not in `full`.
+    #[test]
+    fn a_default_provider_answers_its_doorbell() {
+        assert!(
+            ProviderConfig::default().rendezvous_iroh,
+            "the default provider must be reachable by someone who only has its pubky"
+        );
+    }
 
     fn cfg(confs: u32, fee_floor: u64, allow_unsafe: bool) -> ProviderConfig {
         ProviderConfig {

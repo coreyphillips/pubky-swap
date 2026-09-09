@@ -158,10 +158,13 @@ struct Cli {
     #[arg(long)]
     peer_idle_ttl: Option<u64>,
 
-    /// Accept iroh P2P rendezvous connections (the "doorbell") so clients that know our pubky can
-    /// reach us without a pre-existing follow. Requires a build with `--features iroh`.
+    /// Stop accepting iroh P2P rendezvous connections (the "doorbell").
+    ///
+    /// The doorbell is how a counterparty who has only been handed your pubky reaches you, so it
+    /// is on by default. Turning it off makes this a private provider that serves only
+    /// counterparties already in its follow graph.
     #[arg(long)]
-    rendezvous_iroh: bool,
+    no_rendezvous_iroh: bool,
 
     /// Serve a read-only status API here, e.g. 127.0.0.1:9737. Off unless set.
     ///
@@ -305,7 +308,10 @@ impl Cli {
             data_dir: self.data_dir.clone(),
             wallet_backend: self.wallet.clone(),
             peer_idle_ttl_secs: self.peer_idle_ttl,
-            rendezvous_iroh: flag(self.rendezvous_iroh),
+            // Inverted, because the default is on: an unpassed flag has to leave the lower
+            // configuration layers alone, which is what `flag` exists for, and only `--no-...`
+            // has anything to say.
+            rendezvous_iroh: self.no_rendezvous_iroh.then_some(false),
             status_addr: self.status_addr.clone(),
         })
     }
