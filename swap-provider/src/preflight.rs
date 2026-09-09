@@ -354,6 +354,16 @@ async fn check_chain(
         ));
         return;
     }
+    // Feature-absent and connect-failed are different problems with different answers, and
+    // reporting one as the other sends an operator to rebuild a binary that is fine.
+    if !cfg!(feature = "chain") {
+        report.push(Check::fail(
+            "chain.electrum",
+            "this build has no chain watcher",
+            "rebuild with --features full",
+        ));
+        return;
+    }
     match crate::build_chain(config) {
         Some(chain) => match swap_common::chain::run_blocking(|| chain.tip_height()) {
             Ok(tip) => report.push(Check::pass(
@@ -368,8 +378,8 @@ async fn check_chain(
         },
         None => report.push(Check::fail(
             "chain.electrum",
-            "this build has no chain watcher",
-            "rebuild with --features full",
+            format!("could not connect to {}", config.electrum_url),
+            electrum_remedy(network),
         )),
     }
 }
@@ -426,7 +436,7 @@ async fn check_wallet(config: &crate::ProviderConfig, report: &mut Report) {
         }
         None => report.push(Check::fail(
             "wallet",
-            format!("no {} wallet could be built", config.wallet_backend),
+            format!("the {} wallet is not available", config.wallet_backend),
             match config.wallet_backend.as_str() {
                 "bdk" => "set PUBKY_SWAP_WALLET_MNEMONIC__FILE to a file holding the BIP39 \
                           mnemonic, and --electrum-url to a reachable server"
