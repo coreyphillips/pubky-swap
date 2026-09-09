@@ -39,6 +39,7 @@ Most execution code is behind cargo features so the default build stays toolchai
 | `electrum` | `swap-common` | `ElectrumWatcher`. |
 | `bdk-wallet` | `swap-provider` | BIP84 funding wallet. |
 | `chain` | `swap-provider`, `swap-client` | Electrum chain watcher. |
+| `status` | `swap-provider` | Read-only status API on loopback. |
 | `full` | `swap-provider`, `swap-client` | Everything needed to execute swaps. |
 
 When you add code behind a feature, build it explicitly (e.g.

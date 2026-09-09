@@ -162,6 +162,14 @@ struct Cli {
     /// reach us without a pre-existing follow. Requires a build with `--features iroh`.
     #[arg(long)]
     rendezvous_iroh: bool,
+
+    /// Serve a read-only status API here, e.g. 127.0.0.1:9737. Off unless set.
+    ///
+    /// Read-only by design: it exists so a dashboard or a health check can see what the daemon is
+    /// doing without parsing its logs. The bearer token it requires is written to
+    /// <data-dir>/status.token at 0600.
+    #[arg(long)]
+    status_addr: Option<String>,
 }
 
 /// What the operator typed, in the shape the config layers merge.
@@ -243,6 +251,8 @@ struct Overrides {
     peer_idle_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rendezvous_iroh: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status_addr: Option<String>,
 }
 
 /// A boolean flag contributes only when it is set.
@@ -296,6 +306,7 @@ impl Cli {
             wallet_backend: self.wallet.clone(),
             peer_idle_ttl_secs: self.peer_idle_ttl,
             rendezvous_iroh: flag(self.rendezvous_iroh),
+            status_addr: self.status_addr.clone(),
         })
     }
 }

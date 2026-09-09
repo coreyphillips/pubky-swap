@@ -103,6 +103,15 @@ impl std::fmt::Display for RejectReason {
     }
 }
 
+/// What one counterparty currently holds, projected out of [`PeerState`] for the operator.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PeerExposure {
+    pub peer: String,
+    pub committed_sat: u64,
+    pub in_flight: usize,
+    pub starts_this_hour: usize,
+}
+
 #[derive(Default)]
 struct PeerState {
     committed_sat: u64,
@@ -310,6 +319,32 @@ impl RiskManager {
     /// Swaps in flight right now.
     pub fn in_flight(&self) -> usize {
         self.locked().total_in_flight
+    }
+
+    /// What each counterparty currently holds, for the operator.
+    ///
+    /// The totals say whether the provider is near a ceiling; they do not say who put it there.
+    /// A per-peer view is the difference between "exposure is high" and "one counterparty has
+    /// most of it", which are the same number and different problems.
+    pub fn per_peer(&self) -> Vec<PeerExposure> {
+        let inner = self.locked();
+        let mut out: Vec<PeerExposure> = inner
+            .peers
+            .iter()
+            .filter(|(_, s)| s.in_flight > 0 || s.committed_sat > 0)
+            .map(|(peer, s)| PeerExposure {
+                peer: peer.clone(),
+                committed_sat: s.committed_sat,
+                in_flight: s.in_flight,
+                starts_this_hour: s.recent_starts.len(),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.committed_sat
+                .cmp(&a.committed_sat)
+                .then(a.peer.cmp(&b.peer))
+        });
+        out
     }
 }
 

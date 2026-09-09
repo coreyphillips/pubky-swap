@@ -78,6 +78,19 @@ pub struct SwapRecord {
     pub invoice: String,
     /// Submarine only: routing-fee cap (msat) for paying the invoice.
     pub max_routing_fee_msat: u64,
+    /// What this side charged for the service, from the quote it accepted.
+    ///
+    /// Realised revenue was recorded nowhere. `QuoteFee` splits it at quote time and the quote
+    /// map holds it in memory, but quotes are single-use and pruned, so by the time a swap
+    /// finished there was nothing left saying what it earned. Written at accept time, when it is
+    /// still known and before anything can go wrong with the swap.
+    #[serde(default)]
+    pub service_fee_sat: u64,
+    /// What this side expected the swap to cost it on chain, from the same quote. The difference
+    /// between this and the service fee is the margin; the difference between this and what was
+    /// actually spent is how good the estimate was.
+    #[serde(default)]
+    pub onchain_fee_sat: u64,
 
     // --- progress / idempotency ---
     pub required_confirmations: u32,
@@ -251,6 +264,8 @@ impl SwapRecord {
             secret_key_hex: String::new(),
             invoice: String::new(),
             max_routing_fee_msat: 0,
+            service_fee_sat: 0,
+            onchain_fee_sat: 0,
             required_confirmations: 0,
             funding_txid_hex: None,
             funding_vout: None,
@@ -381,6 +396,12 @@ pub trait SwapStore: Send + Sync {
     fn get(&self, swap_id: Uuid) -> Result<Option<SwapRecord>>;
     /// All non-terminal records, used on startup to resume.
     fn load_active(&self) -> Result<Vec<SwapRecord>>;
+    /// Every record, terminal or not.
+    ///
+    /// Terminal records are kept rather than deleted, which makes them the provider's own history
+    /// of what it did: what it earned, what it refunded, and what went wrong. Nothing read them
+    /// until there was a status surface to read them for.
+    fn load_all(&self) -> Result<Vec<SwapRecord>>;
     /// Record a swap's terminal state. Keeps the record for audit rather than deleting it.
     fn mark_terminal(&self, rec: &SwapRecord) -> Result<()>;
     /// Delete terminal records older than `retain`, returning how many were removed. Called only
@@ -493,6 +514,14 @@ impl SwapStore for JsonFileSwapStore {
     }
 
     fn load_active(&self) -> Result<Vec<SwapRecord>> {
+        Ok(self
+            .load_all()?
+            .into_iter()
+            .filter(|rec| !rec.state.is_terminal())
+            .collect())
+    }
+
+    fn load_all(&self) -> Result<Vec<SwapRecord>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.dir).with_context(|| format!("read dir {:?}", self.dir))? {
             let path = entry?.path();
@@ -507,8 +536,7 @@ impl SwapStore for JsonFileSwapStore {
                 }
             };
             match serde_json::from_slice::<SwapRecord>(&bytes) {
-                Ok(rec) if !rec.state.is_terminal() => out.push(rec),
-                Ok(_) => {} // terminal records that weren't cleaned up; ignore
+                Ok(rec) => out.push(rec),
                 Err(e) => tracing::warn!("skipping unparsable swap record {path:?}: {e}"),
             }
         }

@@ -12,6 +12,8 @@ pub mod preflight;
 pub mod pricing;
 pub mod reverse;
 pub mod risk;
+#[cfg(feature = "status")]
+pub mod status;
 /// Re-exported from `swap-common`, where the store now lives so the client can use it too.
 pub use swap_common::store;
 pub mod submarine;
@@ -129,6 +131,11 @@ pub struct ProviderConfig {
     /// follow graph do not grow without bound. `0` disables idle reaping. Peers are also evicted
     /// as soon as their swap completes, regardless of this value.
     pub peer_idle_ttl_secs: u64,
+    /// Address for the read-only status API, e.g. `127.0.0.1:9737`. Absent means no API.
+    ///
+    /// Loopback by default and read-only by design: it exists so a dashboard or a health check
+    /// can see what the daemon is doing without parsing its logs, not so anything can drive it.
+    pub status_addr: Option<String>,
     /// Accept iroh P2P rendezvous connections (the "doorbell"): a client that knows our pubky can
     /// connect and be added to the poll set without a pre-existing follow. Requires the `iroh`
     /// build feature.
@@ -185,6 +192,7 @@ impl Default for ProviderConfig {
             wallet_backend: "bdk".to_string(),
             peer_idle_ttl_secs: 3600,
             rendezvous_iroh: false,
+            status_addr: None,
         }
     }
 }
@@ -339,6 +347,10 @@ struct IssuedQuote {
     direction: SwapDirection,
     amount_sat: u64,
     fee_sat: u64,
+    /// The two halves of `fee_sat`, kept so the swap's record can say what it earned. The quote
+    /// map is single-use and pruned, so this is the last moment either number exists.
+    service_fee_sat: u64,
+    onchain_fee_sat: u64,
     /// Unix seconds after which this quote is no longer honoured (0 = never).
     expires_at_unix: u64,
 }
@@ -828,6 +840,10 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             o.effective_min_amount_sat()
         );
     }
+    // The status API, if one is configured. After the offer exists, since it serves it.
+    #[cfg(feature = "status")]
+    status::spawn(&ctx, offer.clone(), &config, &provider_pkarr).await?;
+
     spawn_offer_refresher(
         &ctx,
         &config,
@@ -1208,6 +1224,8 @@ async fn handle_message(
                         direction: req.direction,
                         amount_sat: req.amount_sat,
                         fee_sat: fee.total_fee_sat,
+                        service_fee_sat: fee.service_fee_sat,
+                        onchain_fee_sat: fee.onchain_fee_sat,
                         expires_at_unix,
                     },
                 );
@@ -1370,6 +1388,8 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         secret_key_hex: hex::encode(swap.refund_key.secret_bytes()),
         invoice: swap.invoice.clone(),
         max_routing_fee_msat: 0,
+        service_fee_sat: quote.service_fee_sat,
+        onchain_fee_sat: quote.onchain_fee_sat,
         required_confirmations: ctx.required_confirmations,
         funding_txid_hex: None,
         funding_vout: None,
@@ -1551,6 +1571,8 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         secret_key_hex: hex::encode(swap.claim_key.secret_bytes()),
         invoice: swap.invoice.clone(),
         max_routing_fee_msat: swap.max_routing_fee_msat,
+        service_fee_sat: quote.service_fee_sat,
+        onchain_fee_sat: quote.onchain_fee_sat,
         required_confirmations: ctx.required_confirmations,
         funding_txid_hex: None,
         funding_vout: None,
