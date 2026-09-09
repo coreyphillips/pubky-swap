@@ -44,6 +44,21 @@ Most execution code is behind cargo features so the default build stays toolchai
 When you add code behind a feature, build it explicitly (e.g.
 `cargo build -p swap-provider --features full`) — the default `cargo build --all` won't compile it.
 
+## Configuration
+
+Settings layer: defaults, then a TOML file, then the environment, then flags. Add a new setting to
+`ProviderConfig` / `ClientConfig` (with its default in the `Default` impl, **not** on the flag) and
+to the `Overrides` struct in that binary's `main.rs`. A flag carrying `default_value` would
+overwrite the config file on every run, which is why none of them do.
+
+Secrets are `swap_config::SecretSource` and have no flag. If you add one, it takes a value or a
+file path, and it must reach the code through `resolve()` rather than being copied into a `String`
+that could end up in a log line.
+
+`swap-provider --doctor` runs every startup check and prints what to do about each failure. If you
+add something the daemon depends on, add a check for it in `swap-provider/src/preflight.rs`; the
+test there asserts that every failure carries a remedy.
+
 ## Tests
 
 - **Unit tests** run with `cargo test --all` and use trait mocks (no Bitcoin/Lightning needed).

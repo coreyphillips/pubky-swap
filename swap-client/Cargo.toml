@@ -24,6 +24,8 @@ iroh = ["pubky-transport/iroh"]
 [dependencies]
 pubky-transport.workspace = true
 swap-common.workspace = true
+swap-config.workspace = true
+serde.workspace = true
 lightning-backend.workspace = true
 beignet-backend = { workspace = true, optional = true }
 bitcoin.workspace = true

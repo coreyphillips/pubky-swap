@@ -46,15 +46,21 @@ The default build needs no external services and pulls in no LND/Electrum toolch
 
 ### 3. Try the negotiation (no Bitcoin/LN node needed)
 
-Each side needs a Pubky identity (a recovery phrase or a `.pkarr` file).
+Each side needs a Pubky identity: a recovery phrase, or a `.pkarr` file passed as the first
+argument. **The phrase has no flag.** Put it in a file only you can read and name that file, so it
+never reaches the process table or your shell history:
 
 ```bash
+umask 077 && echo "<twelve words>" > provider.phrase
+
 # Provider — prints its pubky on startup
-cargo run -p swap-provider -- --recovery-phrase "<provider phrase>" \
-  --network regtest --directions submarine,reverse --min-amount 10000 --max-amount 1000000
+PUBKY_SWAP_RECOVERY_PHRASE__FILE=provider.phrase \
+  cargo run -p swap-provider -- --network regtest \
+  --directions submarine,reverse --min-amount 10000 --max-amount 1000000
 
 # Client (reverse swap of 50k sat) — use the provider pubky it logged
-cargo run -p swap-client -- <PROVIDER_PUBKY> --recovery-phrase "<client phrase>" \
+PUBKY_SWAP_RECOVERY_PHRASE__FILE=client.phrase \
+  cargo run -p swap-client -- <PROVIDER_PUBKY> \
   --network regtest --direction reverse --amount 50000
 ```
 
@@ -70,19 +76,23 @@ them (e.g. via [Polar](https://lightningpolar.com)). Build with `--features full
 **Provider** (LND + Electrum + a funded BIP84 wallet):
 
 ```bash
-cargo run -p swap-provider --features full -- --recovery-phrase "<provider phrase>" \
-  --network regtest \
+PUBKY_SWAP_RECOVERY_PHRASE__FILE=provider.phrase \
+PUBKY_SWAP_WALLET_MNEMONIC__FILE=wallet.mnemonic \
+  cargo run -p swap-provider --features full -- --network regtest \
   --lnd-address https://127.0.0.1:10009 --lnd-cert ~/.lnd/tls.cert \
   --lnd-macaroon ~/.lnd/.../admin.macaroon \
   --electrum-url tcp://127.0.0.1:60001 \
-  --wallet-mnemonic "<bip39 mnemonic for the funding wallet>" \
   --data-dir ./provider-data
 ```
+
+Not sure what is missing? `swap-provider --doctor` checks everything the daemon needs, says what
+to do about anything that fails, and exits non-zero if it could not run.
 
 **Client** (its own LND to pay the hold invoice, Electrum to watch/claim, and a claim address):
 
 ```bash
-cargo run -p swap-client --features full -- <PROVIDER_PUBKY> --recovery-phrase "<client phrase>" \
+PUBKY_SWAP_RECOVERY_PHRASE__FILE=client.phrase \
+  cargo run -p swap-client --features full -- <PROVIDER_PUBKY> \
   --network regtest --direction reverse --amount 50000 \
   --lnd-address https://127.0.0.1:10011 --lnd-cert ~/.lnd-2/tls.cert \
   --lnd-macaroon ~/.lnd-2/.../admin.macaroon \
@@ -116,7 +126,57 @@ two legs.
 
 Without the execution features a provider runs **negotiation-only** and rejects `SwapRequest`s.
 
-## Configuration & safety
+## Configuration
+
+Settings come from four places, most specific last: **built-in defaults**, a **TOML file**, the
+**environment**, and **flags**. A flag you do not pass leaves the lower layers alone, which is what
+makes the file and the environment usable at all.
+
+Every flag has an environment variable: upper-case it and prefix `PUBKY_SWAP_`, so `--lnd-address`
+is `PUBKY_SWAP_LND_ADDRESS`. The config file is found at `$PUBKY_SWAP_CONFIG`, then
+`$PUBKY_SWAP_DATA_DIR/config.toml`, then `~/.config/pubky-swap/config.toml`, then
+`./pubky-swap.toml`, or wherever `--config` says.
+
+```toml
+network = "bitcoin"
+electrum_url = "tcp://10.21.21.10:50001"
+base_fee_sat = 500
+fee_ppm = 2000
+```
+
+**Secrets have no flag.** The recovery phrase, the wallet mnemonic, the identity passphrase and
+the beignet API token can only come from the environment or from a file, because a value in argv
+is readable by anything that can see the process table and lands in shell history on the way there.
+Each takes either the value or a path to a file holding it:
+
+| Secret | Value | File |
+|---|---|---|
+| Pubky recovery phrase | `PUBKY_SWAP_RECOVERY_PHRASE__VALUE` | `PUBKY_SWAP_RECOVERY_PHRASE__FILE` |
+| Identity passphrase | `PUBKY_SWAP_PASSPHRASE__VALUE` | `PUBKY_SWAP_PASSPHRASE__FILE` |
+| Funding wallet mnemonic | `PUBKY_SWAP_WALLET_MNEMONIC__VALUE` | `PUBKY_SWAP_WALLET_MNEMONIC__FILE` |
+| beignet API token | `PUBKY_SWAP_BEIGNET_TOKEN__VALUE` | `PUBKY_SWAP_BEIGNET_TOKEN__FILE` |
+
+A secret file more permissive than `0600` is warned about, not refused. `--show-config` prints the
+resolved configuration with every secret redacted, so it is safe to paste into an issue.
+
+## Diagnostics
+
+`swap-provider --doctor` runs every check the daemon depends on and prints what to do about
+anything that fails, including credentials it can find on this machine:
+
+```
+  [ok  ] network                Bitcoin
+  [FAIL] identity               no Pubky identity configured
+         -> put the phrase in a file readable only by this user and set
+            PUBKY_SWAP_RECOVERY_PHRASE__FILE to its path
+  [FAIL] lightning.lnd          could not reach LND at https://127.0.0.1:10009
+         -> Credentials found on this machine:
+         ->   Umbrel -> --lnd-address https://10.21.21.9:10009 --lnd-cert ...
+```
+
+It exits non-zero when the daemon could not run, so it works as a container readiness probe.
+
+## Safety
 
 - **Dynamic fees.** Claim/refund/funding transactions use a live Electrum fee estimate, clamped to
   a configured floor (`--onchain-fee-rate`, sat/vB) that is both the minimum and the fallback when

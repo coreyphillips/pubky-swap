@@ -46,12 +46,19 @@ use crate::submarine::{drive_submarine_swap, init_submarine_swap, SubmarineSwap}
 use swap_common::timelock::{self, TimelockParams};
 
 /// Provider configuration (typically populated from the CLI).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ProviderConfig {
-    /// "phrase" or "file".
-    pub recovery_method: String,
-    pub recovery_value: String,
-    pub passphrase: String,
+    /// Path to a Pubky recovery file. Mutually exclusive with `recovery_phrase`.
+    pub recovery_file: String,
+    /// The Pubky recovery phrase, from the environment, a config file, or a file named by
+    /// `recovery_phrase_file`.
+    ///
+    /// Never from a flag. An argv value is readable by anything that can see the process table,
+    /// and lands in shell history on the way there.
+    pub recovery_phrase: swap_config::SecretSource,
+    /// Passphrase protecting the recovery file or phrase.
+    pub passphrase: swap_config::SecretSource,
     pub network: String,
     pub min_amount_sat: u64,
     pub max_amount_sat: u64,
@@ -86,9 +93,8 @@ pub struct ProviderConfig {
     pub lnd_macaroon_path: String,
     /// Base URL of a beignet daemon, e.g. `http://127.0.0.1:2112`.
     pub beignet_url: String,
-    /// Bearer token for that daemon. Prefer the environment over a flag: an argv value is
-    /// visible to anything that can read the process table.
-    pub beignet_token: String,
+    /// Bearer token for that daemon.
+    pub beignet_token: swap_config::SecretSource,
     /// PEM root certificate, when the daemon was started with `--tls-cert`.
     pub beignet_tls_cert: String,
     /// Optional `/v1` API prefix.
@@ -101,7 +107,7 @@ pub struct ProviderConfig {
     /// Electrum server URL for the chain watcher (e.g. `tcp://127.0.0.1:60001`).
     pub electrum_url: String,
     /// BIP39 mnemonic for the on-chain funding wallet.
-    pub wallet_mnemonic: String,
+    pub wallet_mnemonic: swap_config::SecretSource,
     /// Fee rate (sat/vB) for claim/refund transactions.
     pub onchain_fee_rate_sat_vb: u64,
     /// Hold-invoice expiry (seconds).
@@ -129,12 +135,19 @@ pub struct ProviderConfig {
     pub rendezvous_iroh: bool,
 }
 
+impl ProviderConfig {
+    /// Resolve the Pubky identity, or say precisely what is missing.
+    pub fn identity(&self) -> Result<swap_config::Identity> {
+        swap_config::resolve_identity(&self.recovery_file, &self.recovery_phrase, &self.passphrase)
+    }
+}
+
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
-            recovery_method: "phrase".to_string(),
-            recovery_value: String::new(),
-            passphrase: String::new(),
+            recovery_file: String::new(),
+            recovery_phrase: Default::default(),
+            passphrase: Default::default(),
             network: "regtest".to_string(),
             min_amount_sat: 10_000,
             max_amount_sat: 1_000_000,
@@ -156,13 +169,13 @@ impl Default for ProviderConfig {
             lnd_cert_path: String::new(),
             lnd_macaroon_path: String::new(),
             beignet_url: "http://127.0.0.1:2112".to_string(),
-            beignet_token: String::new(),
+            beignet_token: Default::default(),
             beignet_tls_cert: String::new(),
             beignet_api_prefix: String::new(),
             electrum_socks5: String::new(),
             electrum_timeout_secs: 30,
             electrum_url: String::new(),
-            wallet_mnemonic: String::new(),
+            wallet_mnemonic: Default::default(),
             onchain_fee_rate_sat_vb: 2,
             invoice_expiry_secs: 3600,
             max_routing_fee_msat: 10_000,
@@ -658,13 +671,10 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     validate_timelocks(&config)?;
     validate_mainnet_safety(&config, network)?;
 
-    let transport = match config.recovery_method.as_str() {
-        "file" => Transport::from_recovery_file(&config.recovery_value, &config.passphrase).await?,
-        "phrase" => {
-            Transport::from_recovery_phrase(&config.recovery_value, Some(&config.passphrase))
-                .await?
-        }
-        other => return Err(anyhow!("unknown recovery method: {other}")),
+    let identity = config.identity()?;
+    let transport = match identity.method {
+        "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
+        _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
     };
     let provider_pkarr = transport.public_key_string();
     info!("Provider pubky: {provider_pkarr}");
@@ -862,12 +872,15 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
 #[cfg(feature = "beignet")]
 fn beignet_http(config: &ProviderConfig) -> Result<Arc<beignet_backend::BeignetHttp>> {
     let mut cfg = beignet_backend::BeignetConfig::new(&config.beignet_url);
-    // Prefer the environment: an argv token is visible to anything that can read the process
-    // table, and this one authorises spending.
-    let token = std::env::var("BEIGNET_API_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or_else(|| (!config.beignet_token.is_empty()).then(|| config.beignet_token.clone()));
+    // `BEIGNET_API_TOKEN` first, because that is the name beignet's own tooling uses and an
+    // operator who has already set it should not have to set it twice.
+    let token = match std::env::var("BEIGNET_API_TOKEN") {
+        Ok(t) if !t.is_empty() => Some(t),
+        _ => config
+            .beignet_token
+            .resolve("the beignet API token")?
+            .map(|s| s.expose().to_string()),
+    };
     cfg = cfg.with_token(token);
     cfg.api_prefix = config.beignet_api_prefix.clone();
     if !config.beignet_tls_cert.is_empty() {
@@ -1043,12 +1056,20 @@ async fn build_lnd_wallet(_config: &ProviderConfig) -> Option<Arc<dyn OnchainWal
 
 #[cfg(feature = "bdk-wallet")]
 fn build_bdk_wallet(config: &ProviderConfig) -> Option<Arc<dyn OnchainWallet>> {
-    if config.wallet_mnemonic.is_empty() || config.electrum_url.is_empty() {
+    if config.electrum_url.is_empty() {
         return None;
     }
+    let mnemonic = match config.wallet_mnemonic.resolve("the wallet mnemonic") {
+        Ok(Some(m)) => m,
+        Ok(None) => return None,
+        Err(e) => {
+            warn!("funding wallet unavailable: {e}");
+            return None;
+        }
+    };
     let network = parse_network(&config.network).ok()?;
     match crate::wallet::BdkWallet::from_mnemonic(
-        &config.wallet_mnemonic,
+        mnemonic.expose(),
         network,
         &config.electrum_url,
         config.onchain_fee_rate_sat_vb,
@@ -1833,10 +1854,17 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig) {
     if !config.rendezvous_iroh {
         return;
     }
+    let identity = match config.identity() {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("iroh rendezvous disabled: {e}");
+            return;
+        }
+    };
     let secret = match pubky_transport::identity::secret_from_recovery(
-        &config.recovery_method,
-        &config.recovery_value,
-        &config.passphrase,
+        identity.method,
+        &identity.value,
+        &identity.passphrase,
     ) {
         Ok(s) => s,
         Err(e) => {

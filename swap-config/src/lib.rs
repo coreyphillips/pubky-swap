@@ -42,6 +42,14 @@ pub struct SecretSource {
 }
 
 impl SecretSource {
+    /// Whether a secret has been configured at all, without reading it.
+    ///
+    /// Callers that only need to know "is this backend usable" should not have to open a file,
+    /// and should not have the value in a local while they decide.
+    pub fn is_configured(&self) -> bool {
+        !self.value.is_empty() || !self.file.is_empty()
+    }
+
     /// Resolve to the actual value, reading the file if that is where it lives.
     pub fn resolve(&self, what: &str) -> Result<Option<Secret>> {
         if !self.value.is_empty() {
@@ -58,6 +66,71 @@ impl SecretSource {
             anyhow::bail!("{} is empty, so there is no {what} to read", self.file);
         }
         Ok(Some(Secret::new(trimmed)))
+    }
+}
+
+/// Pubky identity material, resolved from wherever the operator configured it.
+///
+/// Both binaries need this and both used to do it inline, in slightly different ways: the "one of
+/// a file or a phrase, not both" rule was stated twice and could have drifted, and each of the
+/// three call sites read the secret separately.
+pub struct Identity {
+    /// `"file"` or `"phrase"`, as `pubky-transport` names them.
+    pub method: &'static str,
+    /// A file path when `method` is `"file"`, and the recovery phrase itself when it is
+    /// `"phrase"`. Redacted in `Debug` either way, because one of the two is a seed.
+    pub value: String,
+    pub passphrase: String,
+}
+
+impl std::fmt::Debug for Identity {
+    /// Written by hand. A derived one prints the recovery phrase, and this is the sort of value
+    /// that ends up in a `warn!` while someone is working out why a daemon will not start.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Identity")
+            .field("method", &self.method)
+            .field(
+                "value",
+                &match self.method {
+                    "file" => self.value.as_str(),
+                    _ => "<redacted>",
+                },
+            )
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Resolve an identity, or say precisely what is missing.
+pub fn resolve_identity(
+    recovery_file: &str,
+    recovery_phrase: &SecretSource,
+    passphrase: &SecretSource,
+) -> Result<Identity> {
+    let phrase = recovery_phrase.resolve("the recovery phrase")?;
+    let passphrase = passphrase
+        .resolve("the passphrase")?
+        .map(|s| s.expose().to_string())
+        .unwrap_or_default();
+    match (!recovery_file.is_empty(), phrase) {
+        (true, None) => Ok(Identity {
+            method: "file",
+            value: recovery_file.to_string(),
+            passphrase,
+        }),
+        (false, Some(phrase)) => Ok(Identity {
+            method: "phrase",
+            value: phrase.expose().to_string(),
+            passphrase,
+        }),
+        (true, Some(_)) => anyhow::bail!(
+            "both a recovery file and a recovery phrase are configured; use exactly one"
+        ),
+        (false, None) => anyhow::bail!(
+            "no Pubky identity configured. Set PUBKY_SWAP_RECOVERY_PHRASE__FILE to a file \
+             holding the phrase, or PUBKY_SWAP_RECOVERY_PHRASE__VALUE, or pass a recovery file \
+             path as the first argument"
+        ),
     }
 }
 
@@ -114,6 +187,72 @@ where
 /// Safe to print or paste into an issue: [`Secret`] serializes as `<redacted>`.
 pub fn to_redacted_toml<T: Serialize>(config: &T) -> Result<String> {
     toml::to_string_pretty(config).context("rendering the configuration")
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn phrase(value: &str) -> SecretSource {
+        SecretSource {
+            value: Secret::new(value),
+            file: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_phrase_and_a_file_are_told_apart() {
+        let id = resolve_identity("", &phrase("twelve words"), &SecretSource::default()).unwrap();
+        assert_eq!(id.method, "phrase");
+        assert_eq!(id.value, "twelve words");
+
+        let id = resolve_identity(
+            "/tmp/recovery.pkarr",
+            &SecretSource::default(),
+            &SecretSource::default(),
+        )
+        .unwrap();
+        assert_eq!(id.method, "file");
+        assert_eq!(id.value, "/tmp/recovery.pkarr");
+    }
+
+    /// Two identities configured at once is ambiguous, and guessing which the operator meant is
+    /// how a daemon comes up as the wrong pubky and advertises to nobody.
+    #[test]
+    fn configuring_both_is_refused() {
+        let err = resolve_identity(
+            "/tmp/recovery.pkarr",
+            &phrase("twelve words"),
+            &SecretSource::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exactly one"), "{err}");
+    }
+
+    /// And the message for none of them says what to actually do, because a daemon that will not
+    /// start is the moment an operator most needs the answer.
+    #[test]
+    fn configuring_neither_says_how_to_fix_it() {
+        let err =
+            resolve_identity("", &SecretSource::default(), &SecretSource::default()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("PUBKY_SWAP_RECOVERY_PHRASE__FILE"), "{msg}");
+    }
+
+    /// The secret reaches the caller, and never reaches a log line on the way.
+    #[test]
+    fn a_resolved_identity_does_not_print_its_secret() {
+        let source = phrase("correct horse battery staple");
+        assert!(!format!("{source:?}").contains("correct horse"));
+        assert!(!serde_json::to_string(&source)
+            .unwrap()
+            .contains("correct horse"));
+        let id = resolve_identity("", &source, &SecretSource::default()).unwrap();
+        assert_eq!(id.value, "correct horse battery staple");
+        // And the resolved identity is just as quiet, which is where it matters: this is the
+        // value that reaches a `warn!` when a daemon cannot start.
+        assert!(!format!("{id:?}").contains("correct horse"));
+    }
 }
 
 #[cfg(test)]

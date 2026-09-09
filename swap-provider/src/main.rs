@@ -1,131 +1,137 @@
 use clap::Parser;
+use serde::Serialize;
 use swap_provider::{parse_directions, run, ProviderConfig};
 
 /// pubky-swap provider daemon.
+///
+/// Settings come from four places, most specific last: built-in defaults, a TOML config file,
+/// the environment, and these flags. A flag you do not pass leaves the lower layers alone, which
+/// is what makes the file and the environment usable at all: `--network` having a default value
+/// would otherwise overwrite whatever the file said on every start.
+///
+/// Every flag has an environment variable, named by upper-casing it and prefixing `PUBKY_SWAP_`:
+/// `--lnd-address` is `PUBKY_SWAP_LND_ADDRESS`. Secrets have no flag, only the environment or a
+/// file, because an argv value is readable by anything that can see the process table.
 #[derive(Parser, Debug)]
 #[command(name = "swap-provider", version, about)]
 struct Cli {
-    /// Pubky recovery file path (mutually exclusive with --recovery-phrase).
+    /// Pubky recovery file path. Mutually exclusive with a configured recovery phrase.
     recovery_file: Option<String>,
 
-    /// Pubky recovery phrase (instead of a recovery file).
+    /// TOML configuration file. Defaults to $PUBKY_SWAP_CONFIG, then $PUBKY_SWAP_DATA_DIR/
+    /// config.toml, then ~/.config/pubky-swap/config.toml, then ./pubky-swap.toml.
     #[arg(long)]
-    recovery_phrase: Option<String>,
+    config: Option<String>,
 
-    /// Passphrase for the Pubky identity.
-    #[arg(long, default_value = "")]
-    pass: String,
+    /// Report on everything the daemon needs, say what to do about anything missing, and exit.
+    #[arg(long)]
+    doctor: bool,
+
+    /// Print the resolved configuration, with secrets redacted, and exit.
+    #[arg(long)]
+    show_config: bool,
 
     /// Network: bitcoin, testnet, signet, regtest.
-    #[arg(long, default_value = "regtest")]
-    network: String,
+    #[arg(long)]
+    network: Option<String>,
 
     /// Comma-separated swap directions to support: submarine,reverse.
-    #[arg(long, default_value = "submarine,reverse")]
-    directions: String,
+    #[arg(long)]
+    directions: Option<String>,
 
-    #[arg(long, default_value_t = 10_000)]
-    min_amount: u64,
-    #[arg(long, default_value_t = 1_000_000)]
-    max_amount: u64,
-    #[arg(long, default_value_t = 500)]
-    base_fee: u64,
-    #[arg(long, default_value_t = 2_000)]
-    fee_ppm: u64,
-    #[arg(long, default_value_t = 1)]
-    confirmations: u32,
+    #[arg(long)]
+    min_amount: Option<u64>,
+    #[arg(long)]
+    max_amount: Option<u64>,
+    #[arg(long)]
+    base_fee: Option<u64>,
+    #[arg(long)]
+    fee_ppm: Option<u64>,
+    #[arg(long)]
+    confirmations: Option<u32>,
     /// Blocks from a swap being accepted to its on-chain HTLC refund branch opening.
-    #[arg(long, default_value_t = 144)]
-    timeout_blocks: u32,
+    #[arg(long)]
+    timeout_blocks: Option<u32>,
 
     /// Minimum blocks that must remain before the on-chain timeout for the provider to take an
     /// irreversible step (paying a submarine invoice, or committing funds to a reverse HTLC).
-    #[arg(long, default_value_t = swap_common::timelock::PROVIDER_MIN_CLAIM_WINDOW)]
-    min_claim_window_blocks: u32,
+    #[arg(long)]
+    min_claim_window_blocks: Option<u32>,
 
     /// Push the offer to discovered followers on startup.
     #[arg(long)]
     broadcast_offer: bool,
 
-    #[arg(long, default_value = "https://127.0.0.1:10009")]
-    lnd_address: String,
-    #[arg(long, default_value = "")]
-    lnd_cert: String,
-    #[arg(long, default_value = "")]
-    lnd_macaroon: String,
+    #[arg(long)]
+    lnd_address: Option<String>,
+    #[arg(long)]
+    lnd_cert: Option<String>,
+    #[arg(long)]
+    lnd_macaroon: Option<String>,
 
     /// SOCKS5 proxy for Electrum, e.g. 127.0.0.1:9050. Required to reach a .onion server.
-    #[arg(long, default_value = "")]
-    electrum_socks5: String,
+    #[arg(long)]
+    electrum_socks5: Option<String>,
 
     /// Per-call Electrum socket timeout, in seconds.
-    #[arg(long, default_value_t = 30)]
-    electrum_timeout_secs: u8,
+    #[arg(long)]
+    electrum_timeout_secs: Option<u8>,
 
     /// Lightning backend: `lnd` (gRPC to your own node) or `beignet` (HTTP to a beignet daemon).
-    #[arg(long, default_value = "lnd")]
-    lightning: String,
+    #[arg(long)]
+    lightning: Option<String>,
 
     /// Base URL of a beignet daemon.
-    #[arg(long, default_value = "http://127.0.0.1:2112")]
-    beignet_url: String,
-
-    /// Bearer token for the beignet daemon. Prefer the BEIGNET_API_TOKEN environment variable:
-    /// a token passed on the command line is visible to anything that can read the process table,
-    /// and this one authorises spending.
-    #[arg(long, default_value = "", env = "BEIGNET_API_TOKEN")]
-    beignet_token: String,
+    #[arg(long)]
+    beignet_url: Option<String>,
 
     /// PEM root certificate for the beignet daemon, if it was started with --tls-cert.
-    #[arg(long, default_value = "")]
-    beignet_tls_cert: String,
+    #[arg(long)]
+    beignet_tls_cert: Option<String>,
 
     /// API prefix for the beignet daemon, e.g. /v1.
-    #[arg(long, default_value = "")]
-    beignet_api_prefix: String,
+    #[arg(long)]
+    beignet_api_prefix: Option<String>,
 
     /// Electrum server URL for the chain watcher / funding wallet (e.g. tcp://127.0.0.1:60001).
-    #[arg(long, default_value = "")]
-    electrum_url: String,
-    /// BIP39 mnemonic for the on-chain funding wallet.
-    #[arg(long, default_value = "")]
-    wallet_mnemonic: String,
+    #[arg(long)]
+    electrum_url: Option<String>,
     /// Fee rate (sat/vB) for claim/refund transactions.
-    #[arg(long, default_value_t = 2)]
-    onchain_fee_rate: u64,
+    #[arg(long)]
+    onchain_fee_rate: Option<u64>,
     /// Hold-invoice expiry in seconds.
-    #[arg(long, default_value_t = 3600)]
-    invoice_expiry: u64,
+    #[arg(long)]
+    invoice_expiry: Option<u64>,
     /// Routing-fee cap (msat) when paying invoices.
-    #[arg(long, default_value_t = 10_000)]
-    max_routing_fee_msat: u64,
+    #[arg(long)]
+    max_routing_fee_msat: Option<u64>,
 
     /// Swaps this provider will drive at once.
-    #[arg(long, default_value_t = 25)]
-    max_concurrent_swaps: usize,
+    #[arg(long)]
+    max_concurrent_swaps: Option<usize>,
 
     /// Swaps one counterparty may have in flight at once. Low by design: a counterparty that
     /// pays a hold invoice and never claims costs you two on-chain fees and a timeout of locked
     /// capital, at no cost to itself.
-    #[arg(long, default_value_t = 2)]
-    max_concurrent_per_peer: usize,
+    #[arg(long)]
+    max_concurrent_per_peer: Option<usize>,
 
     /// Most this provider will have committed on chain across all live swaps.
-    #[arg(long, default_value_t = 5_000_000)]
-    max_total_exposure_sat: u64,
+    #[arg(long)]
+    max_total_exposure_sat: Option<u64>,
 
     /// Most this provider will have committed to any one counterparty.
-    #[arg(long, default_value_t = 1_000_000)]
-    max_exposure_per_peer_sat: u64,
+    #[arg(long)]
+    max_exposure_per_peer_sat: Option<u64>,
 
     /// On-chain balance kept back, so committing to a swap never leaves the wallet unable to pay
     /// for a refund it may owe.
-    #[arg(long, default_value_t = 100_000)]
-    min_onchain_reserve_sat: u64,
+    #[arg(long)]
+    min_onchain_reserve_sat: Option<u64>,
 
     /// New swaps one counterparty may start per hour.
-    #[arg(long, default_value_t = 6)]
-    max_new_swaps_per_peer_per_hour: u32,
+    #[arg(long)]
+    max_new_swaps_per_peer_per_hour: Option<u32>,
 
     /// Permit unsafe mainnet parameters (low confirmations / fee floor). Required to run on
     /// mainnet with regtest-grade settings; intended for testing only.
@@ -133,29 +139,165 @@ struct Cli {
     allow_unsafe: bool,
 
     /// How long an issued quote stays valid, in seconds.
-    #[arg(long, default_value_t = 300)]
-    quote_ttl: u64,
+    #[arg(long)]
+    quote_ttl: Option<u64>,
 
     /// Directory for persisted in-flight swap state (so a restart can resume swaps).
-    #[arg(long, default_value = "./pubky-swap-data")]
-    data_dir: String,
+    #[arg(long)]
+    data_dir: Option<String>,
 
     /// On-chain funding wallet: `lnd` (your LND node's own wallet, no separate seed),
-    /// `beignet` (a beignet daemon's wallet), or `bdk` (a separate BIP84 wallet from
-    /// --wallet-mnemonic).
-    #[arg(long, default_value = "bdk")]
-    wallet: String,
+    /// `beignet` (a beignet daemon's wallet), or `bdk` (a separate BIP84 wallet from a
+    /// configured mnemonic).
+    #[arg(long)]
+    wallet: Option<String>,
 
     /// Seconds of inactivity before an unpinned peer (a client that never completed a swap) is
     /// evicted from the poll set and unfollowed. 0 disables idle reaping. Peers are evicted
     /// immediately on swap completion regardless of this value.
-    #[arg(long, default_value_t = 3600)]
-    peer_idle_ttl: u64,
+    #[arg(long)]
+    peer_idle_ttl: Option<u64>,
 
     /// Accept iroh P2P rendezvous connections (the "doorbell") so clients that know our pubky can
     /// reach us without a pre-existing follow. Requires a build with `--features iroh`.
     #[arg(long)]
     rendezvous_iroh: bool,
+}
+
+/// What the operator typed, in the shape the config layers merge.
+///
+/// Every field is `Option` and skipped when absent, which is the whole mechanism: a flag that was
+/// not passed contributes nothing, rather than contributing a default that silently outranks the
+/// config file it was supposed to sit above.
+#[derive(Serialize, Default)]
+struct Overrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    directions: Option<Vec<swap_common::SwapDirection>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_amount_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_amount_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_fee_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fee_ppm: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_confirmations: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    htlc_timeout_blocks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_claim_window_blocks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    broadcast_offer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lightning_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lnd_address: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lnd_cert_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lnd_macaroon_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beignet_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beignet_tls_cert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beignet_api_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    electrum_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    electrum_socks5: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    electrum_timeout_secs: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    onchain_fee_rate_sat_vb: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invoice_expiry_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_routing_fee_msat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrent_swaps: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_concurrent_per_peer: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_total_exposure_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_exposure_per_peer_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_onchain_reserve_sat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_new_swaps_per_peer_per_hour: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_unsafe: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quote_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet_backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_idle_ttl_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rendezvous_iroh: Option<bool>,
+}
+
+/// A boolean flag contributes only when it is set.
+///
+/// clap gives `false` for a flag nobody passed, and `false` is a value: written into the top
+/// layer it would turn off whatever the config file had turned on.
+fn flag(set: bool) -> Option<bool> {
+    set.then_some(true)
+}
+
+impl Cli {
+    fn overrides(&self) -> anyhow::Result<Overrides> {
+        Ok(Overrides {
+            recovery_file: self.recovery_file.clone(),
+            network: self.network.clone(),
+            directions: self
+                .directions
+                .as_deref()
+                .map(parse_directions)
+                .transpose()?,
+            min_amount_sat: self.min_amount,
+            max_amount_sat: self.max_amount,
+            base_fee_sat: self.base_fee,
+            fee_ppm: self.fee_ppm,
+            required_confirmations: self.confirmations,
+            htlc_timeout_blocks: self.timeout_blocks,
+            min_claim_window_blocks: self.min_claim_window_blocks,
+            broadcast_offer: flag(self.broadcast_offer),
+            lightning_backend: self.lightning.clone(),
+            lnd_address: self.lnd_address.clone(),
+            lnd_cert_path: self.lnd_cert.clone(),
+            lnd_macaroon_path: self.lnd_macaroon.clone(),
+            beignet_url: self.beignet_url.clone(),
+            beignet_tls_cert: self.beignet_tls_cert.clone(),
+            beignet_api_prefix: self.beignet_api_prefix.clone(),
+            electrum_url: self.electrum_url.clone(),
+            electrum_socks5: self.electrum_socks5.clone(),
+            electrum_timeout_secs: self.electrum_timeout_secs,
+            onchain_fee_rate_sat_vb: self.onchain_fee_rate,
+            invoice_expiry_secs: self.invoice_expiry,
+            max_routing_fee_msat: self.max_routing_fee_msat,
+            max_concurrent_swaps: self.max_concurrent_swaps,
+            max_concurrent_per_peer: self.max_concurrent_per_peer,
+            max_total_exposure_sat: self.max_total_exposure_sat,
+            max_exposure_per_peer_sat: self.max_exposure_per_peer_sat,
+            min_onchain_reserve_sat: self.min_onchain_reserve_sat,
+            max_new_swaps_per_peer_per_hour: self.max_new_swaps_per_peer_per_hour,
+            allow_unsafe: flag(self.allow_unsafe),
+            quote_ttl_secs: self.quote_ttl,
+            data_dir: self.data_dir.clone(),
+            wallet_backend: self.wallet.clone(),
+            peer_idle_ttl_secs: self.peer_idle_ttl,
+            rendezvous_iroh: flag(self.rendezvous_iroh),
+        })
+    }
 }
 
 #[tokio::main]
@@ -168,59 +310,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let path = swap_config::paths::resolve_config_path(cli.config.as_deref());
+    let config: ProviderConfig = swap_config::load(Some(&path), "PUBKY_SWAP_", &cli.overrides()?)?;
 
-    let (recovery_method, recovery_value) = match (&cli.recovery_file, &cli.recovery_phrase) {
-        (Some(file), None) => ("file".to_string(), file.clone()),
-        (None, Some(phrase)) => ("phrase".to_string(), phrase.clone()),
-        _ => {
-            return Err(anyhow::anyhow!(
-                "provide exactly one of <recovery_file> or --recovery-phrase"
-            ))
+    if cli.show_config {
+        print!("{}", swap_config::to_redacted_toml(&config)?);
+        return Ok(());
+    }
+
+    if cli.doctor {
+        let report = swap_provider::preflight::diagnose(&config).await;
+        print!("{}", report.render());
+        // A non-zero exit is what makes this usable from a health check or a container's
+        // readiness probe, rather than something a person has to read.
+        if !report.is_capable() {
+            std::process::exit(1);
         }
-    };
-
-    let config = ProviderConfig {
-        recovery_method,
-        recovery_value,
-        passphrase: cli.pass,
-        network: cli.network,
-        min_amount_sat: cli.min_amount,
-        max_amount_sat: cli.max_amount,
-        base_fee_sat: cli.base_fee,
-        fee_ppm: cli.fee_ppm,
-        required_confirmations: cli.confirmations,
-        htlc_timeout_blocks: cli.timeout_blocks,
-        min_claim_window_blocks: cli.min_claim_window_blocks,
-        max_concurrent_swaps: cli.max_concurrent_swaps,
-        max_concurrent_per_peer: cli.max_concurrent_per_peer,
-        max_total_exposure_sat: cli.max_total_exposure_sat,
-        max_exposure_per_peer_sat: cli.max_exposure_per_peer_sat,
-        min_onchain_reserve_sat: cli.min_onchain_reserve_sat,
-        max_new_swaps_per_peer_per_hour: cli.max_new_swaps_per_peer_per_hour,
-        directions: parse_directions(&cli.directions)?,
-        broadcast_offer: cli.broadcast_offer,
-        lightning_backend: cli.lightning,
-        lnd_address: cli.lnd_address,
-        lnd_cert_path: cli.lnd_cert,
-        lnd_macaroon_path: cli.lnd_macaroon,
-        beignet_url: cli.beignet_url,
-        beignet_token: cli.beignet_token,
-        beignet_tls_cert: cli.beignet_tls_cert,
-        beignet_api_prefix: cli.beignet_api_prefix,
-        electrum_url: cli.electrum_url,
-        electrum_socks5: cli.electrum_socks5,
-        electrum_timeout_secs: cli.electrum_timeout_secs,
-        wallet_mnemonic: cli.wallet_mnemonic,
-        onchain_fee_rate_sat_vb: cli.onchain_fee_rate,
-        invoice_expiry_secs: cli.invoice_expiry,
-        max_routing_fee_msat: cli.max_routing_fee_msat,
-        allow_unsafe: cli.allow_unsafe,
-        quote_ttl_secs: cli.quote_ttl,
-        data_dir: cli.data_dir,
-        wallet_backend: cli.wallet,
-        peer_idle_ttl_secs: cli.peer_idle_ttl,
-        rendezvous_iroh: cli.rendezvous_iroh,
-    };
+        return Ok(());
+    }
 
     run(config).await
 }
