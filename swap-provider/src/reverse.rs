@@ -1129,6 +1129,186 @@ mod tests {
         assert_eq!(chain.broadcast_count(), 1);
     }
 
+    /// A backend outage is not a protocol outcome, and a funded swap must outlive one.
+    ///
+    /// Ten transient failures used to end the swap: the driver got ten immediate re-entries and
+    /// then wrote `SwapState::Failed`, which is terminal. Terminal records are filtered out of
+    /// `load_active`, so no restart resumed it; the reservation was released with the task; and
+    /// the provider's coins sat in an HTLC with nobody left to refund them. Ten re-entries with
+    /// no delay between them is what one Electrum restart costs.
+    ///
+    /// This drives the real loop: the same store, the same failure accounting, the same decision
+    /// `finish_driver_run` takes, through an outage that lasts well past the old budget and across
+    /// a restart in the middle of it.
+    #[tokio::test]
+    async fn a_funded_reverse_swap_outlives_an_outage_and_still_refunds() {
+        use crate::recovery::{Recovery, MAX_DRIVER_RETRIES};
+        use std::sync::Arc;
+        use swap_common::chain::mock::FlakyChain;
+        use swap_common::store::{JsonFileSwapStore, SwapRecord, SwapStore};
+        use swap_common::{NetworkSpec, SwapDirection};
+
+        let secp = Secp256k1::new();
+        let (_claim_sk, claim_pk) = random_keypair(&secp);
+        let (refund_sk, refund_pk) = random_keypair(&secp);
+        let ph = payment_hash(&generate_preimage());
+
+        let ln = MockLn::new(InvoiceState::Accepted);
+        let swap = init_reverse_swap(
+            &ln,
+            &claim_pk,
+            refund_sk,
+            &refund_pk,
+            ph,
+            AMOUNT,
+            1000,
+            5,
+            TIMEOUT,
+            3600,
+            Network::Regtest,
+            params(),
+        )
+        .await
+        .unwrap();
+
+        // The state the outage begins in: our funding is on chain, past the timeout, so the only
+        // thing left to do is the refund only we can make.
+        let outpoint = funding_outpoint();
+        let swap_id = uuid::Uuid::new_v4();
+        let record = SwapRecord {
+            swap_id,
+            direction: SwapDirection::Reverse,
+            peer: "client".into(),
+            network: NetworkSpec::Regtest,
+            payment_hash_hex: hex::encode(swap.payment_hash),
+            onchain_amount_sat: AMOUNT,
+            fee_rate_sat_vb: swap.fee_rate_sat_vb,
+            htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+            timeout_height: TIMEOUT,
+            secret_key_hex: hex::encode(swap.refund_key.secret_bytes()),
+            invoice: swap.invoice.clone(),
+            required_confirmations: 2,
+            funding_txid_hex: Some(outpoint.txid.to_string()),
+            funding_vout: Some(outpoint.vout),
+            state: SwapState::LockupConfirmed,
+            ..SwapRecord::new_progress()
+        };
+
+        let dir = std::env::temp_dir().join(format!("pubky-swap-recovery-{swap_id}"));
+        let mut store: Arc<dyn SwapStore> = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+        store.put(&record).unwrap();
+
+        let chain = FlakyChain::new(
+            MockChain::new()
+                .with_tip(TIMEOUT)
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 3,
+                })
+                .always_final(),
+            u32::MAX,
+        );
+        let wallet = MockWallet {
+            funding_outpoint: outpoint,
+            refund_spk: dest(),
+        };
+
+        // Long enough that the old budget would have been spent twice over.
+        let outage_runs = MAX_DRIVER_RETRIES + 2;
+        let mut failures = 0u32;
+        let mut restarted = false;
+        let final_state = loop {
+            assert!(failures < 100, "the driver never got anywhere");
+            // Re-read the record every time, the way a re-entered or restarted driver does.
+            let rec = store
+                .get(swap_id)
+                .unwrap()
+                .expect("the record must never leave the store");
+            assert!(
+                !rec.state.is_terminal(),
+                "an outage made a funded swap terminal after {failures} failures"
+            );
+            let resumed = crate::reverse_swap_from_record(&rec, params()).unwrap();
+            let resume = rec.resume();
+            let progress = crate::StoreProgress {
+                store: store.clone(),
+                record: std::sync::Mutex::new(rec),
+            };
+            match drive_reverse_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &resumed,
+                2,
+                Duration::ZERO,
+                &resume,
+                &progress,
+            )
+            .await
+            {
+                Ok(state) if state.is_terminal() => {
+                    // What `finish_driver_run` does with a terminal return.
+                    progress.set_terminal(state.clone());
+                    break state;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    failures += 1;
+                    let (rec, recovery) = progress.record_failure(&e, crate::is_transient(&e));
+                    assert!(
+                        matches!(recovery, Recovery::Retry(_)),
+                        "failure {failures} gave up on a swap holding {AMOUNT} sat: {e}"
+                    );
+                    assert_eq!(rec.retry_count, failures);
+                }
+            }
+
+            if failures == outage_runs && !restarted {
+                restarted = true;
+                // The daemon restarts mid-outage. Everything it needs to carry on has to be on
+                // disk, because everything in memory has just gone.
+                store = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+                let active = store.load_active().unwrap();
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "a funded swap that failed {failures} times must still be resumed"
+                );
+                assert_eq!(active[0].swap_id, swap_id);
+                assert!(active[0].funds_at_risk());
+                assert!(
+                    crate::needs_recovery(&active[0]),
+                    "and it must be reported as needing an operator"
+                );
+                assert!(
+                    active[0].next_retry_at_unix.is_some(),
+                    "the backoff must survive the restart rather than restarting from zero"
+                );
+                assert!(crate::resume_delay(&active[0]) <= crate::recovery::BACKOFF_MAX);
+                // The backend comes back.
+                chain.recover();
+            }
+        };
+
+        assert_eq!(final_state, SwapState::Refunded);
+        assert!(
+            chain.failed_calls() >= outage_runs,
+            "the outage was meant to fail at least {outage_runs} calls, it failed {}",
+            chain.failed_calls()
+        );
+        assert_eq!(
+            chain.inner().broadcast_count(),
+            1,
+            "the refund must actually reach the wire once the backend is back"
+        );
+        let done = store.get(swap_id).unwrap().unwrap();
+        assert_eq!(done.retry_count, 0, "progress clears the backoff");
+        assert!(done.last_error.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A cancelled hold invoice is a fatal answer only while nothing is committed on chain.
     ///
     /// The provider's coins are in the HTLC and, in a reverse swap, the *client* chose the

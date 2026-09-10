@@ -259,6 +259,107 @@ impl ChainWatcher for MockChain {
     }
 }
 
+/// A chain that answers every call with a transient failure until it is told to recover.
+///
+/// This is the whole of what a backend outage looks like from inside a driver: not a special code
+/// path, just every call returning [`SwapError::Transient`](crate::error::SwapError::Transient)
+/// until the server is back. Wrapping a [`MockChain`] rather than replacing it keeps the recovered
+/// behaviour exactly the behaviour the other tests exercise.
+pub struct FlakyChain<C> {
+    inner: C,
+    /// Failures left to serve. `u32::MAX` is an outage with no end scripted.
+    remaining: Mutex<u32>,
+    /// Calls that were failed, so a test can show the outage was real.
+    failed_calls: Mutex<u32>,
+}
+
+impl<C: ChainWatcher> FlakyChain<C> {
+    /// A chain that fails its next `failures` calls.
+    pub fn new(inner: C, failures: u32) -> Self {
+        Self {
+            inner,
+            remaining: Mutex::new(failures),
+            failed_calls: Mutex::new(0),
+        }
+    }
+
+    /// The backend comes back.
+    pub fn recover(&self) {
+        *self.remaining.lock().unwrap() = 0;
+    }
+
+    /// The chain underneath, for the assertions a test makes about it.
+    pub fn inner(&self) -> &C {
+        &self.inner
+    }
+
+    /// How many calls the outage has failed.
+    pub fn failed_calls(&self) -> u32 {
+        *self.failed_calls.lock().unwrap()
+    }
+
+    fn gate(&self) -> Result<()> {
+        let mut remaining = self.remaining.lock().unwrap();
+        if *remaining == 0 {
+            return Ok(());
+        }
+        *remaining = remaining.saturating_sub(1);
+        let mut failed = self.failed_calls.lock().unwrap();
+        *failed += 1;
+        Err(crate::error::SwapError::transient(
+            "electrum",
+            "connection refused",
+        ))
+    }
+}
+
+impl<C: ChainWatcher> ChainWatcher for FlakyChain<C> {
+    fn tip_height(&self) -> Result<u32> {
+        self.gate()?;
+        self.inner.tip_height()
+    }
+    fn find_funding(&self, spk: &Script, expected_value_sat: u64) -> Result<Option<FundingUtxo>> {
+        self.gate()?;
+        self.inner.find_funding(spk, expected_value_sat)
+    }
+    fn find_outputs(&self, spk: &Script) -> Result<Vec<FundingUtxo>> {
+        self.gate()?;
+        self.inner.find_outputs(spk)
+    }
+    fn find_historical_outputs(&self, spk: &Script) -> Result<Vec<HistoricalOutput>> {
+        self.gate()?;
+        self.inner.find_historical_outputs(spk)
+    }
+    fn outpoint_status(&self, spk: &Script, outpoint: &OutPoint) -> Result<Option<FundingUtxo>> {
+        self.gate()?;
+        self.inner.outpoint_status(spk, outpoint)
+    }
+    fn find_spend(&self, spk: &Script, outpoint: &OutPoint) -> Result<Option<Transaction>> {
+        self.gate()?;
+        self.inner.find_spend(spk, outpoint)
+    }
+    fn broadcast(&self, tx: &Transaction) -> Result<Txid> {
+        self.gate()?;
+        self.inner.broadcast(tx)
+    }
+    fn estimate_fee_rate(&self, target_blocks: u16) -> Result<Option<u64>> {
+        self.gate()?;
+        self.inner.estimate_fee_rate(target_blocks)
+    }
+    fn tx_confirmations(&self, spk: &Script, txid: &Txid) -> Result<Option<u32>> {
+        self.gate()?;
+        self.inner.tx_confirmations(spk, txid)
+    }
+    fn block_hashes_from(&self, start_height: u32, count: u16) -> Result<Vec<BlockHash>> {
+        self.gate()?;
+        self.inner.block_hashes_from(start_height, count)
+    }
+    fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
+        self.gate()?;
+        self.inner.block_hash_at(height)
+    }
+}
+
 /// Bridged the `txid()` / `compute_txid()` rename across `bitcoin` versions. The rename has since
 /// happened, and the shim did its job: this is the one place the mock needed touching.
 trait TxidCompat {
