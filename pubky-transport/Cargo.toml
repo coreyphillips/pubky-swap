@@ -19,7 +19,7 @@ blake3.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 tracing.workspace = true
-iroh = { version = "1.0.1", optional = true }
+iroh = { version = "=1.0.2", optional = true }
 tokio = { workspace = true, optional = true }
 bip39 = { version = "2.2", optional = true }
 pubky-common = { workspace = true, optional = true }

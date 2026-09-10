@@ -25,6 +25,10 @@ use tracing::debug;
 
 use crate::{Result, TransportError};
 
+/// Install process-lifetime JVM and application context pointers for Android DNS.
+#[cfg(target_os = "android")]
+pub use iroh::dns::install_android_jni_context;
+
 /// ALPN identifying the pubky-swap rendezvous protocol. Both ends must present the same string or
 /// iroh aborts the connection.
 pub const SWAP_ALPN: &[u8] = b"pubky-swap/rendezvous/1";

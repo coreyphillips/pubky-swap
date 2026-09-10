@@ -143,6 +143,37 @@ pub fn same_pubky(a: &str, b: &str) -> bool {
     matches!((PublicKey::try_from(a), PublicKey::try_from(b)), (Ok(x), Ok(y)) if x == y)
 }
 
+/// Normalize a bare public key or a Pubky identity prefix to its z32 encoding.
+/// Resource paths and unrelated URL schemes are not identity inputs.
+pub fn canonical_pubky(value: &str) -> Result<String> {
+    let value = value.trim().trim_end_matches('/');
+    let key = if value.len() == 52 {
+        value
+    } else {
+        value
+            .strip_prefix("pubky://")
+            .or_else(|| value.strip_prefix("pubky:"))
+            .or_else(|| value.strip_prefix("pubky"))
+            .or_else(|| value.strip_prefix("pk:"))
+            .unwrap_or(value)
+    };
+    if key.len() != 52 {
+        return Err(TransportError::InvalidPubkey(
+            "expected a public key".into(),
+        ));
+    }
+    PublicKey::try_from(key)
+        .map(|key| key.to_string())
+        .map_err(|error| TransportError::InvalidPubkey(error.to_string()))
+}
+
+/// Derive the public identity directly from an existing Ed25519 secret.
+pub fn identity_from_secret(secret: &[u8; 32]) -> String {
+    pkarr::Keypair::from_secret_key(secret)
+        .public_key()
+        .to_string()
+}
+
 /// Transport layer wrapper for pubky-messenger.
 pub struct Transport {
     messenger: PrivateMessengerClient,
@@ -156,6 +187,18 @@ pub struct Transport {
 const MAX_PROCESSED_IDS: usize = 10_000;
 
 impl Transport {
+    /// Sign into an existing account using its Ed25519 secret without deriving another key.
+    /// The account must already be registered with a homeserver.
+    pub async fn from_secret_key(secret: [u8; 32]) -> Result<Self> {
+        let messenger = PrivateMessengerClient::new(pkarr::Keypair::from_secret_key(&secret))
+            .map_err(|error| TransportError::Messenger(format!("create messenger: {error}")))?;
+        messenger
+            .sign_in()
+            .await
+            .map_err(|error| TransportError::Messenger(format!("sign in: {error}")))?;
+        Ok(Self::wrap(messenger))
+    }
+
     /// Create a transport from a Pubky recovery file + passphrase.
     pub async fn from_recovery_file(recovery_path: &str, passphrase: &str) -> Result<Self> {
         let recovery_bytes = fs::read(recovery_path)?;
@@ -571,6 +614,23 @@ mod poll_window_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_prefixes_normalize_without_accepting_resource_paths() {
+        let key = "q9x5sfjbpajdebk45b9jashgb86iem7rnwpmu16px3ens63xzwro";
+        for prefix in ["", "pubky", "pubky:", "pubky://", "pk:"] {
+            assert_eq!(canonical_pubky(&format!(" {prefix}{key}/ ")).unwrap(), key);
+        }
+        for invalid in [
+            String::new(),
+            format!("https://{key}"),
+            format!("pubky://{key}/pub/profile.json"),
+            format!("pubky://{key}?query=value"),
+            "0".repeat(52),
+        ] {
+            assert!(canonical_pubky(&invalid).is_err());
+        }
+    }
 
     #[test]
     fn pubkys_are_compared_as_keys_not_as_text() {
