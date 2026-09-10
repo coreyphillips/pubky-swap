@@ -3,6 +3,7 @@
 //! - [`messages`] — the wire protocol (offers, quotes, swap requests, status updates).
 //! - [`swap`] — direction, network, and the lifecycle [`swap::SwapState`] machine.
 //! - [`htlc`] — P2WSH HTLC script construction and preimage helpers.
+//! - [`taproot`]: Boltz-compatible Bitcoin Taproot contracts and script-path spends.
 //! - [`onchain`] — build & sign HTLC claim/refund transactions.
 //! - [`fee_bump`] — replace-by-fee bumping for claim/refund spends.
 //! - [`chain`] — chain observation (`ChainWatcher`; Electrum impl behind feature `electrum`).
@@ -21,6 +22,7 @@ pub mod onchain;
 pub mod reorg;
 pub mod store;
 pub mod swap;
+pub mod taproot;
 pub mod timelock;
 pub mod validate;
 pub mod wallet;

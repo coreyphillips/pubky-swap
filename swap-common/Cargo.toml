@@ -8,6 +8,8 @@ description = "Shared types for the pubky-swap marketplace: wire messages, swap 
 
 [dependencies]
 bitcoin.workspace = true
+# BIP327 key aggregation, preserving the provider/client order used by Boltz.
+musig2 = "=0.4.1"
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
@@ -42,6 +44,9 @@ rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 # Enables Transaction::verify (libbitcoinconsensus) so tests validate the claim/refund
 # witnesses against real Bitcoin script consensus rules. Test builds only.
 bitcoin = { version = "0.32", features = ["bitcoinconsensus"] }
+# Taproot verification requires Bitcoin Core 26's spent-output API. The bitcoin
+# crate's built-in verifier only enables pre-Taproot consensus rules.
+bitcoinconsensus = "=0.106.0"
 # The async runtime for `#[tokio::test]` (fee-bump loop tests).
 tokio = { version = "1", features = ["macros", "rt", "time"] }
 

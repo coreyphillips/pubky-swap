@@ -41,6 +41,16 @@ pub enum SwapRole {
     Client,
 }
 
+/// Immutable terms that identify the invoice belonging to one admitted reverse swap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingHoldInvoice {
+    pub amount_msat: u64,
+    pub expiry_secs: u64,
+    pub cltv_expiry_delta: u32,
+    /// Includes the persisted swap UUID so an unrelated invoice cannot be adopted.
+    pub memo: String,
+}
+
 /// A persisted in-flight swap. Bitcoin types are stored as hex/strings because the `bitcoin`
 /// crate is built without its `serde` feature here.
 ///
@@ -58,6 +68,17 @@ pub struct SwapRecord {
     #[serde(default = "current_record_version")]
     pub record_version: u16,
     pub swap_id: Uuid,
+    /// A reverse invoice creation intent persisted before its Lightning RPC.
+    #[serde(default)]
+    pub pending_hold_invoice: Option<PendingHoldInvoice>,
+    /// Durable creation identity and public response, written before acceptance is sent.
+    #[serde(default)]
+    pub swap_request: Option<crate::messages::SwapRequest>,
+    #[serde(default)]
+    pub swap_accept: Option<crate::messages::SwapAccept>,
+    /// Reconstructible Taproot parameters. Absent on legacy P2WSH records.
+    #[serde(default)]
+    pub taproot: Option<crate::taproot::BoltzTaprootSwap>,
     /// Which side wrote this record. Absent on records written before roles existed, which were
     /// all the provider's.
     #[serde(default)]
@@ -280,6 +301,10 @@ impl SwapRecord {
         Self {
             record_version: RECORD_VERSION,
             swap_id: Uuid::nil(),
+            pending_hold_invoice: None,
+            swap_request: None,
+            swap_accept: None,
+            taproot: None,
             role: SwapRole::Provider,
             direction: SwapDirection::Reverse,
             peer: String::new(),
@@ -352,6 +377,11 @@ impl SwapRecord {
 
     /// The HTLC P2WSH scriptPubKey, derived from the redeem script + network.
     pub fn htlc_spk(&self) -> Result<ScriptBuf> {
+        if let Some(taproot) = &self.taproot {
+            return Ok(taproot
+                .address(self.network.to_bitcoin_network())
+                .script_pubkey());
+        }
         let script = self.htlc_script()?;
         Ok(htlc_p2wsh_address(&script, self.network.to_bitcoin_network()).script_pubkey())
     }
@@ -472,6 +502,13 @@ pub trait SwapStore: Send + Sync {
     /// of what it did: what it earned, what it refunded, and what went wrong. Nothing read them
     /// until there was a status surface to read them for.
     fn load_all(&self) -> Result<Vec<SwapRecord>>;
+    /// Complete enumeration for admission and quote recovery. An omitted unreadable record
+    /// could be mistaken for permission to create a second swap, so partial results are errors.
+    fn load_all_checked(&self) -> Result<Vec<SwapRecord>> {
+        Err(anyhow!(
+            "complete swap record enumeration is not supported by this store"
+        ))
+    }
     /// Record a swap's terminal state. Keeps the record for audit rather than deleting it.
     fn mark_terminal(&self, rec: &SwapRecord) -> Result<()>;
     /// Delete terminal records older than `retain`, returning how many were removed. Called only
@@ -677,6 +714,22 @@ impl SwapStore for JsonFileSwapStore {
             }
         }
         Ok(out)
+    }
+
+    fn load_all_checked(&self) -> Result<Vec<SwapRecord>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.dir).with_context(|| format!("read dir {:?}", self.dir))? {
+            let path = entry?.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).with_context(|| format!("read swap record {path:?}"))?;
+            records.push(
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse swap record {path:?}"))?,
+            );
+        }
+        Ok(records)
     }
 }
 

@@ -17,7 +17,7 @@ authors = ["Corey Phillips"]
 license = "MIT"
 
 [workspace.dependencies]
-# Bitcoin (P2WSH HTLC MVP; Taproot/MuSig2 is a planned phase-2 upgrade, see ROADMAP.md).
+# Bitcoin contracts: legacy P2WSH and optional Boltz-compatible Taproot script paths.
 # Pinned together with electrum-client and bdk_wallet: all three exchange `bitcoin` types across
 # their boundaries, so a mismatch in majors is a compile error at best and two incompatible
 # `Txid`s at worst.

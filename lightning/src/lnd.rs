@@ -197,6 +197,45 @@ impl LightningBackend for LndBackend {
         })
     }
 
+    async fn lookup_hold_invoice(&self, req: &HoldInvoiceRequest) -> Result<Option<HoldInvoice>> {
+        let mut client = self.client.lock().await;
+        let invoice = match client
+            .lightning()
+            .lookup_invoice(PaymentHash {
+                r_hash: req.payment_hash.to_vec(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status)
+                if status.code() == fedimint_tonic_lnd::tonic::Code::NotFound
+                    || (status.code() == fedimint_tonic_lnd::tonic::Code::Unknown
+                        && status.message() == "there are no existing invoices") =>
+            {
+                return Ok(None)
+            }
+            Err(status) => return Err(LightningError::Backend(status.to_string())),
+        };
+        if invoice.r_hash != req.payment_hash
+            || invoice.value_msat != to_i64(req.amount_msat, "invoice amount_msat")?
+            || invoice.memo != req.memo
+            || invoice.expiry != to_i64(req.expiry_secs, "invoice expiry_secs")?
+            || invoice.cltv_expiry != u64::from(req.cltv_expiry_delta)
+            || !matches!(invoice.state, 0 | 3)
+            || invoice.payment_request.is_empty()
+        {
+            return Err(LightningError::Backend(
+                "existing hold invoice does not match the persisted creation intent".into(),
+            ));
+        }
+        Ok(Some(HoldInvoice {
+            bolt11: invoice.payment_request,
+            payment_hash: req.payment_hash,
+            amount_msat: req.amount_msat,
+        }))
+    }
+
     async fn create_invoice(
         &self,
         amount_msat: u64,

@@ -1,0 +1,53 @@
+{
+  "source": "BoltzExchange/boltz-core",
+  "version": "5.0.0",
+  "commit": "7612d67102ad370673c26be000ecc8804a5bec45",
+  "cases": {
+    "submarine": {
+      "providerPublicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "clientPublicKey": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "preimage": "0303030303030303030303030303030303030303030303030303030303030303",
+      "preimageHash": "648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b",
+      "timeoutBlockHeight": 250,
+      "swapTree": {
+        "claimLeaf": {
+          "version": 192,
+          "output": "a9148a486ff2e31d6158bf39e2608864d63fefd09d5b882079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ac"
+        },
+        "refundLeaf": {
+          "version": 192,
+          "output": "20c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5ad02fa00b1"
+        }
+      },
+      "internalKey": "3b46d262d2f610e9038b44beabdfe97ab5a0feb89870acc2264edfb7f63ec2ec",
+      "merkleRoot": "6801b894dac5384b2bf8b0f18845bb2a3d43b10b560550b6b87c4adaf3808fa6",
+      "outputKey": "3db7e6cb33fc030646a76485f61acd878b45e62252b5075b1f28e29fdb1bb9f3",
+      "address": "bcrt1p8km7djenlspsv348vjzlvxkds795te3z226swkcl9r3flkcmh8esjmd93u",
+      "claimControlBlock": "c13b46d262d2f610e9038b44beabdfe97ab5a0feb89870acc2264edfb7f63ec2ecaa3c642640b0468b7a10aadb47f91db4c4b3552b8db21a102ca18207cd91a4b7",
+      "refundControlBlock": "c13b46d262d2f610e9038b44beabdfe97ab5a0feb89870acc2264edfb7f63ec2ec483cb8e61b3c0e84c8d5f3ff5071cebd20dbd04ff1c62e219d2d26349addc7e4"
+    },
+    "reverse": {
+      "providerPublicKey": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+      "clientPublicKey": "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+      "preimage": "0303030303030303030303030303030303030303030303030303030303030303",
+      "preimageHash": "648aa5c579fb30f38af744d97d6ec840c7a91277a499a0d780f3e7314eca090b",
+      "timeoutBlockHeight": 250,
+      "swapTree": {
+        "claimLeaf": {
+          "version": 192,
+          "output": "82012088a9148a486ff2e31d6158bf39e2608864d63fefd09d5b8820c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5ac"
+        },
+        "refundLeaf": {
+          "version": 192,
+          "output": "2079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798ad02fa00b1"
+        }
+      },
+      "internalKey": "3b46d262d2f610e9038b44beabdfe97ab5a0feb89870acc2264edfb7f63ec2ec",
+      "merkleRoot": "d98a862fced1bb28c149c9754739f44676f3bf7bb206db34b01264751e21ca50",
+      "outputKey": "04c40726cd327124f3905095246ede8d12eba69ba1d1be7d9a92701d3a118b38",
+      "address": "bcrt1pqnzqwfkdxfcjfuus2z2jgmk735fwhf5m58gmulv6jfcp6ws33vuq5qe3ma",
+      "claimControlBlock": "c13b46d262d2f610e9038b44beabdfe97ab5a0feb89870acc2264edfb7f63ec2ecf1fcaec4227c01dd5d6f60e603d67cfb83e8c4b6df35e65dabecf2d98467d698",
+      "refundControlBlock": "c13b46d262d2f610e9038b44beabdfe97ab5a0feb89870acc2264edfb7f63ec2ecb93311f5d87e0eb3e6b849c9b3ea7acc6807033cba6205028eb1069e3d32d322"
+    }
+  }
+}
