@@ -910,6 +910,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     if let Err(e) = transport.discover_peers().await {
         warn!("peer discovery failed: {e}");
     }
+
     if config.broadcast_offer {
         for peer in transport.get_known_peers() {
             let Some(current) = offer.read().await.clone() else {

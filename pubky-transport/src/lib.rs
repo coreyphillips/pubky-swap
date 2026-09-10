@@ -39,6 +39,22 @@ pub enum TransportError {
 
 pub type Result<T> = std::result::Result<T, TransportError>;
 
+/// Unix seconds.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How far before a peer joined the poll set its messages are still worth reading.
+///
+/// Message timestamps have one-second granularity and are set by the sender, so a request written
+/// in the same second the doorbell rang can carry a slightly earlier stamp than the moment this
+/// side recorded. Generous enough to absorb that and some clock skew, and far short of the
+/// backlog this exists to discard.
+const POLL_FROM_GRACE_SECS: u64 = 120;
+
 /// A tracked peer in the poll set.
 #[derive(Debug, Clone)]
 struct PeerEntry {
@@ -48,6 +64,9 @@ struct PeerEntry {
     pinned: bool,
     /// Last time we added or read a message from this peer, for idle reaping.
     last_seen: Instant,
+    /// Unix seconds when this peer entered the poll set, and therefore the point from which its
+    /// messages are ours to answer. See [`Transport::receive_from`].
+    polling_from: u64,
 }
 
 /// The set of peers a transport polls, with pin + idle-reaping bookkeeping. Extracted from
@@ -58,6 +77,11 @@ struct PeerSet {
 }
 
 impl PeerSet {
+    /// When this peer entered the poll set, in Unix seconds.
+    fn polling_from(&self, pubky: &str) -> Option<u64> {
+        self.peers.read().ok()?.get(pubky).map(|e| e.polling_from)
+    }
+
     /// Insert a peer or bump its last-seen time. `pinned` only ever sets the pin flag (a touch
     /// never un-pins an already-pinned peer).
     fn touch_or_add(&self, pubky: String, pinned: bool) {
@@ -73,6 +97,7 @@ impl PeerSet {
                 .or_insert(PeerEntry {
                     pinned,
                     last_seen: Instant::now(),
+                    polling_from: now_unix(),
                 });
         }
     }
@@ -302,8 +327,33 @@ impl Transport {
             .await
             .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
 
+        // Anything sent before this peer joined the poll set belongs to a conversation that had
+        // already ended.
+        //
+        // A conversation lives on the homeserver and comes back in full on every poll, while the
+        // set that stops a message being handled twice lives in this process and starts empty. A
+        // provider that restarted, or that added a returning peer when it rang the doorbell, read
+        // that peer's entire history and answered every request in it again: one quote request
+        // drew nine quotes, eight of them for amounts nobody was asking about any more, with the
+        // real answer somewhere in the middle. The client refuses a quote whose amount does not
+        // match, so this cost correctness rather than money, but it made a swap after any restart
+        // a matter of luck.
+        //
+        // Discarding them loses nothing: a client waits thirty seconds for a reply before giving
+        // up, and a quote expires within minutes, so a message that predates our interest in this
+        // peer has nobody left listening for its answer.
+        let floor = self
+            .known_peers
+            .polling_from(peer_pkarr)
+            .map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
+
         let mut parsed = Vec::new();
         for msg in messages {
+            if let Some(floor) = floor {
+                if msg.timestamp < floor {
+                    continue;
+                }
+            }
             let message_id = Self::message_id(peer_pkarr, &msg);
 
             let is_duplicate = self
@@ -453,6 +503,55 @@ impl SwapTransport for Transport {
     }
     async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
         Transport::receive_all(self).await
+    }
+}
+
+#[cfg(test)]
+mod poll_window_tests {
+    use super::*;
+
+    /// A peer's backlog is not ours to answer.
+    ///
+    /// The regression: a provider that restarted, or that re-added a returning peer when it rang
+    /// the doorbell, read that peer's whole conversation and answered every request in it again.
+    /// One quote request drew nine quotes.
+    #[test]
+    fn a_peer_is_only_polled_from_the_moment_it_joined() {
+        let peers = PeerSet::default();
+        peers.touch_or_add("peer".into(), false);
+
+        let joined = peers
+            .polling_from("peer")
+            .expect("a tracked peer records when it joined");
+        assert!(joined > 0, "the join time is recorded in Unix seconds");
+
+        // A week-old request predates our interest in this peer by far more than the grace.
+        let week_old = joined - 7 * 24 * 3600;
+        assert!(
+            week_old < joined.saturating_sub(POLL_FROM_GRACE_SECS),
+            "a backlog is discarded"
+        );
+
+        // A request written in the same second the doorbell rang, or a little before it, is the
+        // one we were actually woken for.
+        for skew in [0, 1, 30, POLL_FROM_GRACE_SECS - 1] {
+            let fresh = joined - skew;
+            assert!(
+                fresh >= joined.saturating_sub(POLL_FROM_GRACE_SECS),
+                "a message {skew}s before the peer joined must still be read"
+            );
+        }
+    }
+
+    /// Touching a peer must not move the window: a peer that keeps talking would otherwise have
+    /// its own in-flight messages fall behind a floor that kept advancing.
+    #[test]
+    fn the_window_is_set_once_and_does_not_advance() {
+        let peers = PeerSet::default();
+        peers.touch_or_add("peer".into(), false);
+        let first = peers.polling_from("peer").unwrap();
+        peers.touch_or_add("peer".into(), true);
+        assert_eq!(peers.polling_from("peer"), Some(first));
     }
 }
 
