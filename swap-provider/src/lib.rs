@@ -234,19 +234,48 @@ fn prune_quotes(quotes: &mut HashMap<Uuid, IssuedQuote>, now: u64) {
     quotes.retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
 }
 
-/// Remove and return a still-valid quote (single-use, so a quote can't be replayed). Also prunes
-/// any other expired quotes while the map is locked.
-async fn take_valid_quote(ctx: &ExecCtx, quote_id: Uuid) -> Result<IssuedQuote> {
-    let now = now_unix();
-    let mut quotes = ctx.quotes.lock().await;
-    prune_quotes(&mut quotes, now);
-    let q = quotes
-        .remove(&quote_id)
-        .ok_or_else(|| anyhow!("unknown or expired quote"))?;
-    if q.expires_at_unix != 0 && now >= q.expires_at_unix {
-        return Err(anyhow!("quote expired"));
+/// Remove and return a still-valid quote issued to `peer` for `direction` (single-use, so a quote
+/// can't be replayed). Also prunes any other expired quotes while the map is locked.
+///
+/// A quote is authorization to swap on terms we already priced, so it belongs to the authenticated
+/// pubky we quoted and to nobody else: a quote id is not a bearer token. Everything is checked
+/// before the quote leaves the map, so a request from the wrong peer, or for the wrong direction,
+/// cannot burn the quote its owner is still holding.
+async fn take_valid_quote(
+    quotes: &Mutex<HashMap<Uuid, IssuedQuote>>,
+    quote_id: Uuid,
+    peer: &str,
+    direction: SwapDirection,
+) -> Result<IssuedQuote> {
+    use std::collections::hash_map::Entry;
+
+    let mut quotes = quotes.lock().await;
+    prune_quotes(&mut quotes, now_unix());
+    let Entry::Occupied(entry) = quotes.entry(quote_id) else {
+        return Err(anyhow!("unknown or expired quote"));
+    };
+    if !pubky_transport::same_pubky(&entry.get().peer, peer) {
+        return Err(anyhow!("quote {quote_id} was not issued to {peer}"));
     }
-    Ok(q)
+    if entry.get().direction != direction {
+        return Err(anyhow!("quote {quote_id} is not for a {direction:?} swap"));
+    }
+    Ok(entry.remove())
+}
+
+/// Refuse a request whose self-declared `client_pkarr` is not the pubky it arrived from.
+///
+/// The transport identity is the authenticated one and the only one anything is authorized
+/// against; `client_pkarr` is whatever the sender typed into a field. They should always agree,
+/// so a request where they do not is either a confused client or one asking to be treated as
+/// somebody else, and neither is worth quoting.
+fn check_client_pkarr(claimed: &str, sender: &str) -> Result<()> {
+    if pubky_transport::same_pubky(claimed, sender) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "client_pkarr '{claimed}' is not the pubky this message came from"
+    ))
 }
 
 /// Minimum HTLC funding confirmations the provider will accept on mainnet without `allow_unsafe`.
@@ -363,6 +392,8 @@ pub fn parse_directions(s: &str) -> Result<Vec<SwapDirection>> {
 /// A quote the provider has issued, retained so a later `SwapRequest` can be priced/validated.
 #[derive(Debug, Clone)]
 struct IssuedQuote {
+    /// The authenticated pubky this quote was sent to, and the only one that may redeem it.
+    peer: String,
     direction: SwapDirection,
     amount_sat: u64,
     fee_sat: u64,
@@ -1268,6 +1299,9 @@ async fn handle_message(
                 )
                 .await;
             }
+            if let Err(e) = check_client_pkarr(&req.client_pkarr, sender) {
+                return reject(&ctx.transport, sender, None, None, &e.to_string()).await;
+            }
             if !offer.supports(req.direction) {
                 return reject(&ctx.transport, sender, None, None, "unsupported direction").await;
             }
@@ -1305,6 +1339,7 @@ async fn handle_message(
                 quotes.insert(
                     quote.quote_id,
                     IssuedQuote {
+                        peer: sender.to_string(),
                         direction: req.direction,
                         amount_sat: req.amount_sat,
                         fee_sat: fee.total_fee_sat,
@@ -1328,6 +1363,16 @@ async fn handle_message(
                     None,
                     Some(req.quote_id),
                     "provider is not configured for swap execution",
+                )
+                .await;
+            }
+            if let Err(e) = check_client_pkarr(&req.client_pkarr, sender) {
+                return reject(
+                    &ctx.transport,
+                    sender,
+                    None,
+                    Some(req.quote_id),
+                    &e.to_string(),
                 )
                 .await;
             }
@@ -1408,17 +1453,16 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         .chain
         .clone()
         .ok_or_else(|| anyhow!("no chain watcher"))?;
-    let quote = take_valid_quote(ctx, req.quote_id).await?;
-    if quote.direction != SwapDirection::Reverse {
-        return Err(anyhow!("quote {} is not for a reverse swap", req.quote_id));
-    }
-
+    // Everything the request has to get right is checked before the quote is spent, so a
+    // malformed request cannot burn a quote its sender could otherwise still use.
     let claim_pk = parse_pubkey(
         req.client_claim_pubkey_hex
             .as_deref()
             .ok_or_else(|| anyhow!("reverse swap requires client_claim_pubkey"))?,
     )?;
     let payment_hash = parse_hash32(&req.payment_hash_hex)?;
+
+    let quote = take_valid_quote(&ctx.quotes, req.quote_id, sender, SwapDirection::Reverse).await?;
 
     // Reserve capacity and check the wallet before the hold invoice exists. Creating the
     // invoice first would mean discovering we cannot fund only after the client has paid it.
@@ -1585,14 +1629,8 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         .chain
         .clone()
         .ok_or_else(|| anyhow!("no chain watcher"))?;
-    let quote = take_valid_quote(ctx, req.quote_id).await?;
-    if quote.direction != SwapDirection::Submarine {
-        return Err(anyhow!(
-            "quote {} is not for a submarine swap",
-            req.quote_id
-        ));
-    }
-
+    // As in the reverse direction: nothing about the request is taken on trust until it has been
+    // checked, and the quote is only spent once it has.
     let invoice = req
         .invoice
         .clone()
@@ -1602,6 +1640,9 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
             .as_deref()
             .ok_or_else(|| anyhow!("submarine swap requires client_refund_pubkey"))?,
     )?;
+
+    let quote =
+        take_valid_quote(&ctx.quotes, req.quote_id, sender, SwapDirection::Submarine).await?;
 
     // Reserve before anything is promised. A submarine swap does not spend our coins on chain,
     // but it does commit our Lightning liquidity and a driver slot, and one counterparty should
@@ -2194,6 +2235,114 @@ mod tests {
         assert!(validate_mainnet_safety(&cfg(3, 2, false), Network::Bitcoin).is_err());
         // The override permits both.
         assert!(validate_mainnet_safety(&cfg(1, 2, true), Network::Bitcoin).is_ok());
+    }
+
+    fn issued(peer: &str, direction: SwapDirection, expires_at_unix: u64) -> IssuedQuote {
+        IssuedQuote {
+            peer: peer.to_string(),
+            direction,
+            amount_sat: 100_000,
+            fee_sat: 700,
+            service_fee_sat: 500,
+            onchain_fee_sat: 200,
+            expires_at_unix,
+        }
+    }
+
+    /// One quote per direction, issued to peer A.
+    async fn quote_map(direction: SwapDirection) -> (Mutex<HashMap<Uuid, IssuedQuote>>, Uuid) {
+        let id = Uuid::new_v4();
+        let quotes = Mutex::new(HashMap::new());
+        quotes.lock().await.insert(
+            id,
+            issued("peer-a", direction, now_unix().saturating_add(300)),
+        );
+        (quotes, id)
+    }
+
+    /// A quote id used to be a bearer token: whoever held it could spend it, on their own
+    /// invoice and their own keys, and the rightful holder's later request found it gone.
+    #[tokio::test]
+    async fn a_quote_belongs_to_the_pubky_it_was_issued_to() {
+        for direction in [SwapDirection::Reverse, SwapDirection::Submarine] {
+            let (quotes, id) = quote_map(direction).await;
+
+            let stolen = take_valid_quote(&quotes, id, "peer-b", direction).await;
+            assert!(
+                stolen.is_err(),
+                "{direction:?}: another pubky must not redeem peer A's quote"
+            );
+            assert_eq!(
+                quotes.lock().await.len(),
+                1,
+                "{direction:?}: the rejected attempt must not consume the quote"
+            );
+
+            let mine = take_valid_quote(&quotes, id, "peer-a", direction)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{direction:?}: peer A must still be able to redeem: {e}")
+                });
+            assert_eq!(mine.peer, "peer-a");
+            assert!(
+                quotes.lock().await.is_empty(),
+                "{direction:?}: redeeming is single-use"
+            );
+            assert!(
+                take_valid_quote(&quotes, id, "peer-a", direction)
+                    .await
+                    .is_err(),
+                "{direction:?}: a spent quote cannot be replayed"
+            );
+        }
+    }
+
+    /// The direction check used to run after the quote had been removed, so a request naming the
+    /// wrong one spent a quote that was never eligible for it.
+    #[tokio::test]
+    async fn a_wrong_direction_request_does_not_spend_the_quote() {
+        let (quotes, id) = quote_map(SwapDirection::Reverse).await;
+        assert!(
+            take_valid_quote(&quotes, id, "peer-a", SwapDirection::Submarine)
+                .await
+                .is_err()
+        );
+        assert_eq!(quotes.lock().await.len(), 1);
+        assert!(
+            take_valid_quote(&quotes, id, "peer-a", SwapDirection::Reverse)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_quotes_are_rejected_and_pruned() {
+        let quotes = Mutex::new(HashMap::new());
+        let (mine, stale) = (Uuid::new_v4(), Uuid::new_v4());
+        {
+            let mut map = quotes.lock().await;
+            map.insert(mine, issued("peer-a", SwapDirection::Reverse, 1));
+            map.insert(stale, issued("peer-b", SwapDirection::Reverse, 1));
+        }
+        assert!(
+            take_valid_quote(&quotes, mine, "peer-a", SwapDirection::Reverse)
+                .await
+                .is_err(),
+            "a quote past its expiry is not redeemable by its owner either"
+        );
+        assert!(
+            quotes.lock().await.is_empty(),
+            "every expired quote goes, not just the one asked for"
+        );
+    }
+
+    /// `client_pkarr` is self-declared. Believing it over the sender the message authenticated as
+    /// would put the whole point of the ownership check back in the client's hands.
+    #[test]
+    fn a_self_declared_pubky_must_match_the_sender() {
+        assert!(check_client_pkarr("peer-a", "peer-a").is_ok());
+        assert!(check_client_pkarr("peer-a", "peer-b").is_err());
+        assert!(check_client_pkarr("", "peer-a").is_err());
     }
 
     #[test]

@@ -130,6 +130,19 @@ impl PeerSet {
     }
 }
 
+/// Whether two pkarr strings name the same key.
+///
+/// Peer strings arrive from several places (the follow graph, the iroh doorbell, a field a peer
+/// filled in itself), and only the key they encode is meaningful, so they are compared as keys
+/// where both parse. Anything that does not parse falls back to an exact string match, which is
+/// what a caller comparing two identifiers it minted itself expects.
+pub fn same_pubky(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!((PublicKey::try_from(a), PublicKey::try_from(b)), (Ok(x), Ok(y)) if x == y)
+}
+
 /// Transport layer wrapper for pubky-messenger.
 pub struct Transport {
     messenger: PrivateMessengerClient,
@@ -558,6 +571,21 @@ mod poll_window_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pubkys_are_compared_as_keys_not_as_text() {
+        let key = pkarr::Keypair::random().public_key().to_string();
+        let other = pkarr::Keypair::random().public_key().to_string();
+        assert!(same_pubky(&key, &key));
+        assert!(!same_pubky(&key, &other));
+        // The same key wearing the URL clothes the follow graph hands out.
+        assert!(same_pubky(&key, &format!("pubky://{key}")));
+        assert!(same_pubky(&format!("{key}/"), &key));
+        // Neither side parses: an exact match is all there is to go on.
+        assert!(same_pubky("peer-a", "peer-a"));
+        assert!(!same_pubky("peer-a", "peer-b"));
+        assert!(!same_pubky("", &key));
+    }
 
     #[test]
     fn touch_add_and_list() {
