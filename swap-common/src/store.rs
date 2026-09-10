@@ -691,7 +691,10 @@ mod tests {
         store.put(&rec).unwrap();
 
         let first = store.get(rec.swap_id).unwrap().unwrap();
-        assert!(first.created_at_unix > 0, "the first write stamps a creation time");
+        assert!(
+            first.created_at_unix > 0,
+            "the first write stamps a creation time"
+        );
 
         // A driver writing progress back does not carry the timestamp in its own copy.
         let mut later = rec.clone();

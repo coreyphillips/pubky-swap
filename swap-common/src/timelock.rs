@@ -473,8 +473,7 @@ mod invoice_expiry_tests {
             // drift apart silently: the client uses its own confirmation floor, which can be
             // higher than the provider asked for.
             let effective = confirmations.max(validate::MAX_REQUIRED_CONFIRMATIONS);
-            let needed =
-                u64::from(effective + CLIENT_CLAIM_WINDOW) * SECONDS_PER_BLOCK;
+            let needed = u64::from(effective + CLIENT_CLAIM_WINDOW) * SECONDS_PER_BLOCK;
 
             assert!(
                 floor >= needed,

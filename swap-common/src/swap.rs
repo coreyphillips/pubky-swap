@@ -150,8 +150,11 @@ mod direction_tests {
         assert_eq!(SwapDirection::Reverse.to_string(), "reverse");
         for d in [SwapDirection::Submarine, SwapDirection::Reverse] {
             let wire = serde_json::to_string(&d).unwrap();
-            assert_eq!(wire, format!("\"{}\"", d.as_str()), "serde and as_str must agree");
+            assert_eq!(
+                wire,
+                format!("\"{}\"", d.as_str()),
+                "serde and as_str must agree"
+            );
         }
     }
 }
-
