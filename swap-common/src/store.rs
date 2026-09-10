@@ -401,6 +401,12 @@ impl SwapRecord {
     }
 
     /// Note that the swap moved on, so the next failure starts a fresh backoff.
+    ///
+    /// Only a write that changes the state counts, so callers go through the persistence helper
+    /// that checks. A driver re-entered during an outage rewrites what it already knows (the same
+    /// funding output, the same paid invoice, the same claim it is about to put on the wire) before
+    /// failing again at the step it is stuck on; clearing the count on those pins the swap to the
+    /// first backoff delay forever and the operator alarm never fires.
     pub fn progressed(&mut self) {
         self.retry_count = 0;
         self.next_retry_at_unix = None;

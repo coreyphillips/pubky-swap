@@ -293,14 +293,17 @@ fn spawn_health_refresher(api: Api) {
 ///
 /// Read from the store rather than counted in memory: these are exactly the swaps that outlive a
 /// process, so a restart must not make the daemon look healthy again.
-fn recovery_required(api: &Api) -> Vec<SwapRecord> {
-    api.state
+///
+/// Fallible on purpose. A read failure used to become an empty list here, which reported the one
+/// condition where the answer matters most as the answer an operator wants to see.
+fn recovery_required(api: &Api) -> anyhow::Result<Vec<SwapRecord>> {
+    Ok(api
+        .state
         .store
-        .load_active()
-        .unwrap_or_default()
+        .load_active()?
         .into_iter()
         .filter(crate::needs_recovery)
-        .collect()
+        .collect())
 }
 
 /// The health check for swaps needing recovery.
@@ -308,8 +311,21 @@ fn recovery_required(api: &Api) -> Vec<SwapRecord> {
 /// A funded swap the daemon cannot drive is not a swap-shaped problem, it is money that will not
 /// come back on its own, so it belongs beside the backend checks rather than only in a list of
 /// swaps somebody has to go and read.
-fn recovery_check(stuck: &[SwapRecord]) -> crate::preflight::Check {
+fn recovery_check(stuck: Result<&[SwapRecord], &anyhow::Error>) -> crate::preflight::Check {
     use crate::preflight::Check;
+    // "No swap needs recovery" and "the file that answer lives in cannot be read" are opposite
+    // things to tell an operator, and this is the surface that has to tell them apart.
+    let stuck = match stuck {
+        Ok(stuck) => stuck,
+        Err(e) => {
+            return Check::fail(
+                "swap recovery",
+                format!("the swap store could not be read: {e}"),
+                "fix the store before trusting anything else here: whether any funded swap is \
+                 stuck is currently unknown.",
+            )
+        }
+    };
     if stuck.is_empty() {
         return Check::pass("swap recovery", "no swap is waiting on recovery");
     }
@@ -348,7 +364,7 @@ async fn health(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> R
     // take on a new swap, and a stuck old one does not change that answer.
     let capable = report.is_capable();
     let stuck = recovery_required(&api);
-    report.push(recovery_check(&stuck));
+    report.push(recovery_check(stuck.as_deref()));
     let checks: Vec<CheckView> = report
         .checks
         .iter()
@@ -363,7 +379,12 @@ async fn health(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> R
             remedy: c.remedy.clone(),
         })
         .collect();
-    let recovery: Vec<SwapView> = stuck.iter().map(SwapView::from).collect();
+    let recovery: Vec<SwapView> = stuck
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(SwapView::from)
+        .collect();
     Json(serde_json::json!({
         "capable": capable,
         "failures": report.failures(),
@@ -401,7 +422,9 @@ async fn status(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> R
         "committed_sat": api.state.risk.committed_sat(),
         // The one number here that is not about capacity. A daemon can be capable, within its
         // limits, and still be holding funds it has stopped being able to recover.
-        "recovery_required": recovery_required(&api).len(),
+        // `null` rather than zero when the store cannot be read: not knowing is not the same
+        // answer as none.
+        "recovery_required": recovery_required(&api).ok().map(|s| s.len()),
     }))
     .into_response()
 }
@@ -592,7 +615,7 @@ mod tests {
         rec.last_error = Some("electrum: connection refused".into());
         assert!(crate::needs_recovery(&rec));
 
-        let check = recovery_check(std::slice::from_ref(&rec));
+        let check = recovery_check(Ok(std::slice::from_ref(&rec)));
         assert_eq!(check.status, crate::preflight::Status::Fail);
         assert!(check.detail.contains(&rec.swap_id.to_string()));
         assert!(check.detail.contains("connection refused"));
@@ -609,10 +632,78 @@ mod tests {
         assert!(!crate::needs_recovery(&healthy));
         assert!(!SwapView::from(&healthy).needs_recovery);
         assert_eq!(
-            recovery_check(&[]).status,
+            recovery_check(Ok(&[])).status,
             crate::preflight::Status::Pass,
             "and with nothing stuck the check passes rather than going missing"
         );
+    }
+
+    /// A health surface that could not read the store used to report every funded swap as fine.
+    ///
+    /// `recovery_required` turned any `load_active` failure into an empty list, so a store the
+    /// daemon could not open produced a *passing* `swap recovery` check and a `/status` count of
+    /// zero. That is the one condition where the answer matters most, and it was the one condition
+    /// where the answer was invented. `/swaps` had returned a 500 for the same failure all along.
+    #[test]
+    fn a_store_that_cannot_be_read_is_an_alarm_rather_than_an_all_clear() {
+        use swap_common::store::SwapStore;
+
+        struct UnreadableStore;
+        impl SwapStore for UnreadableStore {
+            fn load_active(&self) -> anyhow::Result<Vec<SwapRecord>> {
+                Err(anyhow::anyhow!("permission denied"))
+            }
+            fn load_all(&self) -> anyhow::Result<Vec<SwapRecord>> {
+                Err(anyhow::anyhow!("permission denied"))
+            }
+            fn put(&self, _: &SwapRecord) -> anyhow::Result<()> {
+                unreachable!("the health surface only reads")
+            }
+            fn get(&self, _: uuid::Uuid) -> anyhow::Result<Option<SwapRecord>> {
+                unreachable!("the health surface only reads")
+            }
+            fn mark_terminal(&self, _: &SwapRecord) -> anyhow::Result<()> {
+                unreachable!("the health surface only reads")
+            }
+            fn prune_terminal(&self, _: Duration) -> anyhow::Result<usize> {
+                unreachable!("the health surface only reads")
+            }
+            fn mutate(
+                &self,
+                _: uuid::Uuid,
+                _: &mut dyn FnMut(&mut SwapRecord),
+            ) -> anyhow::Result<bool> {
+                unreachable!("the health surface only reads")
+            }
+        }
+
+        let api = Api {
+            state: Arc::new(State {
+                config: Arc::new(ProviderConfig::default()),
+                store: Arc::new(UnreadableStore),
+                risk: risk::RiskManager::new(Default::default()),
+                offer: Arc::new(RwLock::new(None)),
+                ready: Arc::new(AtomicBool::new(true)),
+                provider_pkarr: String::new(),
+            }),
+            token: String::new(),
+            health: Arc::new(RwLock::new(None)),
+        };
+
+        let stuck = recovery_required(&api);
+        assert!(
+            stuck.is_err(),
+            "a store that cannot be read is not a store with nothing in it"
+        );
+
+        let check = recovery_check(stuck.as_deref());
+        assert_eq!(
+            check.status,
+            crate::preflight::Status::Fail,
+            "not knowing whether a funded swap is stuck is a failure, not a pass"
+        );
+        assert!(check.detail.contains("permission denied"));
+        assert!(check.remedy.is_some(), "a failure must say what to do");
     }
 
     /// The reason a swap failed belongs in a field, not inside the state name.

@@ -1247,7 +1247,11 @@ mod tests {
             )
             .await
             {
-                Ok(state) if state.is_terminal() => break state,
+                Ok(state) if state.is_terminal() => {
+                    // What `finish_driver_run` does with a terminal return.
+                    progress.set_terminal(state.clone());
+                    break state;
+                }
                 Ok(_) => {}
                 Err(e) => {
                     failures += 1;

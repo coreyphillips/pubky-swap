@@ -462,7 +462,14 @@ impl StoreProgress {
             Ok(r) => r,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let before = rec.state.clone();
         f(&mut rec);
+        // The retry metadata is cleared here rather than by the callbacks, because only a write
+        // that moves the state is progress. `spend_broadcast` in particular runs *before* the
+        // broadcast it names, so it cannot attest to anything having worked.
+        if rec.state != before {
+            rec.progressed();
+        }
         rec.updated_at_unix = now_unix();
         if let Err(e) = self.store.put(&rec) {
             error!(
@@ -485,6 +492,8 @@ impl StoreProgress {
             Err(poisoned) => poisoned.into_inner(),
         };
         rec.state = state;
+        // Reaching an outcome is progress, and the retry metadata describes work still owed.
+        rec.progressed();
         rec.updated_at_unix = now_unix();
         if let Err(e) = self.store.mark_terminal(&rec) {
             warn!(
@@ -540,7 +549,6 @@ impl ProgressSink for StoreProgress {
             rec.funding_intent_at_height = Some(tip);
             rec.funding_attempts = rec.funding_attempts.saturating_add(1);
             rec.state = SwapState::LockupPending;
-            rec.progressed();
         })
     }
 
@@ -550,7 +558,6 @@ impl ProgressSink for StoreProgress {
             rec.funding_vout = Some(outpoint.vout);
             rec.funding_intent_at_height = None;
             rec.state = SwapState::LockupConfirmed;
-            rec.progressed();
         });
     }
 
@@ -560,14 +567,12 @@ impl ProgressSink for StoreProgress {
         self.try_update("invoice payment intent", |rec| {
             rec.invoice_pay_started_at_unix = Some(now_unix());
             rec.state = SwapState::InvoicePending;
-            rec.progressed();
         })
     }
 
     fn invoice_paid(&self) {
         self.update("invoice paid", |rec| {
             rec.state = SwapState::InvoicePaid;
-            rec.progressed();
         });
     }
 
@@ -577,7 +582,6 @@ impl ProgressSink for StoreProgress {
         self.update("observed claim", |rec| {
             rec.claim_observed_txid_hex = Some(txid.to_string());
             rec.state = SwapState::InvoicePaid;
-            rec.progressed();
         });
     }
 
@@ -587,7 +591,6 @@ impl ProgressSink for StoreProgress {
         // `ClaimPending` would describe it as the opposite of what it is.
         self.update("broadcast spend", |rec| {
             rec.note_our_spend(txid);
-            rec.progressed();
         });
     }
 }
@@ -2265,6 +2268,45 @@ mod tests {
         assert!(!is_transient(&anyhow!("a bare string error")));
     }
     use super::*;
+
+    /// A driver stuck on one step still rewrites what it already knows on every re-entry: the
+    /// invoice it has already paid, and the claim it is about to broadcast. Clearing the retry
+    /// metadata on those left the count at one however long the outage ran, so the backoff never
+    /// grew past the first delay and `needs_recovery` never fired.
+    #[test]
+    fn re_recording_what_we_already_knew_does_not_reset_the_backoff() {
+        use swap_common::store::{JsonFileSwapStore, SwapRecord};
+
+        let mut rec = SwapRecord {
+            direction: SwapDirection::Submarine,
+            invoice_pay_started_at_unix: Some(1),
+            state: SwapState::InvoicePaid,
+            ..SwapRecord::new_progress()
+        };
+        rec.swap_id = Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("pubky-swap-backoff-{}", rec.swap_id));
+        let store = JsonFileSwapStore::new(&dir).unwrap();
+
+        let progress = StoreProgress {
+            store: Arc::new(store),
+            record: std::sync::Mutex::new(rec),
+        };
+        let txid = "0000000000000000000000000000000000000000000000000000000000000001"
+            .parse::<Txid>()
+            .unwrap();
+        for attempt in 1..=12 {
+            progress.invoice_paid();
+            progress.spend_broadcast(txid);
+            let e: anyhow::Error =
+                swap_common::SwapError::transient("broadcast", "connection reset").into();
+            let (rec, recovery) = progress.record_failure(&e, true);
+            assert_eq!(rec.retry_count, attempt);
+            assert!(matches!(recovery, Recovery::Retry(_)));
+        }
+        assert!(needs_recovery(&progress.snapshot()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A provider that does not answer its doorbell can only be reached by someone it already
     /// follows, which is nobody on a fresh install.
