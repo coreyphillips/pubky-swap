@@ -111,10 +111,13 @@ two legs.
 | Crate | Role |
 |-------|------|
 | `pubky-transport` | Generic encrypted-DM + follow-graph transport (message-type agnostic). |
-| `swap-common` | Wire messages, swap state machine, P2WSH HTLC scripts + preimage helpers, on-chain claim/refund signing, `ChainWatcher` (+ Electrum impl). |
+| `swap-common` | Wire messages, swap state machine, P2WSH and optional Boltz-compatible Taproot contracts, on-chain claim/refund signing, `ChainWatcher` (+ Electrum impl). |
 | `lightning` (`lightning-backend`) | `LightningBackend` trait, a no-op `StubBackend`, and a real LND gRPC backend behind the `lnd` feature. |
 | `swap-provider` | Operator daemon: advertises offers, negotiates, and drives swaps; persists in-flight swaps and resumes them on restart. |
 | `swap-client` | Client CLI: discovers providers, requests quotes, verifies the HTLC, and executes a reverse swap. |
+
+See [external client adapters](docs/CLIENT_ADAPTERS.md) for Taproot negotiation, public-key-only
+integration, and authenticated creation/status recovery over Pubky.
 
 ## Feature flags
 

@@ -128,7 +128,7 @@ pub struct DecodedInvoice {
 /// Grouped into a struct because the CLTV delta is not optional detail: it is the field that
 /// keeps the Lightning leg alive past the on-chain refund height, and a positional argument list
 /// makes it too easy to add a call site that forgets it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldInvoiceRequest {
     pub payment_hash: [u8; 32],
     pub amount_msat: u64,
@@ -182,6 +182,15 @@ pub trait LightningBackend: Send + Sync {
     /// Implementations must apply `req.cltv_expiry_delta` and must reject a zero delta rather
     /// than silently falling back to a node default.
     async fn create_hold_invoice(&self, req: HoldInvoiceRequest) -> Result<HoldInvoice>;
+
+    /// Recover an invoice for a previously persisted creation intent. Implementations must
+    /// verify hash, amount, memo, expiry and CLTV against the immutable request. An unsupported
+    /// lookup is an error, never evidence that the invoice does not exist.
+    async fn lookup_hold_invoice(&self, _req: &HoldInvoiceRequest) -> Result<Option<HoldInvoice>> {
+        Err(LightningError::NotImplemented(
+            "hold invoice recovery lookup".into(),
+        ))
+    }
 
     /// Create a normal (auto-settling) invoice — the node generates the preimage and settles on
     /// payment. Used by the submarine-swap client: the provider pays this invoice (learning the

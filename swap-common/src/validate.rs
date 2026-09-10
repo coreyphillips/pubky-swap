@@ -515,6 +515,7 @@ mod tests {
 
     fn request(direction: SwapDirection) -> QuoteRequest {
         QuoteRequest {
+            request_id: None,
             offer_id: Uuid::nil(),
             client_pkarr: "client".into(),
             direction,
@@ -526,6 +527,7 @@ mod tests {
 
     fn quote(direction: SwapDirection) -> Quote {
         Quote {
+            request_id: None,
             quote_id: Uuid::new_v4(),
             offer_id: Uuid::new_v4(),
             direction,
@@ -571,6 +573,8 @@ mod tests {
 
     fn accept(q: &Quote) -> SwapAccept {
         SwapAccept {
+            script_type: Default::default(),
+            swap_tree: None,
             quote_id: q.quote_id,
             swap_id: Uuid::new_v4(),
             direction: q.direction,

@@ -149,6 +149,13 @@ impl Drop for ReservationGuard {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReservationMode {
+    New,
+    Pending,
+    Funded,
+}
+
 impl RiskManager {
     pub fn new(limits: RiskLimits) -> Arc<Self> {
         Arc::new(Self {
@@ -174,7 +181,12 @@ impl RiskManager {
     pub fn restore(self: &Arc<Self>, active: &[SwapRecord]) -> Vec<ReservationGuard> {
         let mut guards = Vec::new();
         for rec in active {
-            match self.reserve_inner(&rec.peer, rec.swap_id, rec.onchain_amount_sat, true) {
+            match self.reserve_inner(
+                &rec.peer,
+                rec.swap_id,
+                rec.onchain_amount_sat,
+                ReservationMode::Funded,
+            ) {
                 Ok(guard) => guards.push(guard),
                 Err(reason) => {
                     // Never refuse a swap that already exists: the money is committed whether or
@@ -216,7 +228,18 @@ impl RiskManager {
         swap_id: Uuid,
         amount_sat: u64,
     ) -> std::result::Result<ReservationGuard, RejectReason> {
-        self.reserve_inner(peer, swap_id, amount_sat, false)
+        self.reserve_inner(peer, swap_id, amount_sat, ReservationMode::New)
+    }
+
+    /// Re-admit an intent that has not released an acceptance or committed funds. Capacity and
+    /// exposure still apply, but retrying the same admission is not another hourly start.
+    pub fn reserve_pending(
+        self: &Arc<Self>,
+        peer: &str,
+        swap_id: Uuid,
+        amount_sat: u64,
+    ) -> std::result::Result<ReservationGuard, RejectReason> {
+        self.reserve_inner(peer, swap_id, amount_sat, ReservationMode::Pending)
     }
 
     fn reserve_inner(
@@ -224,8 +247,9 @@ impl RiskManager {
         peer: &str,
         swap_id: Uuid,
         amount_sat: u64,
-        forced: bool,
+        mode: ReservationMode,
     ) -> std::result::Result<ReservationGuard, RejectReason> {
+        let forced = mode == ReservationMode::Funded;
         let mut inner = self.locked();
         let now = Instant::now();
         let hour = Duration::from_secs(3600);
@@ -237,7 +261,9 @@ impl RiskManager {
                 .retain(|t| now.duration_since(*t) < hour);
             if !forced {
                 let started = state.recent_starts.len() as u32;
-                if started >= self.limits.max_new_swaps_per_peer_per_hour {
+                if mode == ReservationMode::New
+                    && started >= self.limits.max_new_swaps_per_peer_per_hour
+                {
                     return Err(RejectReason::RateLimited {
                         started,
                         max_per_hour: self.limits.max_new_swaps_per_peer_per_hour,
@@ -283,7 +309,7 @@ impl RiskManager {
         let state = inner.peers.entry(peer.to_string()).or_default();
         state.committed_sat = state.committed_sat.saturating_add(amount_sat);
         state.in_flight += 1;
-        if !forced {
+        if mode == ReservationMode::New {
             state.recent_starts.push(now);
         }
 

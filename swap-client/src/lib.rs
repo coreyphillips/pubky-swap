@@ -363,6 +363,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // 1) Request a quote (offer_id nil = the provider's current offer; a real client would
     //    first discover the Offer via the follow graph).
     let qreq = QuoteRequest {
+        request_id: None,
         offer_id: Uuid::nil(),
         client_pkarr: client_pkarr.clone(),
         direction: config.direction,
@@ -473,6 +474,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 
     // 3) Commit to the swap (reverse).
     let sreq = SwapRequest {
+        script_type: Default::default(),
         quote_id: quote.quote_id,
         client_pkarr: client_pkarr.clone(),
         direction: config.direction,
@@ -699,6 +701,7 @@ async fn run_submarine(
 
     // 3) Commit to the swap, carrying our invoice + refund pubkey.
     let sreq = SwapRequest {
+        script_type: Default::default(),
         quote_id: quote.quote_id,
         client_pkarr: client_pkarr.to_string(),
         direction: SwapDirection::Submarine,

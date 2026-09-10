@@ -1,10 +1,19 @@
 name: Regtest integration
 
-# Runs every #[ignore]d integration test against a real backplane: bitcoind + electrs + two LND
-# nodes with a funded channel (set up by scripts/setup-regtest-lnd.sh). Manual + weekly, so it
-# never blocks PRs.
+# Run funded recovery checks for pull requests that change the swap engine or its drivers.
 
 on:
+  pull_request:
+    paths:
+      - 'swap-common/**'
+      - 'swap-provider/**'
+      - 'swap-client/**'
+      - 'lightning/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'docker-compose.regtest.yml'
+      - 'scripts/setup-regtest-lnd.sh'
+      - '.github/workflows/regtest.yml'
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
@@ -70,6 +79,9 @@ jobs:
 
       - name: Submarine swap (two LND nodes)
         run: cargo test -p swap-provider --features full --test submarine_swap_regtest -- --ignored --nocapture
+
+      - name: Taproot swaps and timeout refund (two LND nodes)
+        run: cargo test -p swap-provider --features full --test taproot_regtest -- --ignored --nocapture
 
       - name: Tear down
         if: always()

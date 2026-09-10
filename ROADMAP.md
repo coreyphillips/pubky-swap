@@ -139,7 +139,7 @@ Also here: a **config file and secret-source layer** (`swap-config`) shared by b
 `--doctor` for a checked setup, and `--show-config` for a redacted dump.
 
 ### Phase 8: Hardening & extensions
-Taproot swaps (cooperative MuSig2 key-path + script-path fallback), Core Lightning backend,
+Cooperative MuSig2 key-path signing (Taproot script paths are implemented), Core Lightning backend,
 optional Liquid chain swaps.
 
 ## Remaining for mainnet

@@ -85,6 +85,8 @@ pub struct ReverseSwap {
     pub fee_rate_sat_vb: u64,
     pub htlc_script: ScriptBuf,
     pub htlc_spk: ScriptBuf,
+    /// Present when this swap uses a Boltz-compatible Taproot contract.
+    pub taproot: Option<swap_common::taproot::BoltzTaprootSwap>,
     pub timeout_height: u32,
     /// Provider's key for the HTLC refund branch.
     pub refund_key: SecretKey,
@@ -119,6 +121,40 @@ pub async fn init_reverse_swap(
     );
     let htlc_spk = htlc_p2wsh_address(&htlc_script, network).script_pubkey();
 
+    let request = reverse_invoice_request(
+        payment_hash,
+        onchain_amount_sat,
+        provider_fee_sat,
+        invoice_expiry_secs,
+        timelock,
+    )?;
+    let hold = ln
+        .create_hold_invoice(request)
+        .await
+        .map_err(|e| anyhow!("create hold invoice: {e}"))?;
+
+    Ok(ReverseSwap {
+        taproot: None,
+        payment_hash,
+        onchain_amount_sat,
+        fee_rate_sat_vb,
+        htlc_script,
+        htlc_spk,
+        timeout_height,
+        refund_key: provider_refund_key,
+        invoice: hold.bolt11,
+        timelock,
+    })
+}
+
+/// Price and time a reverse hold invoice before any external side effect.
+pub fn reverse_invoice_request(
+    payment_hash: PaymentHash,
+    onchain_amount_sat: u64,
+    provider_fee_sat: u64,
+    invoice_expiry_secs: u64,
+    timelock: TimelockParams,
+) -> Result<HoldInvoiceRequest> {
     // The client pays the on-chain amount plus the provider's fee over Lightning.
     let invoice_amount_msat = onchain_amount_sat
         .checked_add(provider_fee_sat)
@@ -146,27 +182,12 @@ pub async fn init_reverse_swap(
             timelock.required_confirmations
         );
     }
-    let hold = ln
-        .create_hold_invoice(HoldInvoiceRequest {
-            payment_hash,
-            amount_msat: invoice_amount_msat,
-            expiry_secs,
-            cltv_expiry_delta,
-            memo: "pubky-swap reverse".to_string(),
-        })
-        .await
-        .map_err(|e| anyhow!("create hold invoice: {e}"))?;
-
-    Ok(ReverseSwap {
+    Ok(HoldInvoiceRequest {
         payment_hash,
-        onchain_amount_sat,
-        fee_rate_sat_vb,
-        htlc_script,
-        htlc_spk,
-        timeout_height,
-        refund_key: provider_refund_key,
-        invoice: hold.bolt11,
-        timelock,
+        amount_msat: invoice_amount_msat,
+        expiry_secs,
+        cltv_expiry_delta,
+        memo: "pubky-swap reverse".to_string(),
     })
 }
 
@@ -499,8 +520,20 @@ pub async fn drive_reverse_swap(
     // again claimable, and lose the on-chain leg without ever noticing. So the swap only finishes
     // once the claim is buried, and until then the refund path stays live.
     let dest = wallet.receive_destination();
-    let refund_vsize = spend_vsize(&swap.htlc_script, &dest, false);
+    let refund_vsize = swap.taproot.as_ref().map_or_else(
+        || spend_vsize(&swap.htlc_script, &dest, false),
+        |contract| contract.spend_vsize(&dest, false),
+    );
     let build = |rate: u64| {
+        if let Some(contract) = &swap.taproot {
+            return contract.refund_tx(
+                funding_outpoint,
+                swap.onchain_amount_sat,
+                dest.clone(),
+                estimate_spend_fee(rate, refund_vsize),
+                &swap.refund_key,
+            );
+        }
         build_refund_tx(
             funding_outpoint,
             swap.onchain_amount_sat,
@@ -807,144 +840,188 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_swap_happy_path_settles_invoice() {
-        let secp = Secp256k1::new();
-        let (claim_sk, claim_pk) = random_keypair(&secp);
-        let (refund_sk, refund_pk) = random_keypair(&secp);
-        let preimage = generate_preimage();
-        let ph = payment_hash(&preimage);
+        for use_taproot in [false, true] {
+            let secp = Secp256k1::new();
+            let (claim_sk, claim_pk) = random_keypair(&secp);
+            let (refund_sk, refund_pk) = random_keypair(&secp);
+            let preimage = generate_preimage();
+            let ph = payment_hash(&preimage);
 
-        let ln = MockLn::new(InvoiceState::Accepted); // client has paid the hold invoice
-        let swap = init_reverse_swap(
-            &ln,
-            &claim_pk,
-            refund_sk,
-            &refund_pk,
-            ph,
-            AMOUNT,
-            1000,
-            5,
-            TIMEOUT,
-            3600,
-            Network::Regtest,
-            params(),
-        )
-        .await
-        .unwrap();
+            let ln = MockLn::new(InvoiceState::Accepted); // client has paid the hold invoice
+            let mut swap = init_reverse_swap(
+                &ln,
+                &claim_pk,
+                refund_sk,
+                &refund_pk,
+                ph,
+                AMOUNT,
+                1000,
+                5,
+                TIMEOUT,
+                3600,
+                Network::Regtest,
+                params(),
+            )
+            .await
+            .unwrap();
 
-        // The client's on-chain claim, spending the (mock) funding outpoint and revealing
-        // the preimage in its witness.
-        let outpoint = funding_outpoint();
-        let claim_tx = build_claim_tx(
-            outpoint,
-            AMOUNT,
-            &swap.htlc_script,
-            dest(),
-            1000,
-            preimage,
-            &claim_sk,
-        )
-        .unwrap();
+            if use_taproot {
+                let contract = swap_common::taproot::BoltzTaprootSwap::new(
+                    swap_common::SwapDirection::Reverse,
+                    &ph,
+                    &claim_pk,
+                    &refund_pk,
+                    TIMEOUT,
+                )
+                .unwrap();
+                swap.htlc_spk = contract.address(Network::Regtest).script_pubkey();
+                swap.htlc_script = ScriptBuf::new();
+                swap.taproot = Some(contract);
+            }
 
-        let chain = MockChain::new()
-            .with_tip(MOCK_TIP)
-            .with_funding(FundingUtxo {
-                outpoint,
-                value_sat: AMOUNT,
-                confirmations: 3,
-            })
-            .with_spend(claim_tx)
-            .always_final();
-        let wallet = MockWallet {
-            funding_outpoint: outpoint,
-            refund_spk: dest(),
-        };
+            // The client's on-chain claim, spending the (mock) funding outpoint and revealing
+            // the preimage in its witness.
+            let outpoint = funding_outpoint();
+            let claim_tx = if let Some(contract) = &swap.taproot {
+                contract.claim_tx(outpoint, AMOUNT, dest(), 1000, preimage, &claim_sk)
+            } else {
+                build_claim_tx(
+                    outpoint,
+                    AMOUNT,
+                    &swap.htlc_script,
+                    dest(),
+                    1000,
+                    preimage,
+                    &claim_sk,
+                )
+            }
+            .unwrap();
 
-        let final_state = drive_reverse_swap(
-            &ln,
-            &chain,
-            &wallet,
-            &swap,
-            2,
-            Duration::from_millis(0),
-            &Resume::default(),
-            &(),
-        )
-        .await
-        .unwrap();
+            let chain = MockChain::new()
+                .with_tip(MOCK_TIP)
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 3,
+                })
+                .with_spend(claim_tx)
+                .always_final();
+            let wallet = MockWallet {
+                funding_outpoint: outpoint,
+                refund_spk: dest(),
+            };
 
-        assert_eq!(final_state, SwapState::Claimed);
-        assert_eq!(
-            *ln.settled_preimage.lock().unwrap(),
-            Some(preimage),
-            "provider must settle the invoice with the preimage recovered from the claim"
-        );
-        assert!(chain.broadcasts().is_empty());
+            let final_state = drive_reverse_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &swap,
+                2,
+                Duration::from_millis(0),
+                &Resume::default(),
+                &(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(final_state, SwapState::Claimed);
+            assert_eq!(
+                *ln.settled_preimage.lock().unwrap(),
+                Some(preimage),
+                "provider must settle the invoice with the preimage recovered from the claim"
+            );
+            assert!(chain.broadcasts().is_empty());
+        }
     }
 
     #[tokio::test]
     async fn reverse_swap_refunds_after_timeout() {
-        let secp = Secp256k1::new();
-        let (_claim_sk, claim_pk) = random_keypair(&secp);
-        let (refund_sk, refund_pk) = random_keypair(&secp);
-        let preimage = generate_preimage();
-        let ph = payment_hash(&preimage);
+        for use_taproot in [false, true] {
+            let secp = Secp256k1::new();
+            let (_claim_sk, claim_pk) = random_keypair(&secp);
+            let (refund_sk, refund_pk) = random_keypair(&secp);
+            let preimage = generate_preimage();
+            let ph = payment_hash(&preimage);
 
-        let ln = MockLn::new(InvoiceState::Accepted);
-        let swap = init_reverse_swap(
-            &ln,
-            &claim_pk,
-            refund_sk,
-            &refund_pk,
-            ph,
-            AMOUNT,
-            1000,
-            5,
-            TIMEOUT,
-            3600,
-            Network::Regtest,
-            params(),
-        )
-        .await
-        .unwrap();
+            let ln = MockLn::new(InvoiceState::Accepted);
+            let mut swap = init_reverse_swap(
+                &ln,
+                &claim_pk,
+                refund_sk,
+                &refund_pk,
+                ph,
+                AMOUNT,
+                1000,
+                5,
+                TIMEOUT,
+                3600,
+                Network::Regtest,
+                params(),
+            )
+            .await
+            .unwrap();
 
-        let outpoint = funding_outpoint();
-        let chain = MockChain::new()
-            .with_tip(TIMEOUT)
-            .with_funding(FundingUtxo {
-                outpoint,
-                value_sat: AMOUNT,
-                confirmations: 3,
-            })
-            .always_final();
-        let wallet = MockWallet {
-            funding_outpoint: outpoint,
-            refund_spk: dest(),
-        };
+            if use_taproot {
+                let contract = swap_common::taproot::BoltzTaprootSwap::new(
+                    swap_common::SwapDirection::Reverse,
+                    &ph,
+                    &claim_pk,
+                    &refund_pk,
+                    TIMEOUT,
+                )
+                .unwrap();
+                swap.htlc_spk = contract.address(Network::Regtest).script_pubkey();
+                swap.htlc_script = ScriptBuf::new();
+                swap.taproot = Some(contract);
+            }
 
-        let final_state = drive_reverse_swap(
-            &ln,
-            &chain,
-            &wallet,
-            &swap,
-            2,
-            Duration::from_millis(0),
-            &Resume::default(),
-            &(),
-        )
-        .await
-        .unwrap();
+            let outpoint = funding_outpoint();
+            let chain = MockChain::new()
+                .with_tip(TIMEOUT)
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 3,
+                })
+                .always_final();
+            let wallet = MockWallet {
+                funding_outpoint: outpoint,
+                refund_spk: dest(),
+            };
 
-        assert_eq!(final_state, SwapState::Refunded);
-        assert_eq!(
-            chain.broadcast_count(),
-            1,
-            "a refund transaction must be broadcast"
-        );
-        assert!(
-            *ln.cancelled.lock().unwrap(),
-            "the hold invoice must be cancelled on refund"
-        );
-        assert!(ln.settled_preimage.lock().unwrap().is_none());
+            let final_state = drive_reverse_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &swap,
+                2,
+                Duration::from_millis(0),
+                &Resume::default(),
+                &(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(final_state, SwapState::Refunded);
+            assert_eq!(
+                chain.broadcast_count(),
+                1,
+                "a refund transaction must be broadcast"
+            );
+            assert!(
+                *ln.cancelled.lock().unwrap(),
+                "the hold invoice must be cancelled on refund"
+            );
+            assert!(ln.settled_preimage.lock().unwrap().is_none());
+            if let Some(contract) = &swap.taproot {
+                let broadcasts = chain.broadcasts();
+                assert_eq!(
+                    broadcasts[0].input[0].witness.last().unwrap(),
+                    contract.refund_control_block()
+                );
+                assert_eq!(broadcasts[0].lock_time.to_consensus_u32(), TIMEOUT);
+            }
+        }
     }
 
     /// A wallet whose `fund_htlc` must never be reached: proves the provider refuses to commit

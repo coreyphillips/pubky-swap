@@ -150,6 +150,7 @@ mod tests {
         use uuid::Uuid;
 
         let offer = |onchain_fee_sat| SwapOffer {
+            request_id: None,
             offer_id: Uuid::nil(),
             provider_pkarr: String::new(),
             network: NetworkSpec::Bitcoin,

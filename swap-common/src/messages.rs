@@ -21,6 +21,8 @@ use uuid::Uuid;
 pub enum SwapMessage {
     /// Provider → anyone: advertises swap capabilities + rates.
     Offer(SwapOffer),
+    /// Client requests the current executable offer.
+    OfferRequest(OfferRequest),
     /// Client → provider: request a concrete quote against an offer.
     QuoteRequest(QuoteRequest),
     /// Provider → client: a firm, time-limited quote.
@@ -31,6 +33,10 @@ pub enum SwapMessage {
     SwapAccept(SwapAccept),
     /// Either party → counterparty: lifecycle transition.
     SwapStatusUpdate(SwapStatusUpdate),
+    /// Client queries its persisted swap or recovers a lost acceptance.
+    SwapStatusRequest(SwapStatusRequest),
+    /// Provider returns public recovery data to the authenticated swap owner.
+    SwapStatusSnapshot(SwapStatusSnapshot),
     /// Either party → counterparty: cooperative signature material.
     /// Reserved for phase-2 Taproot cooperative (key-path) spends.
     CoopSignature(CoopSignature),
@@ -62,6 +68,9 @@ pub fn protocol_version_supported(version: u16) -> bool {
 /// A provider's advertised swap capabilities and rates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapOffer {
+    /// Correlates a direct offer response. Absent for broadcasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Uuid>,
     pub offer_id: Uuid,
     pub provider_pkarr: String,
     pub network: NetworkSpec,
@@ -162,6 +171,9 @@ impl SwapOffer {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteRequest {
+    /// Correlates concurrent quote requests and delayed responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Uuid>,
     pub offer_id: Uuid,
     /// The sender's own pubky, as the sender states it.
     ///
@@ -184,6 +196,8 @@ pub struct QuoteRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quote {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Uuid>,
     pub quote_id: Uuid,
     pub offer_id: Uuid,
     pub direction: SwapDirection,
@@ -220,8 +234,20 @@ impl Quote {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// On-chain contract selected by the client. Old requests retain the P2WSH contract.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwapScript {
+    #[default]
+    P2wsh,
+    /// Boltz-compatible Taproot tree with unilateral script-path spends.
+    TaprootBoltz,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapRequest {
+    #[serde(default)]
+    pub script_type: SwapScript,
     pub quote_id: Uuid,
     /// The sender's own pubky, as the sender states it. Non-authoritative, exactly as on
     /// [`QuoteRequest`]; a quote is redeemable only by the authenticated pubky it was issued to.
@@ -239,14 +265,19 @@ pub struct SwapRequest {
     pub invoice: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwapAccept {
+    #[serde(default)]
+    pub script_type: SwapScript,
+    /// Present for Taproot contracts. The legacy redeem script is empty in this case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swap_tree: Option<crate::taproot::BoltzSwapTree>,
     pub quote_id: Uuid,
     pub swap_id: Uuid,
     pub direction: SwapDirection,
     /// HTLC redeem script (hex), so both parties can independently verify it.
     pub htlc_script_hex: String,
-    /// P2WSH address the funding party must pay into.
+    /// Contract address the funding party must pay into.
     pub htlc_address: String,
     /// Exact amount to lock on-chain.
     pub onchain_amount_sat: u64,
@@ -256,6 +287,38 @@ pub struct SwapAccept {
     pub provider_pubkey_hex: String,
     /// Reverse only: the Lightning hold invoice the client must pay.
     pub invoice: Option<String>,
+}
+
+/// Request a provider's current offer without committing to a quote.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferRequest {
+    #[serde(default)]
+    pub request_id: Option<Uuid>,
+}
+
+/// Exactly one of swap_id and quote_id must be present.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapStatusRequest {
+    #[serde(default)]
+    pub request_id: Option<Uuid>,
+    pub swap_id: Option<Uuid>,
+    pub quote_id: Option<Uuid>,
+}
+
+/// Public recovery information. This never contains a branch secret or a preimage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapStatusSnapshot {
+    #[serde(default)]
+    pub request_id: Option<Uuid>,
+    pub accept: SwapAccept,
+    pub network: NetworkSpec,
+    pub state: SwapState,
+    pub funding_txid_hex: Option<String>,
+    pub funding_vout: Option<u32>,
+    pub spend_txid_hex: Option<String>,
+    pub required_confirmations: u32,
+    pub updated_at_unix: u64,
+    pub observed_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +339,11 @@ pub struct CoopSignature {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reject {
+    /// Machine-readable recovery outcome, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<Uuid>,
     pub swap_id: Option<Uuid>,
     pub quote_id: Option<Uuid>,
     pub reason: String,
@@ -287,6 +355,7 @@ mod tests {
 
     fn sample_offer() -> SwapOffer {
         SwapOffer {
+            request_id: None,
             offer_id: Uuid::nil(),
             provider_pkarr: "provider".to_string(),
             network: NetworkSpec::Regtest,
@@ -372,6 +441,7 @@ mod tests {
     #[test]
     fn quote_expiry() {
         let mut q = Quote {
+            request_id: None,
             quote_id: Uuid::nil(),
             offer_id: Uuid::nil(),
             direction: SwapDirection::Reverse,

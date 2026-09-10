@@ -27,6 +27,8 @@ pub mod risk;
 pub mod status;
 /// Re-exported from `swap-common`, where the store now lives so the client can use it too.
 pub use swap_common::store;
+#[cfg(test)]
+mod compatibility_tests;
 pub mod submarine;
 #[cfg(feature = "bdk-wallet")]
 pub mod wallet;
@@ -52,8 +54,7 @@ use uuid::Uuid;
 
 use crate::recovery::Recovery;
 use crate::reverse::{
-    cancel_hold_invoice, drive_reverse_swap, init_reverse_swap, OnchainWallet, ProgressSink,
-    ReverseSwap,
+    drive_reverse_swap, reverse_invoice_request, OnchainWallet, ProgressSink, ReverseSwap,
 };
 use crate::store::{JsonFileSwapStore, SwapRecord, SwapStore};
 use crate::submarine::{drive_submarine_swap, init_submarine_swap, SubmarineSwap};
@@ -726,6 +727,7 @@ fn spawn_offer_refresher(
                 network,
                 lightning_node_id.clone(),
                 rate,
+                ctx.capable,
             ) else {
                 continue;
             };
@@ -922,7 +924,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     ready.store(capable, std::sync::atomic::Ordering::Relaxed);
 
     // Resume any swaps that were in flight when we last shut down / crashed.
-    resume_swaps(&ctx);
+    resume_swaps(&ctx).await;
     // Watch for chain reorganizations affecting in-flight swaps.
     spawn_reorg_monitor(&ctx);
     // Sweep terminal swap records once they are old enough to drop. Records are retained
@@ -945,6 +947,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             network,
             lightning_node_id.clone(),
             offer_fee_rate(ctx.chain.as_ref(), config.onchain_fee_rate_sat_vb),
+            ctx.capable,
         )?;
         info!(
             "Advertising offer {} ({}..{} sat, dirs: {:?}); on-chain cost priced at {} sat at \
@@ -1270,6 +1273,7 @@ fn build_offer(
     network: Network,
     lightning_node_id: Option<String>,
     fee_rate_sat_vb: u64,
+    capable: bool,
 ) -> Result<SwapOffer> {
     // Price the on-chain component from the direction that costs the most, so a single advertised
     // figure covers whichever direction a client picks.
@@ -1283,6 +1287,7 @@ fn build_offer(
         .unwrap_or(0);
 
     Ok(SwapOffer {
+        request_id: None,
         offer_id: Uuid::new_v4(),
         provider_pkarr: provider_pkarr.to_string(),
         network: NetworkSpec::from_bitcoin_network(network)?,
@@ -1300,7 +1305,11 @@ fn build_offer(
         onchain_fee_sat,
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
-        features: Vec::new(),
+        features: if capable {
+            vec!["boltz-taproot-v1".into(), "swap-status-v1".into()]
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -1311,6 +1320,40 @@ async fn handle_message(
     msg: SwapMessage,
 ) -> Result<()> {
     match msg {
+        SwapMessage::OfferRequest(req) => {
+            let mut current = offer.clone();
+            current.request_id = req.request_id;
+            ctx.transport
+                .send(sender, &SwapMessage::Offer(current))
+                .await?;
+        }
+        SwapMessage::SwapStatusRequest(req) => {
+            match status_snapshot(ctx.store.as_ref(), sender, &req) {
+                Ok(snapshot) => {
+                    ctx.transport
+                        .send(sender, &SwapMessage::SwapStatusSnapshot(snapshot))
+                        .await?
+                }
+                Err(error) => {
+                    let code = match error.downcast_ref::<SwapLookupError>() {
+                        Some(SwapLookupError::NotFound) => Some("not_found"),
+                        Some(SwapLookupError::Pending) => Some("pending"),
+                        None => None,
+                    };
+                    reject_coded(
+                        &ctx.transport,
+                        sender,
+                        req.request_id,
+                        req.swap_id,
+                        req.quote_id,
+                        &error.to_string(),
+                        code,
+                    )
+                    .await?
+                }
+            }
+        }
+
         SwapMessage::QuoteRequest(req) => {
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
                 return Ok(());
@@ -1318,9 +1361,10 @@ async fn handle_message(
             // The cheapest place to find a mismatch: nothing is quoted, nothing reserved, and no
             // key generated. Finding it later means finding it with money already committed.
             if !protocol_version_supported(req.protocol_version) {
-                return reject(
+                return reject_request(
                     &ctx.transport,
                     sender,
+                    req.request_id,
                     None,
                     None,
                     &format!(
@@ -1331,18 +1375,43 @@ async fn handle_message(
                 .await;
             }
             if let Err(e) = check_client_pkarr(&req.client_pkarr, sender) {
-                return reject(&ctx.transport, sender, None, None, &e.to_string()).await;
+                return reject_request(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    &e.to_string(),
+                )
+                .await;
             }
             if !offer.supports(req.direction) {
-                return reject(&ctx.transport, sender, None, None, "unsupported direction").await;
+                return reject_request(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    "unsupported direction",
+                )
+                .await;
             }
             if !offer.accepts_amount(req.amount_sat) {
-                return reject(&ctx.transport, sender, None, None, "amount out of range").await;
+                return reject_request(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    "amount out of range",
+                )
+                .await;
             }
             let fee = offer.quote_fee(req.amount_sat);
             let now = now_unix();
             let expires_at_unix = now.saturating_add(ctx.quote_ttl_secs);
             let quote = Quote {
+                request_id: req.request_id,
                 quote_id: Uuid::new_v4(),
                 offer_id: offer.offer_id,
                 direction: req.direction,
@@ -1365,7 +1434,15 @@ async fn handle_message(
                     warn!(
                         "quote cache full ({MAX_TRACKED_QUOTES}); dropping request from {sender}"
                     );
-                    return reject(&ctx.transport, sender, None, None, "provider busy").await;
+                    return reject_request(
+                        &ctx.transport,
+                        sender,
+                        req.request_id,
+                        None,
+                        None,
+                        "provider busy",
+                    )
+                    .await;
                 }
                 quotes.insert(
                     quote.quote_id,
@@ -1387,6 +1464,57 @@ async fn handle_message(
         }
 
         SwapMessage::SwapRequest(req) => {
+            if let Err(error) = check_client_pkarr(&req.client_pkarr, sender) {
+                return reject(
+                    &ctx.transport,
+                    sender,
+                    None,
+                    Some(req.quote_id),
+                    &error.to_string(),
+                )
+                .await;
+            }
+            match replay_record(ctx.store.as_ref(), sender, &req) {
+                Ok(Some(mut record)) => {
+                    if record.pending_hold_invoice.is_some() {
+                        let reservation = Some(reserve_pending_swap(ctx, &record).await?);
+                        record = complete_invoice_intent(
+                            ctx.ln.as_ref(),
+                            ctx.store.as_ref(),
+                            record.swap_id,
+                            true,
+                        )
+                        .await?;
+                        let swap = reverse_swap_from_record(&record, ctx.timelock)?;
+                        spawn_reverse_driver(
+                            ctx,
+                            swap,
+                            record.clone(),
+                            reservation,
+                            Duration::ZERO,
+                        );
+                    }
+                    let accept = record
+                        .swap_accept
+                        .ok_or_else(|| anyhow!("persisted creation is missing its acceptance"))?;
+                    return ctx
+                        .transport
+                        .send(sender, &SwapMessage::SwapAccept(accept))
+                        .await
+                        .map_err(Into::into);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return reject(
+                        &ctx.transport,
+                        sender,
+                        None,
+                        Some(req.quote_id),
+                        &error.to_string(),
+                    )
+                    .await
+                }
+            }
             if !ctx.capable {
                 return reject(
                     &ctx.transport,
@@ -1394,16 +1522,6 @@ async fn handle_message(
                     None,
                     Some(req.quote_id),
                     "provider is not configured for swap execution",
-                )
-                .await;
-            }
-            if let Err(e) = check_client_pkarr(&req.client_pkarr, sender) {
-                return reject(
-                    &ctx.transport,
-                    sender,
-                    None,
-                    Some(req.quote_id),
-                    &e.to_string(),
                 )
                 .await;
             }
@@ -1431,6 +1549,180 @@ async fn handle_message(
     Ok(())
 }
 
+/// One Lightning payment hash cannot fund multiple reverse contracts.
+fn ensure_reverse_hash_available(store: &dyn SwapStore, hash: &PaymentHash) -> Result<()> {
+    for record in store.load_all_checked()? {
+        if record.direction == SwapDirection::Reverse && record.payment_hash()? == *hash {
+            return Err(anyhow!(
+                "payment hash already belongs to an admitted reverse swap"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Finish only the invoice associated with a previously persisted admission.
+async fn complete_invoice_intent(
+    ln: &dyn LightningBackend,
+    store: &dyn SwapStore,
+    swap_id: Uuid,
+    recover_existing: bool,
+) -> Result<SwapRecord> {
+    let mut record = store
+        .get(swap_id)?
+        .ok_or_else(|| anyhow!("reverse invoice intent was not persisted"))?;
+    validate_persisted_contract(&record)?;
+    let pending = record
+        .pending_hold_invoice
+        .as_ref()
+        .ok_or_else(|| anyhow!("missing reverse invoice intent"))?;
+    let expected_amount = record
+        .onchain_amount_sat
+        .checked_add(record.service_fee_sat)
+        .and_then(|value| value.checked_add(record.onchain_fee_sat))
+        .and_then(|value| value.checked_mul(1000))
+        .ok_or_else(|| anyhow!("persisted invoice amount overflows"))?;
+    if record.direction != SwapDirection::Reverse
+        || !record.invoice.is_empty()
+        || record.funding_outpoint().is_some()
+        || record.funding_intent_at_height.is_some()
+        || pending.amount_msat != expected_amount
+        || pending.memo != format!("pubky-swap reverse {}", record.swap_id)
+        || pending.cltv_expiry_delta == 0
+        || pending.expiry_secs == 0
+    {
+        return Err(anyhow!("invalid persisted reverse invoice intent"));
+    }
+    let request = lightning_backend::HoldInvoiceRequest {
+        payment_hash: record.payment_hash()?,
+        amount_msat: pending.amount_msat,
+        expiry_secs: pending.expiry_secs,
+        cltv_expiry_delta: pending.cltv_expiry_delta,
+        memo: pending.memo.clone(),
+    };
+    let existing = if recover_existing {
+        ln.lookup_hold_invoice(&request)
+            .await
+            .context("recover hold invoice")?
+    } else {
+        None
+    };
+    let invoice = match existing {
+        Some(invoice) => invoice,
+        None => ln
+            .create_hold_invoice(request.clone())
+            .await
+            .context("create hold invoice")?,
+    };
+    if invoice.payment_hash != request.payment_hash
+        || invoice.amount_msat != request.amount_msat
+        || invoice.bolt11.is_empty()
+    {
+        return Err(anyhow!(
+            "hold invoice response does not match the persisted intent"
+        ));
+    }
+    record.invoice = invoice.bolt11.clone();
+    record
+        .swap_accept
+        .as_mut()
+        .ok_or_else(|| anyhow!("invoice intent has no acceptance"))?
+        .invoice = Some(invoice.bolt11);
+    record.pending_hold_invoice = None;
+    record.updated_at_unix = now_unix();
+    validate_persisted_contract(&record)?;
+    store
+        .put(&record)
+        .context("persist completed reverse invoice creation")?;
+    Ok(record)
+}
+
+/// Find an already admitted creation without spending another quote or generating new keys.
+fn replay_record(
+    store: &dyn SwapStore,
+    sender: &str,
+    request: &SwapRequest,
+) -> Result<Option<SwapRecord>> {
+    for record in store.load_all_checked()? {
+        let Some(original) = record.swap_request.as_ref() else {
+            continue;
+        };
+        if original.quote_id != request.quote_id {
+            continue;
+        }
+        if !pubky_transport::same_pubky(&record.peer, sender) {
+            return Err(anyhow!("unknown or expired quote"));
+        }
+        if original != request {
+            return Err(anyhow!(
+                "quote was already accepted with a different request"
+            ));
+        }
+        if record.swap_accept.is_none() {
+            return Err(anyhow!("persisted creation is missing its acceptance"));
+        }
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
+/// Restrict recovery to the transport-authenticated counterparty and expose only public data.
+fn status_snapshot(
+    store: &dyn SwapStore,
+    sender: &str,
+    request: &SwapStatusRequest,
+) -> Result<SwapStatusSnapshot> {
+    let record = match (request.swap_id, request.quote_id) {
+        (Some(swap_id), None) => store.get(swap_id)?,
+        (None, Some(quote_id)) => store.load_all_checked()?.into_iter().find(|record| {
+            record
+                .swap_request
+                .as_ref()
+                .is_some_and(|original| original.quote_id == quote_id)
+        }),
+        _ => return Err(anyhow!("exactly one of swap_id and quote_id is required")),
+    }
+    .ok_or(SwapLookupError::NotFound)?;
+    if !pubky_transport::same_pubky(&record.peer, sender) {
+        return Err(SwapLookupError::NotFound.into());
+    }
+    if record.pending_hold_invoice.is_some() {
+        return Err(SwapLookupError::Pending.into());
+    }
+    let accept = record
+        .swap_accept
+        .ok_or_else(|| anyhow!("this older swap has no persisted acceptance"))?;
+    Ok(SwapStatusSnapshot {
+        request_id: request.request_id,
+        accept,
+        network: record.network,
+        state: record.state,
+        funding_txid_hex: record.funding_txid_hex,
+        funding_vout: record.funding_vout,
+        spend_txid_hex: record.spend_txid_hex,
+        required_confirmations: record.required_confirmations,
+        updated_at_unix: record.updated_at_unix,
+        observed_at_unix: now_unix(),
+    })
+}
+
+#[derive(Debug)]
+enum SwapLookupError {
+    NotFound,
+    Pending,
+}
+
+impl std::fmt::Display for SwapLookupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::NotFound => "unknown swap",
+            Self::Pending => "swap admission is persisted; invoice creation is pending",
+        })
+    }
+}
+
+impl std::error::Error for SwapLookupError {}
+
 /// Reserve capacity and check the wallet can actually fund this swap, before anything is
 /// promised to the counterparty.
 ///
@@ -1450,6 +1742,27 @@ async fn reserve_for_swap(
         .reserve(peer, swap_id, onchain_amount_sat)
         .map_err(|reason| anyhow!("{reason}"))?;
 
+    check_funding_balance(ctx, direction, onchain_amount_sat).await?;
+    Ok(guard)
+}
+
+async fn reserve_pending_swap(
+    ctx: &ExecCtx,
+    record: &SwapRecord,
+) -> Result<risk::ReservationGuard> {
+    let guard = ctx
+        .risk
+        .reserve_pending(&record.peer, record.swap_id, record.onchain_amount_sat)
+        .map_err(|reason| anyhow!("{reason}"))?;
+    check_funding_balance(ctx, record.direction, record.onchain_amount_sat).await?;
+    Ok(guard)
+}
+
+async fn check_funding_balance(
+    ctx: &ExecCtx,
+    direction: SwapDirection,
+    onchain_amount_sat: u64,
+) -> Result<()> {
     // Only a reverse swap spends the provider's own coins on chain; in a submarine swap the
     // client funds and we claim.
     if direction == SwapDirection::Reverse {
@@ -1474,7 +1787,7 @@ async fn reserve_for_swap(
             }
         }
     }
-    Ok(guard)
+    Ok(())
 }
 
 /// Start a reverse swap: create the hold invoice + HTLC, reply with `SwapAccept`, and spawn
@@ -1493,6 +1806,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     )?;
     let payment_hash = parse_hash32(&req.payment_hash_hex)?;
 
+    ensure_reverse_hash_available(ctx.store.as_ref(), &payment_hash)?;
     let quote = take_valid_quote(&ctx.quotes, req.quote_id, sender, SwapDirection::Reverse).await?;
 
     // Reserve capacity and check the wallet before the hold invoice exists. Creating the
@@ -1513,28 +1827,83 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     let timeout_height = timelock::onchain_timeout(tip, &ctx.timelock)
         .map_err(|e| anyhow!("timeout height: {e}"))?;
 
-    let swap = init_reverse_swap(
-        ctx.ln.as_ref(),
-        &claim_pk,
-        refund_sk,
-        &refund_pk,
+    let taproot = match req.script_type {
+        SwapScript::P2wsh => None,
+        SwapScript::TaprootBoltz => Some(swap_common::taproot::BoltzTaprootSwap::new(
+            SwapDirection::Reverse,
+            &parse_hash32(&req.payment_hash_hex)?,
+            &claim_pk,
+            &refund_pk,
+            timeout_height,
+        )?),
+    };
+    let htlc_script = if taproot.is_some() {
+        bitcoin::ScriptBuf::new()
+    } else {
+        swap_common::htlc::build_htlc_script(&payment_hash, &claim_pk, &refund_pk, timeout_height)
+    };
+    let htlc_spk = taproot.as_ref().map_or_else(
+        || htlc_p2wsh_address(&htlc_script, ctx.network).script_pubkey(),
+        |contract| contract.address(ctx.network).script_pubkey(),
+    );
+    let swap = ReverseSwap {
+        taproot,
+        payment_hash,
+        onchain_amount_sat: quote.amount_sat,
+        fee_rate_sat_vb: ctx.onchain_fee_rate_sat_vb,
+        htlc_script,
+        htlc_spk,
+        timeout_height,
+        refund_key: refund_sk,
+        invoice: String::new(),
+        timelock: ctx.timelock,
+    };
+    let mut invoice_request = reverse_invoice_request(
         payment_hash,
         quote.amount_sat,
         quote.fee_sat,
-        ctx.onchain_fee_rate_sat_vb,
-        timeout_height,
         ctx.invoice_expiry_secs,
-        ctx.network,
         ctx.timelock,
-    )
-    .await?;
+    )?;
+    invoice_request.memo = format!("pubky-swap reverse {swap_id}");
 
     // Persist before telling the client anything. The record is what makes the swap resumable,
     // and the moment the `SwapAccept` is on the wire the client can pay the hold invoice; a
     // record written after that leaves a window where the counterparty is committed and we have
     // nothing on disk to come back to. Writing first also means a failure here costs nothing:
     // nobody has acted yet.
+    let accept = SwapAccept {
+        script_type: req.script_type,
+        swap_tree: swap.taproot.as_ref().map(|contract| contract.swap_tree()),
+        quote_id: req.quote_id,
+        swap_id,
+        direction: SwapDirection::Reverse,
+        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+        htlc_address: swap
+            .taproot
+            .as_ref()
+            .map_or_else(
+                || htlc_p2wsh_address(&swap.htlc_script, ctx.network),
+                |contract| contract.address(ctx.network),
+            )
+            .to_string(),
+        onchain_amount_sat: swap.onchain_amount_sat,
+        timeout_block_height: swap.timeout_height,
+        provider_pubkey_hex: hex::encode(refund_pk.to_bytes()),
+        invoice: None,
+    };
     let record = SwapRecord {
+        pending_hold_invoice: Some(store::PendingHoldInvoice {
+            amount_msat: invoice_request.amount_msat,
+            expiry_secs: invoice_request.expiry_secs,
+            cltv_expiry_delta: invoice_request.cltv_expiry_delta,
+            memo: invoice_request.memo,
+        }),
+        swap_request: Some(req.clone()),
+        swap_accept: Some(accept.clone()),
+        taproot: swap.taproot.clone(),
+        created_at_unix: now_unix(),
+        updated_at_unix: now_unix(),
         swap_id,
         direction: SwapDirection::Reverse,
         peer: sender.to_string(),
@@ -1555,42 +1924,24 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         state: SwapState::Created,
         ..SwapRecord::new_progress()
     };
-    if let Err(e) = ctx.store.put(&record) {
-        // Nothing has been promised, so take back the one thing that exists: the hold invoice.
-        // Leaving it open would let a client pay into a swap no driver is watching.
-        cancel_hold_invoice(ctx.ln.as_ref(), swap.payment_hash).await;
-        return Err(anyhow!("cannot start reverse swap {swap_id}: {e}"));
-    }
+    // The durable intent exists before the invoice RPC, including its owner and immutable hash.
+    ctx.store
+        .put(&record)
+        .context("persist reverse invoice intent")?;
+    let record =
+        complete_invoice_intent(ctx.ln.as_ref(), ctx.store.as_ref(), record.swap_id, false).await?;
+    let swap = reverse_swap_from_record(&record, ctx.timelock)?;
+    let accept = record
+        .swap_accept
+        .clone()
+        .ok_or_else(|| anyhow!("completed reverse swap has no acceptance"))?;
 
-    let accept = SwapAccept {
-        quote_id: req.quote_id,
-        swap_id,
-        direction: SwapDirection::Reverse,
-        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
-        htlc_address: htlc_p2wsh_address(&swap.htlc_script, ctx.network).to_string(),
-        onchain_amount_sat: swap.onchain_amount_sat,
-        timeout_block_height: swap.timeout_height,
-        provider_pubkey_hex: hex::encode(refund_pk.to_bytes()),
-        invoice: Some(swap.invoice.clone()),
-    };
     if let Err(e) = ctx
         .transport
         .send(sender, &SwapMessage::SwapAccept(accept))
         .await
     {
-        // No driver will be spawned, so the record must not be left looking live: a restart would
-        // adopt a swap whose counterparty was told nothing. Cancel the invoice too, because a
-        // send that reports failure may still have been delivered, and an open hold invoice is
-        // one a client can pay into with nobody watching.
-        error!("could not send the SwapAccept for {swap_id} ({e}); abandoning the swap");
-        cancel_hold_invoice(ctx.ln.as_ref(), swap.payment_hash).await;
-        let mut abandoned = record;
-        abandoned.state = SwapState::Failed(format!("could not send the SwapAccept: {e}"));
-        abandoned.updated_at_unix = now_unix();
-        if let Err(e) = ctx.store.mark_terminal(&abandoned) {
-            warn!("failed to record the abandoned swap {swap_id}: {e}");
-        }
-        return Err(anyhow!("send SwapAccept for {swap_id}: {e}"));
+        warn!("could not send acceptance for {swap_id}: {e}; keeping its persisted driver active for recovery");
     }
     info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
 
@@ -1701,7 +2052,17 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
     let timeout_height = timelock::onchain_timeout(tip, &ctx.timelock)
         .map_err(|e| anyhow!("timeout height: {e}"))?;
 
-    let swap = init_submarine_swap(
+    let taproot = match req.script_type {
+        SwapScript::P2wsh => None,
+        SwapScript::TaprootBoltz => Some(swap_common::taproot::BoltzTaprootSwap::new(
+            SwapDirection::Submarine,
+            &parse_hash32(&req.payment_hash_hex)?,
+            &claim_pk,
+            &client_refund_pk,
+            timeout_height,
+        )?),
+    };
+    let mut swap = init_submarine_swap(
         ctx.ln.as_ref(),
         &invoice,
         &client_refund_pk,
@@ -1717,11 +2078,45 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         ctx.timelock,
     )
     .await?;
+    if let Some(contract) = taproot {
+        // The invoice and the script must commit to the same client-supplied hash.
+        if swap.payment_hash != parse_hash32(&req.payment_hash_hex)? {
+            return Err(anyhow!("request payment hash does not match the invoice"));
+        }
+        swap.htlc_spk = contract.address(ctx.network).script_pubkey();
+        swap.htlc_script = bitcoin::ScriptBuf::new();
+        swap.taproot = Some(contract);
+    }
 
     // Persist before the `SwapAccept` goes out, for the same reason as the reverse direction:
     // once the client has the HTLC address it can fund it, and a claim key that only exists in
     // this process is a claim key one crash away from being gone.
+    let accept = SwapAccept {
+        script_type: req.script_type,
+        swap_tree: swap.taproot.as_ref().map(|contract| contract.swap_tree()),
+        quote_id: req.quote_id,
+        swap_id,
+        direction: SwapDirection::Submarine,
+        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+        htlc_address: swap
+            .taproot
+            .as_ref()
+            .map_or_else(
+                || htlc_p2wsh_address(&swap.htlc_script, ctx.network),
+                |contract| contract.address(ctx.network),
+            )
+            .to_string(),
+        onchain_amount_sat: swap.onchain_amount_sat,
+        timeout_block_height: swap.timeout_height,
+        provider_pubkey_hex: hex::encode(claim_pk.to_bytes()),
+        invoice: None,
+    };
     let record = SwapRecord {
+        swap_request: Some(req.clone()),
+        swap_accept: Some(accept.clone()),
+        taproot: swap.taproot.clone(),
+        created_at_unix: now_unix(),
+        updated_at_unix: now_unix(),
         swap_id,
         direction: SwapDirection::Submarine,
         peer: sender.to_string(),
@@ -1746,33 +2141,12 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         return Err(anyhow!("cannot start submarine swap {swap_id}: {e}"));
     }
 
-    let accept = SwapAccept {
-        quote_id: req.quote_id,
-        swap_id,
-        direction: SwapDirection::Submarine,
-        htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
-        htlc_address: htlc_p2wsh_address(&swap.htlc_script, ctx.network).to_string(),
-        onchain_amount_sat: swap.onchain_amount_sat,
-        timeout_block_height: swap.timeout_height,
-        provider_pubkey_hex: hex::encode(claim_pk.to_bytes()),
-        invoice: None,
-    };
     if let Err(e) = ctx
         .transport
         .send(sender, &SwapMessage::SwapAccept(accept))
         .await
     {
-        // As above. Nothing was created on the Lightning side here, so the record is all there is
-        // to take back, and leaving it live would have a restart drive a swap the client never
-        // heard about.
-        error!("could not send the SwapAccept for {swap_id} ({e}); abandoning the swap");
-        let mut abandoned = record;
-        abandoned.state = SwapState::Failed(format!("could not send the SwapAccept: {e}"));
-        abandoned.updated_at_unix = now_unix();
-        if let Err(e) = ctx.store.mark_terminal(&abandoned) {
-            warn!("failed to record the abandoned swap {swap_id}: {e}");
-        }
-        return Err(anyhow!("send SwapAccept for {swap_id}: {e}"));
+        warn!("could not send acceptance for {swap_id}: {e}; keeping its persisted driver active for recovery");
     }
     info!(
         "Submarine swap {swap_id} started (fund {} to the HTLC)",
@@ -1846,12 +2220,17 @@ fn spawn_submarine_driver(
 
 /// Reconstruct a [`ReverseSwap`] from a persisted record (resume path).
 fn reverse_swap_from_record(rec: &SwapRecord, timelock: TimelockParams) -> Result<ReverseSwap> {
+    validate_persisted_contract(rec)?;
+    if rec.pending_hold_invoice.is_some() {
+        return Err(anyhow!("reverse invoice creation is still pending"));
+    }
     Ok(ReverseSwap {
         payment_hash: rec.payment_hash()?,
         onchain_amount_sat: rec.onchain_amount_sat,
         fee_rate_sat_vb: rec.fee_rate_sat_vb,
         htlc_script: rec.htlc_script()?,
         htlc_spk: rec.htlc_spk()?,
+        taproot: rec.taproot.clone(),
         timeout_height: rec.timeout_height,
         refund_key: rec.secret_key()?,
         invoice: rec.invoice.clone(),
@@ -1861,18 +2240,96 @@ fn reverse_swap_from_record(rec: &SwapRecord, timelock: TimelockParams) -> Resul
 
 /// Reconstruct a [`SubmarineSwap`] from a persisted record (resume path).
 fn submarine_swap_from_record(rec: &SwapRecord, timelock: TimelockParams) -> Result<SubmarineSwap> {
+    validate_persisted_contract(rec)?;
     Ok(SubmarineSwap {
         payment_hash: rec.payment_hash()?,
         onchain_amount_sat: rec.onchain_amount_sat,
         fee_rate_sat_vb: rec.fee_rate_sat_vb,
         htlc_script: rec.htlc_script()?,
         htlc_spk: rec.htlc_spk()?,
+        taproot: rec.taproot.clone(),
         timeout_height: rec.timeout_height,
         claim_key: rec.secret_key()?,
         invoice: rec.invoice.clone(),
         max_routing_fee_msat: rec.max_routing_fee_msat,
         timelock,
     })
+}
+
+/// A resumed driver must use the exact contract accepted by its original counterparty.
+fn validate_persisted_contract(rec: &SwapRecord) -> Result<()> {
+    let Some(contract) = &rec.taproot else {
+        if rec
+            .swap_request
+            .as_ref()
+            .is_some_and(|request| request.script_type == SwapScript::TaprootBoltz)
+            || rec
+                .swap_accept
+                .as_ref()
+                .is_some_and(|accept| accept.script_type == SwapScript::TaprootBoltz)
+        {
+            return Err(anyhow!("Taproot record is missing its contract parameters"));
+        }
+        return Ok(());
+    };
+    let request = rec
+        .swap_request
+        .as_ref()
+        .ok_or_else(|| anyhow!("Taproot record is missing its request"))?;
+    let accept = rec
+        .swap_accept
+        .as_ref()
+        .ok_or_else(|| anyhow!("Taproot record is missing its acceptance"))?;
+    let provider_key = PublicKey::new(rec.secret_key()?.public_key(&Secp256k1::new()));
+    let client_key = match rec.direction {
+        SwapDirection::Submarine => request.client_refund_pubkey_hex.as_deref(),
+        SwapDirection::Reverse => request.client_claim_pubkey_hex.as_deref(),
+    }
+    .ok_or_else(|| anyhow!("Taproot record is missing its counterparty public key"))?;
+    let client_key = parse_pubkey(client_key)?;
+    let (claim, refund) = match rec.direction {
+        SwapDirection::Submarine => (&provider_key, &client_key),
+        SwapDirection::Reverse => (&client_key, &provider_key),
+    };
+    let expected = swap_common::taproot::BoltzTaprootSwap::new(
+        rec.direction,
+        &rec.payment_hash()?,
+        claim,
+        refund,
+        rec.timeout_height,
+    )?;
+    if expected != *contract
+        || request.script_type != SwapScript::TaprootBoltz
+        || accept.script_type != SwapScript::TaprootBoltz
+        || request.direction != rec.direction
+        || accept.direction != rec.direction
+        || parse_hash32(&request.payment_hash_hex)? != rec.payment_hash()?
+        || !pubky_transport::same_pubky(&request.client_pkarr, &rec.peer)
+        || accept.quote_id != request.quote_id
+        || accept.swap_id != rec.swap_id
+        || accept.timeout_block_height != rec.timeout_height
+        || accept.onchain_amount_sat != rec.onchain_amount_sat
+        || parse_pubkey(&accept.provider_pubkey_hex)? != provider_key
+        || accept.htlc_address
+            != expected
+                .address(rec.network.to_bitcoin_network())
+                .to_string()
+        || accept.swap_tree.as_ref() != Some(&expected.swap_tree())
+        || !accept.htlc_script_hex.is_empty()
+        || !rec.htlc_script_hex.is_empty()
+        || match rec.direction {
+            SwapDirection::Submarine => request.invoice.as_deref() != Some(rec.invoice.as_str()),
+            SwapDirection::Reverse if rec.pending_hold_invoice.is_some() => {
+                accept.invoice.is_some() || !rec.invoice.is_empty()
+            }
+            SwapDirection::Reverse => accept.invoice.as_deref() != Some(rec.invoice.as_str()),
+        }
+    {
+        return Err(anyhow!(
+            "persisted Taproot parameters do not match the accepted contract"
+        ));
+    }
+    Ok(())
 }
 
 /// Spawn a background task that watches for chain reorganizations and re-validates the funding of
@@ -1995,7 +2452,7 @@ fn react_to_reorg(chain: &dyn ChainWatcher, store: &dyn SwapStore, fork: u32) {
 }
 
 /// On startup, re-spawn drivers for any swaps that were in flight at the last shutdown/crash.
-fn resume_swaps(ctx: &ExecCtx) {
+async fn resume_swaps(ctx: &ExecCtx) {
     let records = match ctx.store.load_active() {
         Ok(r) => r,
         Err(e) => {
@@ -2024,11 +2481,16 @@ fn resume_swaps(ctx: &ExecCtx) {
     // Re-establish exposure accounting before spawning anything: the money committed by these
     // swaps is committed whether or not this process has been up, and starting from zero would
     // let the provider commit its whole ceiling again on top of them.
+    let accepted_records: Vec<_> = records
+        .iter()
+        .filter(|record| record.pending_hold_invoice.is_none())
+        .cloned()
+        .collect();
     let mut guards: std::collections::HashMap<Uuid, risk::ReservationGuard> = ctx
         .risk
-        .restore(&records)
+        .restore(&accepted_records)
         .into_iter()
-        .zip(records.iter().map(|r| r.swap_id))
+        .zip(accepted_records.iter().map(|r| r.swap_id))
         .map(|(g, id)| (id, g))
         .collect();
     info!("Resuming {} persisted swap(s)", records.len());
@@ -2040,9 +2502,27 @@ fn resume_swaps(ctx: &ExecCtx) {
              failing until whatever they could not reach is working."
         );
     }
-    for rec in records {
+    for mut rec in records {
         let swap_id = rec.swap_id;
-        let guard = guards.remove(&swap_id);
+        let mut guard = guards.remove(&swap_id);
+        if rec.pending_hold_invoice.is_some() {
+            match reserve_pending_swap(ctx, &rec).await {
+                Ok(reservation) => guard = Some(reservation),
+                Err(error) => {
+                    warn!("pending swap {swap_id} must wait for capacity or liquidity: {error}");
+                    continue;
+                }
+            }
+            match complete_invoice_intent(ctx.ln.as_ref(), ctx.store.as_ref(), rec.swap_id, true)
+                .await
+            {
+                Ok(completed) => rec = completed,
+                Err(error) => {
+                    warn!("cannot resume reverse invoice creation {swap_id}: {error}; its intent remains recoverable");
+                    continue;
+                }
+            }
+        }
         let delay = resume_delay(&rec);
         match rec.direction {
             SwapDirection::Reverse => match reverse_swap_from_record(&rec, ctx.timelock) {
@@ -2202,10 +2682,38 @@ async fn reject(
     quote_id: Option<Uuid>,
     reason: &str,
 ) -> Result<()> {
+    reject_request(transport, sender, None, swap_id, quote_id, reason).await
+}
+
+async fn reject_request(
+    transport: &Transport,
+    sender: &str,
+    request_id: Option<Uuid>,
+    swap_id: Option<Uuid>,
+    quote_id: Option<Uuid>,
+    reason: &str,
+) -> Result<()> {
+    reject_coded(
+        transport, sender, request_id, swap_id, quote_id, reason, None,
+    )
+    .await
+}
+
+async fn reject_coded(
+    transport: &Transport,
+    sender: &str,
+    request_id: Option<Uuid>,
+    swap_id: Option<Uuid>,
+    quote_id: Option<Uuid>,
+    reason: &str,
+    code: Option<&str>,
+) -> Result<()> {
     transport
         .send(
             sender,
             &SwapMessage::Reject(Reject {
+                code: code.map(str::to_string),
+                request_id,
                 swap_id,
                 quote_id,
                 reason: reason.to_string(),
@@ -2232,11 +2740,14 @@ fn parse_hash32(hex_str: &str) -> Result<PaymentHash> {
 fn variant_name(msg: &SwapMessage) -> &'static str {
     match msg {
         SwapMessage::Offer(_) => "Offer",
+        SwapMessage::OfferRequest(_) => "OfferRequest",
         SwapMessage::QuoteRequest(_) => "QuoteRequest",
         SwapMessage::Quote(_) => "Quote",
         SwapMessage::SwapRequest(_) => "SwapRequest",
         SwapMessage::SwapAccept(_) => "SwapAccept",
         SwapMessage::SwapStatusUpdate(_) => "SwapStatusUpdate",
+        SwapMessage::SwapStatusRequest(_) => "SwapStatusRequest",
+        SwapMessage::SwapStatusSnapshot(_) => "SwapStatusSnapshot",
         SwapMessage::CoopSignature(_) => "CoopSignature",
         SwapMessage::Reject(_) => "Reject",
     }

@@ -43,6 +43,8 @@ pub struct SubmarineSwap {
     pub fee_rate_sat_vb: u64,
     pub htlc_script: ScriptBuf,
     pub htlc_spk: ScriptBuf,
+    /// Present when this swap uses a Boltz-compatible Taproot contract.
+    pub taproot: Option<swap_common::taproot::BoltzTaprootSwap>,
     pub timeout_height: u32,
     /// Provider's key for the HTLC claim branch.
     pub claim_key: SecretKey,
@@ -137,6 +139,7 @@ pub async fn init_submarine_swap(
     let htlc_spk = htlc_p2wsh_address(&htlc_script, network).script_pubkey();
 
     Ok(SubmarineSwap {
+        taproot: None,
         payment_hash,
         onchain_amount_sat,
         fee_rate_sat_vb,
@@ -417,8 +420,21 @@ pub async fn drive_submarine_swap(
     //    (RBF) — the claim races the client's refund timeout, so a stuck claim is bumped.
     let dest = wallet.receive_destination();
     let preimage = payment.preimage;
-    let claim_vsize = spend_vsize(&swap.htlc_script, &dest, true);
+    let claim_vsize = swap.taproot.as_ref().map_or_else(
+        || spend_vsize(&swap.htlc_script, &dest, true),
+        |contract| contract.spend_vsize(&dest, true),
+    );
     let build = |rate: u64| {
+        if let Some(contract) = &swap.taproot {
+            return contract.claim_tx(
+                funding_outpoint,
+                funding_value_sat,
+                dest.clone(),
+                estimate_spend_fee(rate, claim_vsize),
+                preimage,
+                &swap.claim_key,
+            );
+        }
         build_claim_tx(
             funding_outpoint,
             funding_value_sat,
@@ -817,43 +833,67 @@ mod tests {
 
     #[tokio::test]
     async fn submarine_swap_happy_path_pays_and_claims() {
-        let preimage = generate_preimage();
-        let ph = payment_hash(&preimage);
-        let ln = MockLn::new(ph, Some(preimage));
-        let (swap, _) = make_swap(&ln).await;
+        for use_taproot in [false, true] {
+            let preimage = generate_preimage();
+            let ph = payment_hash(&preimage);
+            let ln = MockLn::new(ph, Some(preimage));
+            let (mut swap, _) = make_swap(&ln).await;
+            if use_taproot {
+                let secp = Secp256k1::new();
+                let claim_pk = PublicKey::new(swap.claim_key.public_key(&secp));
+                let (_, refund_pk) = random_keypair(&secp);
+                let contract = swap_common::taproot::BoltzTaprootSwap::new(
+                    swap_common::SwapDirection::Submarine,
+                    &ph,
+                    &claim_pk,
+                    &refund_pk,
+                    swap.timeout_height,
+                )
+                .unwrap();
+                swap.htlc_spk = contract.address(Network::Regtest).script_pubkey();
+                swap.htlc_script = ScriptBuf::new();
+                swap.taproot = Some(contract);
+            }
 
-        let chain = MockChain::new()
-            .with_tip(MOCK_TIP)
-            .with_funding(FundingUtxo {
-                outpoint: funding_outpoint(),
-                value_sat: ONCHAIN_SAT,
-                confirmations: 3,
-            })
-            .always_final();
-        let wallet = MockWallet { spk: dest() };
+            let chain = MockChain::new()
+                .with_tip(MOCK_TIP)
+                .with_funding(FundingUtxo {
+                    outpoint: funding_outpoint(),
+                    value_sat: ONCHAIN_SAT,
+                    confirmations: 3,
+                })
+                .always_final();
+            let wallet = MockWallet { spk: dest() };
 
-        let state = drive_submarine_swap(
-            &ln,
-            &chain,
-            &wallet,
-            &swap,
-            2,
-            Duration::from_millis(0),
-            &Resume::default(),
-            false,
-            &(),
-        )
-        .await
-        .unwrap();
+            let state = drive_submarine_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &swap,
+                2,
+                Duration::from_millis(0),
+                &Resume::default(),
+                false,
+                &(),
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(state, SwapState::Claimed);
-        let broadcasts = chain.broadcasts();
-        assert_eq!(broadcasts.len(), 1, "one claim tx must be broadcast");
-        // The broadcast claim must carry the preimage that matches the hashlock.
-        assert_eq!(
-            extract_preimage(&broadcasts[0], &funding_outpoint(), &ph),
-            Some(preimage)
-        );
+            assert_eq!(state, SwapState::Claimed);
+            let broadcasts = chain.broadcasts();
+            assert_eq!(broadcasts.len(), 1, "one claim tx must be broadcast");
+            // The broadcast claim must carry the preimage that matches the hashlock.
+            assert_eq!(
+                extract_preimage(&broadcasts[0], &funding_outpoint(), &ph),
+                Some(preimage)
+            );
+            if let Some(contract) = &swap.taproot {
+                assert_eq!(
+                    broadcasts[0].input[0].witness.last().unwrap(),
+                    contract.claim_control_block()
+                );
+            }
+        }
     }
 
     /// The submarine half of the same hole. The provider has paid the Lightning invoice, so the
