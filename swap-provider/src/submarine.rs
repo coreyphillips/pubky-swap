@@ -856,6 +856,144 @@ mod tests {
         );
     }
 
+    /// The submarine half of the same hole. The provider has paid the Lightning invoice, so the
+    /// on-chain claim is the only way that money comes back, and it is a race against the client's
+    /// refund branch. Ten transient failures used to write `Failed` and stop: no claim, no
+    /// fee-bump, no resume after a restart, and a client refund walking towards its timeout.
+    #[tokio::test]
+    async fn a_paid_submarine_swap_outlives_an_outage_and_still_claims() {
+        use crate::recovery::{Recovery, MAX_DRIVER_RETRIES};
+        use std::sync::Arc;
+        use swap_common::chain::mock::FlakyChain;
+        use swap_common::store::{JsonFileSwapStore, SwapRecord, SwapStore};
+        use swap_common::{NetworkSpec, SwapDirection};
+
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        // A node that has already paid: this is the state a driver comes back to.
+        let ln = MockLn::new(ph, Some(preimage)).with_status(PaymentStatus::Succeeded(
+            lightning_backend::PaymentResult {
+                preimage,
+                fee_msat: 0,
+            },
+        ));
+        let (swap, _) = make_swap(&ln).await;
+
+        let outpoint = funding_outpoint();
+        let swap_id = uuid::Uuid::new_v4();
+        let record = SwapRecord {
+            swap_id,
+            direction: SwapDirection::Submarine,
+            peer: "client".into(),
+            network: NetworkSpec::Regtest,
+            payment_hash_hex: hex::encode(swap.payment_hash),
+            onchain_amount_sat: ONCHAIN_SAT,
+            fee_rate_sat_vb: swap.fee_rate_sat_vb,
+            htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+            timeout_height: TIMEOUT,
+            secret_key_hex: hex::encode(swap.claim_key.secret_bytes()),
+            invoice: swap.invoice.clone(),
+            max_routing_fee_msat: swap.max_routing_fee_msat,
+            required_confirmations: 2,
+            funding_txid_hex: Some(outpoint.txid.to_string()),
+            funding_vout: Some(outpoint.vout),
+            invoice_pay_started_at_unix: Some(1),
+            state: SwapState::InvoicePaid,
+            ..SwapRecord::new_progress()
+        };
+
+        let dir = std::env::temp_dir().join(format!("pubky-swap-recovery-{swap_id}"));
+        let mut store: Arc<dyn SwapStore> = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+        store.put(&record).unwrap();
+
+        let chain = FlakyChain::new(
+            MockChain::new()
+                .with_tip(MOCK_TIP)
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: ONCHAIN_SAT,
+                    confirmations: 3,
+                })
+                .always_final(),
+            u32::MAX,
+        );
+        let wallet = MockWallet { spk: dest() };
+
+        let outage_runs = MAX_DRIVER_RETRIES + 2;
+        let mut failures = 0u32;
+        let mut restarted = false;
+        let state = loop {
+            assert!(failures < 100, "the driver never got anywhere");
+            let rec = store
+                .get(swap_id)
+                .unwrap()
+                .expect("the record must never leave the store");
+            assert!(
+                !rec.state.is_terminal(),
+                "an outage made a paid swap terminal after {failures} failures"
+            );
+            let resumed = crate::submarine_swap_from_record(&rec, params()).unwrap();
+            let resume = rec.resume();
+            let already_paid = rec.invoice_pay_started_at_unix.is_some();
+            let progress = crate::StoreProgress {
+                store: store.clone(),
+                record: std::sync::Mutex::new(rec),
+            };
+            match drive_submarine_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &resumed,
+                2,
+                Duration::ZERO,
+                &resume,
+                already_paid,
+                &progress,
+            )
+            .await
+            {
+                Ok(state) if state.is_terminal() => break state,
+                Ok(_) => {}
+                Err(e) => {
+                    failures += 1;
+                    let (rec, recovery) = progress.record_failure(&e, crate::is_transient(&e));
+                    assert!(
+                        matches!(recovery, Recovery::Retry(_)),
+                        "failure {failures} gave up on a swap whose invoice is already paid: {e}"
+                    );
+                    assert_eq!(rec.retry_count, failures);
+                }
+            }
+
+            if failures == outage_runs && !restarted {
+                restarted = true;
+                store = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+                let active = store.load_active().unwrap();
+                assert_eq!(
+                    active.len(),
+                    1,
+                    "a swap with a paid invoice must still be resumed after {failures} failures"
+                );
+                assert!(active[0].funds_at_risk());
+                assert!(crate::needs_recovery(&active[0]));
+                assert!(active[0].next_retry_at_unix.is_some());
+                chain.recover();
+            }
+        };
+
+        assert_eq!(state, SwapState::Claimed);
+        assert!(chain.failed_calls() >= outage_runs);
+        let broadcasts = chain.inner().broadcasts();
+        assert_eq!(broadcasts.len(), 1, "the claim must reach the wire");
+        assert_eq!(
+            extract_preimage(&broadcasts[0], &outpoint, &ph),
+            Some(preimage),
+            "and it must carry the preimage the payment bought"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn submarine_swap_payment_failure_does_not_claim() {
         let preimage = generate_preimage();

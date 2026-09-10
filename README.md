@@ -187,8 +187,8 @@ can see what the daemon is doing without parsing its logs:
 
 | Endpoint | What it answers |
 |---|---|
-| `/health` | the `--doctor` report, as JSON, with `capable` |
-| `/status` | pubky, network, directions, in-flight count, committed sats |
+| `/health` | the `--doctor` report, as JSON, with `capable`, plus any swap needing recovery |
+| `/status` | pubky, network, directions, in-flight count, committed sats, swaps needing recovery |
 | `/swaps` | live swaps, and the most recent finished ones |
 | `/limits` | exposure and concurrency against their ceilings, and per counterparty |
 | `/offer` | the offer currently being advertised |

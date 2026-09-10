@@ -163,12 +163,19 @@ pub struct SwapRecord {
     /// reads this and re-validates rather than trusting what it wrote down before the fork.
     #[serde(default)]
     pub reorg_seen_at_height: Option<u32>,
-    /// The most recent driver failure, for the operator.
+    /// The most recent driver failure, for the operator. Cleared as soon as the swap moves on.
     #[serde(default)]
     pub last_error: Option<String>,
-    /// Consecutive transient failures, bounding the retry loop.
+    /// Consecutive failed driver runs, setting the backoff before the next one.
     #[serde(default)]
     pub retry_count: u32,
+    /// When the next driver run is due, for a swap whose last one failed.
+    ///
+    /// Persisted because the backoff has to survive a restart. Without it a daemon coming back up
+    /// during an outage re-enters every failing driver at once, which is how a backend that is
+    /// still down gets hammered by the swaps waiting on it.
+    #[serde(default)]
+    pub next_retry_at_unix: Option<u64>,
     #[serde(default)]
     pub updated_at_unix: u64,
     /// When this swap was first written down, as opposed to when it last changed.
@@ -303,6 +310,7 @@ impl SwapRecord {
             quote_total_sat: 0,
             last_error: None,
             retry_count: 0,
+            next_retry_at_unix: None,
             updated_at_unix: 0,
             created_at_unix: 0,
         }
@@ -390,6 +398,40 @@ impl SwapRecord {
             our_spends: self.our_spends(),
             reorg_seen_at_height: self.reorg_seen_at_height,
         }
+    }
+
+    /// Note that the swap moved on, so the next failure starts a fresh backoff.
+    pub fn progressed(&mut self) {
+        self.retry_count = 0;
+        self.next_retry_at_unix = None;
+        self.last_error = None;
+    }
+
+    /// Whether this side has funds committed that only an action of its own can recover.
+    ///
+    /// This is the line between a swap that may be given up on and one that may not. Before it,
+    /// abandoning a swap costs a swap; after it, abandoning one costs the money, because the claim
+    /// or refund that recovers it is unilateral and nobody else will do it.
+    ///
+    /// Which marker means "committed" depends on which leg this side pays. The on-chain funder
+    /// (the provider in a reverse swap, the client in a submarine one) is committed from the
+    /// moment it *intends* to broadcast, not from the moment it records an outpoint: the
+    /// transaction may be on the wire whatever the chain currently shows. The Lightning payer is
+    /// committed once a payment has been started, and recovers by claiming the HTLC on chain.
+    pub fn funds_at_risk(&self) -> bool {
+        let we_fund_onchain = matches!(
+            (self.role, self.direction),
+            (SwapRole::Provider, SwapDirection::Reverse)
+                | (SwapRole::Client, SwapDirection::Submarine)
+        );
+        let committed = if we_fund_onchain {
+            self.funding_intent_at_height.is_some() || self.funding_outpoint().is_some()
+        } else {
+            self.invoice_pay_started_at_unix.is_some()
+        };
+        // A claim or refund of ours on the wire is a commitment either way: it is the recovery
+        // itself, and it is not finished until it confirms.
+        committed || !self.our_spend_txids.is_empty() || self.spend_txid_hex.is_some()
     }
 
     /// The funding outpoint, if it has been recorded.
@@ -668,6 +710,78 @@ mod tests {
             rec.note_our_spend(txid(n.wrapping_add(10)));
         }
         assert_eq!(rec.our_spend_txids.len(), MAX_TRACKED_OUR_SPENDS);
+    }
+
+    /// Which marker means "our money is committed" depends on which leg this side pays, and
+    /// getting it backwards is expensive in both directions: too eager and an ordinary failed swap
+    /// is retried forever; too cautious and a funded HTLC is given up on.
+    #[test]
+    fn committed_funds_are_recognised_from_the_marker_this_side_writes() {
+        let base = |role, direction| SwapRecord {
+            role,
+            direction,
+            ..SwapRecord::new_progress()
+        };
+
+        for (role, direction) in [
+            (SwapRole::Provider, SwapDirection::Reverse),
+            (SwapRole::Client, SwapDirection::Submarine),
+        ] {
+            // The on-chain funder. Committed from the intent, not the outpoint: the transaction
+            // may be on the wire whatever the chain currently shows.
+            let mut rec = base(role, direction);
+            assert!(!rec.funds_at_risk(), "{role:?}/{direction:?}: nothing yet");
+            rec.invoice_pay_started_at_unix = Some(1);
+            assert!(
+                !rec.funds_at_risk(),
+                "{role:?}/{direction:?}: this side does not pay the invoice"
+            );
+            rec.funding_intent_at_height = Some(800_000);
+            assert!(rec.funds_at_risk());
+
+            let mut rec = base(role, direction);
+            rec.funding_txid_hex = Some("11".repeat(32));
+            rec.funding_vout = Some(0);
+            assert!(rec.funds_at_risk());
+        }
+
+        for (role, direction) in [
+            (SwapRole::Provider, SwapDirection::Submarine),
+            (SwapRole::Client, SwapDirection::Reverse),
+        ] {
+            // The Lightning payer. The counterparty's on-chain funding is not this side's money;
+            // its own payment is, and it recovers by claiming.
+            let mut rec = base(role, direction);
+            rec.funding_txid_hex = Some("11".repeat(32));
+            rec.funding_vout = Some(0);
+            assert!(
+                !rec.funds_at_risk(),
+                "{role:?}/{direction:?}: the counterparty funded that, not us"
+            );
+            rec.invoice_pay_started_at_unix = Some(1);
+            assert!(rec.funds_at_risk());
+        }
+
+        // A claim or refund on the wire counts whoever wrote it: it is the recovery itself, and it
+        // is not finished until it confirms.
+        let mut rec = base(SwapRole::Provider, SwapDirection::Submarine);
+        rec.note_our_spend(txid(3));
+        assert!(rec.funds_at_risk());
+    }
+
+    /// Progress is what ends a backoff. Leaving the count and the error behind would have a swap
+    /// that recovered still reported as needing an operator.
+    #[test]
+    fn progress_clears_the_retry_state() {
+        let mut rec = SwapRecord::new_progress();
+        rec.retry_count = 7;
+        rec.next_retry_at_unix = Some(1);
+        rec.last_error = Some("electrum: connection refused".into());
+
+        rec.progressed();
+        assert_eq!(rec.retry_count, 0);
+        assert_eq!(rec.next_retry_at_unix, None);
+        assert_eq!(rec.last_error, None);
     }
 
     fn temp_dir() -> PathBuf {

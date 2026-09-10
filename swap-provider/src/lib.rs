@@ -20,6 +20,7 @@ compile_error!(
 
 pub mod preflight;
 pub mod pricing;
+pub(crate) mod recovery;
 pub mod reverse;
 pub mod risk;
 #[cfg(feature = "status")]
@@ -49,6 +50,7 @@ use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::recovery::Recovery;
 use crate::reverse::{
     cancel_hold_invoice, drive_reverse_swap, init_reverse_swap, OnchainWallet, ProgressSink,
     ReverseSwap,
@@ -492,17 +494,23 @@ impl StoreProgress {
         }
     }
 
-    /// Note a failure and return how many have accumulated.
-    fn record_error(&self, e: &anyhow::Error, transient: bool) -> u32 {
-        let mut attempts = 0;
-        self.update("error", |rec| {
+    /// Note a failure, work out what it earns the swap, and write down when the next run is due.
+    ///
+    /// One write rather than two, and the decision is taken inside it: the delay depends on the
+    /// count this call increments, and `next_retry_at_unix` is what makes the delay survive a
+    /// restart rather than being a `sleep` that dies with the process.
+    fn record_failure(&self, e: &anyhow::Error, transient: bool) -> (SwapRecord, Recovery) {
+        let mut recovery = Recovery::GiveUp;
+        self.update("driver failure", |rec| {
             rec.last_error = Some(e.to_string());
-            if transient {
-                rec.retry_count = rec.retry_count.saturating_add(1);
-            }
-            attempts = rec.retry_count;
+            rec.retry_count = rec.retry_count.saturating_add(1);
+            recovery = recovery::after_failure(rec, transient);
+            rec.next_retry_at_unix = match recovery {
+                Recovery::Retry(delay) => Some(now_unix().saturating_add(delay.as_secs())),
+                Recovery::GiveUp => None,
+            };
         });
-        attempts
+        (self.snapshot(), recovery)
     }
 
     /// The record as it stands.
@@ -532,7 +540,7 @@ impl ProgressSink for StoreProgress {
             rec.funding_intent_at_height = Some(tip);
             rec.funding_attempts = rec.funding_attempts.saturating_add(1);
             rec.state = SwapState::LockupPending;
-            rec.retry_count = 0;
+            rec.progressed();
         })
     }
 
@@ -542,7 +550,7 @@ impl ProgressSink for StoreProgress {
             rec.funding_vout = Some(outpoint.vout);
             rec.funding_intent_at_height = None;
             rec.state = SwapState::LockupConfirmed;
-            rec.retry_count = 0;
+            rec.progressed();
         });
     }
 
@@ -552,14 +560,14 @@ impl ProgressSink for StoreProgress {
         self.try_update("invoice payment intent", |rec| {
             rec.invoice_pay_started_at_unix = Some(now_unix());
             rec.state = SwapState::InvoicePending;
-            rec.retry_count = 0;
+            rec.progressed();
         })
     }
 
     fn invoice_paid(&self) {
         self.update("invoice paid", |rec| {
             rec.state = SwapState::InvoicePaid;
-            rec.retry_count = 0;
+            rec.progressed();
         });
     }
 
@@ -569,7 +577,7 @@ impl ProgressSink for StoreProgress {
         self.update("observed claim", |rec| {
             rec.claim_observed_txid_hex = Some(txid.to_string());
             rec.state = SwapState::InvoicePaid;
-            rec.retry_count = 0;
+            rec.progressed();
         });
     }
 
@@ -579,7 +587,7 @@ impl ProgressSink for StoreProgress {
         // `ClaimPending` would describe it as the opposite of what it is.
         self.update("broadcast spend", |rec| {
             rec.note_our_spend(txid);
-            rec.retry_count = 0;
+            rec.progressed();
         });
     }
 }
@@ -596,9 +604,6 @@ const REORG_FAILURES_BEFORE_ALARM: u32 = 3;
 
 /// How long a terminal swap record is kept before the background sweeper removes it.
 const TERMINAL_RECORD_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
-/// Attempts a driver gets on transient failures before the swap is given up on.
-const MAX_DRIVER_RETRIES: u32 = 10;
 
 /// Whether a driver error looks like something retrying could fix.
 ///
@@ -619,6 +624,10 @@ fn is_transient(e: &anyhow::Error) -> bool {
 /// errors -- and every `?` in a driver propagates, including `chain.tip_height()?`. So a single
 /// Electrum blip on a funded swap deleted its record, which meant no resume, which meant the
 /// refund was never attempted and the provider's coins sat in an HTLC nobody was watching.
+///
+/// It is not marked terminal here either, once the swap holds funds. `Failed` is terminal, and
+/// terminal is the same disappearance by another route: excluded from restart recovery, exposure
+/// released, nothing left driving the refund. See [`recovery`].
 async fn finish_driver_run(
     ctx: &ExecCtx,
     progress: &StoreProgress,
@@ -630,7 +639,7 @@ async fn finish_driver_run(
     // failure stopped counting against total exposure and concurrency for the rest of its life,
     // while its coins were still very much at risk.
     reservation: Option<risk::ReservationGuard>,
-    respawn: impl FnOnce(&ExecCtx, SwapRecord, Option<risk::ReservationGuard>),
+    respawn: impl FnOnce(&ExecCtx, SwapRecord, Option<risk::ReservationGuard>, Duration),
 ) {
     match result {
         Ok(state) if state.is_terminal() => {
@@ -643,23 +652,42 @@ async fn finish_driver_run(
             // re-enter it on the state it left behind.
             warn!("swap {swap_id} returned non-terminal state {state:?}; re-entering the driver");
             progress.set_state(state);
-            respawn(ctx, progress.snapshot(), reservation);
+            respawn(ctx, progress.snapshot(), reservation, Duration::ZERO);
         }
         Err(e) => {
             let transient = is_transient(&e);
-            let attempts = progress.record_error(&e, transient);
-            if transient && attempts < MAX_DRIVER_RETRIES {
-                warn!(
-                    "swap {swap_id} hit a transient failure ({e}); attempt {attempts} of \
-                     {MAX_DRIVER_RETRIES}, re-entering the driver"
-                );
-                respawn(ctx, progress.snapshot(), reservation);
-            } else {
-                error!("swap {swap_id} failed permanently: {e}");
-                let state = SwapState::Failed(e.to_string());
-                progress.set_terminal(state.clone());
-                send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
-                evict_peer_if_idle(ctx, peer).await;
+            let (rec, recovery) = progress.record_failure(&e, transient);
+            match recovery {
+                Recovery::Retry(delay) => {
+                    if rec.funds_at_risk() && rec.retry_count >= recovery::MAX_DRIVER_RETRIES {
+                        // Loud, and repeated at the recovery cadence rather than once: this swap
+                        // holds committed funds, the daemon can no longer make progress on it, and
+                        // nothing but an operator is going to change that.
+                        error!(
+                            "swap {swap_id} holds committed funds and its driver has now failed \
+                             {} times in a row ({e}). It stays live and is re-entered in {}s; the \
+                             claim or refund it owes will not happen without it. Check the chain, \
+                             Lightning and wallet backends.",
+                            rec.retry_count,
+                            delay.as_secs()
+                        );
+                    } else {
+                        warn!(
+                            "swap {swap_id} hit a failure ({e}); attempt {}, re-entering the \
+                             driver in {}s",
+                            rec.retry_count,
+                            delay.as_secs()
+                        );
+                    }
+                    respawn(ctx, rec, reservation, delay);
+                }
+                Recovery::GiveUp => {
+                    error!("swap {swap_id} failed permanently: {e}");
+                    let state = SwapState::Failed(e.to_string());
+                    progress.set_terminal(state.clone());
+                    send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
+                    evict_peer_if_idle(ctx, peer).await;
+                }
             }
         }
     }
@@ -1563,7 +1591,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
     }
     info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
 
-    spawn_reverse_driver(ctx, swap, record, Some(reservation));
+    spawn_reverse_driver(ctx, swap, record, Some(reservation), Duration::ZERO);
     Ok(())
 }
 
@@ -1576,6 +1604,10 @@ fn spawn_reverse_driver(
     // Held for the driver's lifetime, so exposure is released when the task ends however it
     // ends. A driver that panics or is cancelled cannot leave capacity counted forever.
     reservation: Option<risk::ReservationGuard>,
+    // How long to wait before driving, after a failure. Waited out inside the task rather than
+    // before spawning it, so the reservation is held across the delay: a swap backing off is a
+    // swap whose funds are still committed.
+    delay: Duration,
 ) {
     let chain = match ctx.chain.clone() {
         Some(c) => c,
@@ -1595,6 +1627,9 @@ fn spawn_reverse_driver(
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
         let result = drive_reverse_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -1613,8 +1648,8 @@ fn spawn_reverse_driver(
             swap_id,
             result,
             reservation,
-            |ctx, rec, reservation| match reverse_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, reservation),
+            |ctx, rec, reservation, delay| match reverse_swap_from_record(&rec, ctx.timelock) {
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, reservation, delay),
                 Err(e) => error!("cannot re-enter reverse swap {swap_id}: {e}"),
             },
         )
@@ -1740,7 +1775,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         "Submarine swap {swap_id} started (fund {} to the HTLC)",
         swap.onchain_amount_sat
     );
-    spawn_submarine_driver(ctx, swap, record, Some(reservation));
+    spawn_submarine_driver(ctx, swap, record, Some(reservation), Duration::ZERO);
     Ok(())
 }
 
@@ -1752,6 +1787,9 @@ fn spawn_submarine_driver(
     // Held for the driver's lifetime, so exposure is released when the task ends however it
     // ends. A driver that panics or is cancelled cannot leave capacity counted forever.
     reservation: Option<risk::ReservationGuard>,
+    // How long to wait before driving, after a failure. As in the reverse direction, waited out
+    // inside the task so the reservation is held across it.
+    delay: Duration,
 ) {
     let chain = match ctx.chain.clone() {
         Some(c) => c,
@@ -1772,6 +1810,9 @@ fn spawn_submarine_driver(
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
         let result = drive_submarine_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -1791,8 +1832,8 @@ fn spawn_submarine_driver(
             swap_id,
             result,
             reservation,
-            |ctx, rec, reservation| match submarine_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, reservation),
+            |ctx, rec, reservation, delay| match submarine_swap_from_record(&rec, ctx.timelock) {
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, reservation, delay),
                 Err(e) => error!("cannot re-enter submarine swap {swap_id}: {e}"),
             },
         )
@@ -1988,20 +2029,51 @@ fn resume_swaps(ctx: &ExecCtx) {
         .map(|(g, id)| (id, g))
         .collect();
     info!("Resuming {} persisted swap(s)", records.len());
+    let needing_recovery = records.iter().filter(|r| needs_recovery(r)).count();
+    if needing_recovery > 0 {
+        error!(
+            "{needing_recovery} of them hold committed funds and were failing against a backend \
+             when this daemon last ran. They are resumed, not abandoned, but they will keep \
+             failing until whatever they could not reach is working."
+        );
+    }
     for rec in records {
         let swap_id = rec.swap_id;
         let guard = guards.remove(&swap_id);
+        let delay = resume_delay(&rec);
         match rec.direction {
             SwapDirection::Reverse => match reverse_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, guard),
+                Ok(swap) => spawn_reverse_driver(ctx, swap, rec, guard, delay),
                 Err(e) => warn!("cannot resume reverse swap {swap_id}: {e}"),
             },
             SwapDirection::Submarine => match submarine_swap_from_record(&rec, ctx.timelock) {
-                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, guard),
+                Ok(swap) => spawn_submarine_driver(ctx, swap, rec, guard, delay),
                 Err(e) => warn!("cannot resume submarine swap {swap_id}: {e}"),
             },
         }
     }
+}
+
+/// How long a resumed swap waits before its driver runs.
+///
+/// The backoff a failing swap had built up is on its record, so a restart continues it rather than
+/// resetting it: an operator bouncing the daemon during an outage would otherwise put every
+/// waiting swap back onto the backend at once. Capped, because the value is a wall-clock time and
+/// a clock that jumped should not park a funded swap indefinitely.
+fn resume_delay(rec: &SwapRecord) -> Duration {
+    rec.next_retry_at_unix
+        .map(|at| Duration::from_secs(at.saturating_sub(now_unix())))
+        .unwrap_or_default()
+        .min(recovery::BACKOFF_MAX)
+}
+
+/// Whether this swap holds committed funds and has stopped being able to make progress on them.
+///
+/// The threshold is the retry budget an unfunded swap gets. It is not a limit here -- a funded
+/// swap is never given up on -- but it is the same evidence, and past it "a backend blipped" is no
+/// longer the likely explanation.
+fn needs_recovery(rec: &SwapRecord) -> bool {
+    rec.funds_at_risk() && rec.retry_count >= recovery::MAX_DRIVER_RETRIES
 }
 
 /// Start accepting iroh rendezvous (doorbell) connections when enabled and built with the `iroh`
