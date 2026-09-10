@@ -47,6 +47,29 @@ pub const PROVIDER_MIN_CLAIM_WINDOW: u32 = 18;
 /// opens.
 pub const CLIENT_CLAIM_WINDOW: u32 = 18;
 
+/// Nominal seconds per block, for turning a block count into a wall-clock deadline.
+///
+/// A ten-minute block is an average rather than a promise, which is why this only ever appears in
+/// deadlines that are deliberately generous.
+pub const SECONDS_PER_BLOCK: u64 = 600;
+
+/// The shortest hold-invoice expiry a reverse-swap client will accept.
+///
+/// A client refuses an invoice that expires before it could see the funding confirm and still have
+/// its claim window, because paying one would mean committing to watch a funding for an invoice
+/// the provider could let lapse underneath it. The provider has to price its invoice against that
+/// rule, and it could not: the default expiry of an hour is less than a third of what the rule
+/// needs at one confirmation, so a provider on stock settings had every reverse swap refused at the
+/// invoice check, after both sides had already done the work of negotiating one.
+///
+/// Priced at the highest confirmation count the protocol allows rather than at the count this
+/// provider asked for, because the client applies its own floor and that floor may be higher than
+/// ours. A hold invoice that outlives the swap costs nothing: it is cancelled when the swap ends.
+pub fn reverse_invoice_min_expiry_secs(required_confirmations: u32) -> u64 {
+    let confirmations = required_confirmations.max(crate::validate::MAX_REQUIRED_CONFIRMATIONS);
+    u64::from(confirmations.saturating_add(CLIENT_CLAIM_WINDOW)).saturating_mul(SECONDS_PER_BLOCK)
+}
+
 /// Never *start* a claim this close to the counterparty's refund window. Broadcasting a first
 /// claim inside this margin reveals the preimage into a race that cannot be won, which is
 /// strictly worse than not claiming: the counterparty learns the preimage and refunds anyway.
@@ -429,6 +452,39 @@ fn check_timeout_ceiling(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod invoice_expiry_tests {
+    use super::*;
+    use crate::validate;
+
+    /// The provider's default expiry has to satisfy the client's own rule, or the two sides
+    /// negotiate a swap and then refuse it at the last step.
+    ///
+    /// This is the regression that the default configuration used to fail: an hour of invoice
+    /// expiry against a rule that needs more than three.
+    #[test]
+    fn the_floor_satisfies_the_check_a_client_actually_applies() {
+        for confirmations in [1_u32, 2, 3, 6, 12] {
+            let floor = reverse_invoice_min_expiry_secs(confirmations);
+
+            // What `validate::check_hold_invoice` demands, spelled out here so the two cannot
+            // drift apart silently: the client uses its own confirmation floor, which can be
+            // higher than the provider asked for.
+            let effective = confirmations.max(validate::MAX_REQUIRED_CONFIRMATIONS);
+            let needed = u64::from(effective + CLIENT_CLAIM_WINDOW) * SECONDS_PER_BLOCK;
+
+            assert!(
+                floor >= needed,
+                "at {confirmations} confirmations the floor {floor}s is under the {needed}s a client needs"
+            );
+        }
+        assert!(
+            reverse_invoice_min_expiry_secs(1) > 3600,
+            "the old default of one hour must not satisfy this, or the bug would not have existed"
+        );
+    }
 }
 
 #[cfg(test)]

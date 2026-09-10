@@ -324,12 +324,31 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     let store = store::open(&config.data_dir)?;
     // Before anything new: a swap left in flight has money in it, and starting a second one while
     // the first is unattended is how a client ends up with two.
-    resume_unfinished_swaps(&store, &config, network).await;
+    //
+    // Not in `--quote-only`. A quote moves nothing, signs nothing and starts no swap, so there is
+    // nothing for an unfinished one to collide with, and the next real run resumes it anyway.
+    // Resuming here made asking a provider for a price cost however long the open swap took to
+    // drive, which can be hours if it is waiting on confirmations, and a caller that bounded the
+    // quote on a timeout would kill the resume partway through.
+    if !config.quote_only {
+        resume_unfinished_swaps(&store, &config, network).await;
+    }
     if config.resume_only {
         info!("--resume-only: not starting a new swap");
         return Ok(());
     }
     transport.add_known_peer(config.provider_pkarr.clone());
+
+    // Everything already in this conversation belongs to an earlier run, and none of it is the
+    // answer to a question this one has not asked yet. Without this, a second run against the same
+    // provider reads the previous run's quote out of the conversation history and refuses it as
+    // expired, having never looked at the reply to the request it actually sent.
+    if let Err(e) = transport
+        .mark_conversation_seen(&config.provider_pkarr)
+        .await
+    {
+        warn!("could not read the existing conversation with the provider ({e}); a reply from an earlier run may be picked up instead of this one's");
+    }
 
     // Optionally ring the provider's iroh doorbell so a provider that isn't already following us
     // starts polling us for the swap DM below.
@@ -387,15 +406,29 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // A receiving a quote confirms the peer is a live provider that serves this direction. In
     // quote-only mode, print a machine-readable line and stop (no funds move).
     if config.quote_only {
+        // `direction` is spelled the way the CLI, the config file and the wire spell it, rather
+        // than with `{:?}`: `Reverse` was the only capitalised spelling in the whole system, and
+        // every reader had to know to case-fold it.
+        //
+        // The fee split, the rate it was priced at and the expiry are all already in the `Quote`;
+        // they were simply never printed, so anything reading this line had to present an
+        // undifferentiated fee and could not tell the caller when the price stops being valid.
         println!(
-            "QUOTE provider={} direction={:?} amount_sat={} fee_sat={} total_sat={} timeout_blocks={} confirmations={}",
+            "QUOTE provider={} direction={} amount_sat={} fee_sat={} service_fee_sat={} \
+             onchain_fee_sat={} fee_rate_sat_vb={} total_sat={} timeout_blocks={} \
+             confirmations={} valid_until_unix={} quote_id={}",
             config.provider_pkarr,
-            config.direction,
+            config.direction.as_str(),
             quote.amount_sat,
             quote.fee_sat,
+            quote.service_fee_sat,
+            quote.onchain_fee_sat,
+            quote.fee_rate_sat_vb,
             quote.total_sat,
             quote.htlc_timeout_blocks,
-            required_confirmations
+            required_confirmations,
+            quote.valid_until_unix,
+            quote.quote_id
         );
         return Ok(());
     }

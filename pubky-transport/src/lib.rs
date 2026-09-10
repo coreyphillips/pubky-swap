@@ -248,6 +248,51 @@ impl Transport {
     /// Messages that fail to deserialize into `M` are skipped (they may be a different
     /// message type from the same peer); they are not marked processed, so a caller
     /// expecting a different type can still read them.
+    /// Treat everything already in a conversation as read, without parsing any of it.
+    ///
+    /// A conversation lives on the homeserver and is returned in full on every poll; the dedup set
+    /// that stops a message being handled twice lives in this process and starts empty. So a fresh
+    /// process reads the whole history and hands the caller messages from previous runs. For a
+    /// request/response exchange that is not a stale duplicate, it is a wrong answer: a client that
+    /// asked a provider for a price yesterday, and asks again today, is handed yesterday's quote
+    /// and refuses it as expired, having never seen the reply to the question it actually asked.
+    ///
+    /// Call this immediately before sending a request. Anything already in the conversation is,
+    /// by definition, not the answer to a question that has not been asked yet.
+    pub async fn mark_conversation_seen(&self, peer_pkarr: &str) -> Result<usize> {
+        let peer = PublicKey::try_from(peer_pkarr)
+            .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
+        let messages = self
+            .messenger
+            .get_messages(&peer)
+            .await
+            .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
+
+        let mut marked = 0;
+        if let Ok(mut processed) = self.processed_messages.write() {
+            for msg in &messages {
+                if processed.len() >= MAX_PROCESSED_IDS {
+                    processed.clear();
+                }
+                if processed.insert(Self::message_id(peer_pkarr, msg)) {
+                    marked += 1;
+                }
+            }
+        }
+        debug!("marked {marked} existing message(s) from {peer_pkarr} as already seen");
+        Ok(marked)
+    }
+
+    /// The identity of a message, for deduplication.
+    fn message_id(peer_pkarr: &str, msg: &pubky_messenger::DecryptedMessage) -> String {
+        format!(
+            "{}-{}-{}",
+            peer_pkarr,
+            msg.timestamp,
+            blake3::hash(msg.content.as_bytes()).to_hex()
+        )
+    }
+
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
@@ -259,12 +304,7 @@ impl Transport {
 
         let mut parsed = Vec::new();
         for msg in messages {
-            let message_id = format!(
-                "{}-{}-{}",
-                peer_pkarr,
-                msg.timestamp,
-                blake3::hash(msg.content.as_bytes()).to_hex()
-            );
+            let message_id = Self::message_id(peer_pkarr, &msg);
 
             let is_duplicate = self
                 .processed_messages

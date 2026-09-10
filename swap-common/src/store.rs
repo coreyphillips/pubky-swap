@@ -171,6 +171,25 @@ pub struct SwapRecord {
     pub retry_count: u32,
     #[serde(default)]
     pub updated_at_unix: u64,
+    /// When this swap was first written down, as opposed to when it last changed.
+    ///
+    /// There was only `updated_at_unix`, which answers "is this moving" and cannot answer "when
+    /// did this start" or "how long did it take" -- so a history view could sort records but not
+    /// describe them. Stamped once, by the store, on the first write of a record; a record from
+    /// before this field existed loads with zero, which reads as unknown rather than as 1970.
+    #[serde(default)]
+    pub created_at_unix: u64,
+}
+
+/// Seconds since the epoch.
+///
+/// Duplicated privately in the provider and the client before this; the store needs one of its own
+/// because it is the only thing that can stamp a record's creation time exactly once.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl std::fmt::Debug for SwapRecord {
@@ -285,6 +304,7 @@ impl SwapRecord {
             last_error: None,
             retry_count: 0,
             updated_at_unix: 0,
+            created_at_unix: 0,
         }
     }
 
@@ -488,6 +508,25 @@ impl SwapStore for JsonFileSwapStore {
     fn put(&self, rec: &SwapRecord) -> Result<()> {
         let path = self.path_for(rec.swap_id);
         let tmp = self.tmp_path_for(rec.swap_id);
+
+        // Stamped here rather than at each call site: `put` is the only way a record reaches the
+        // disk, so this is the one place that can be sure it happens exactly once, on the write
+        // that creates the file. Every later write carries the value already in the record.
+        let stamped;
+        let rec = if rec.created_at_unix == 0 {
+            let existing = self.get(rec.swap_id).ok().flatten();
+            stamped = SwapRecord {
+                created_at_unix: existing
+                    .map(|e| e.created_at_unix)
+                    .filter(|t| *t > 0)
+                    .unwrap_or_else(now_unix),
+                ..rec.clone()
+            };
+            &stamped
+        } else {
+            rec
+        };
+
         let bytes = serde_json::to_vec_pretty(rec).context("serialize swap record")?;
 
         // Write to a temp file, fsync it, then rename. The rename is what makes the update
@@ -636,6 +675,40 @@ mod tests {
         // swap_id is unique per call).
         let id = Uuid::new_v4();
         std::env::temp_dir().join(format!("pubky-swap-store-test-{id}"))
+    }
+
+    /// A record's creation time is stamped once, on the write that creates it.
+    ///
+    /// The store is the only thing that can guarantee "once": every driver writes through `put`
+    /// repeatedly as a swap progresses, and a later write must not move the timestamp.
+    #[test]
+    fn a_record_is_stamped_with_its_creation_time_exactly_once() {
+        let dir = temp_dir();
+        let store = JsonFileSwapStore::new(&dir).unwrap();
+
+        let mut rec = SwapRecord::new_progress();
+        rec.swap_id = Uuid::new_v4();
+        store.put(&rec).unwrap();
+
+        let first = store.get(rec.swap_id).unwrap().unwrap();
+        assert!(
+            first.created_at_unix > 0,
+            "the first write stamps a creation time"
+        );
+
+        // A driver writing progress back does not carry the timestamp in its own copy.
+        let mut later = rec.clone();
+        later.state = SwapState::LockupConfirmed;
+        store.put(&later).unwrap();
+
+        let second = store.get(rec.swap_id).unwrap().unwrap();
+        assert_eq!(
+            second.created_at_unix, first.created_at_unix,
+            "a later write must not move the creation time"
+        );
+        assert_eq!(second.state, SwapState::LockupConfirmed);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

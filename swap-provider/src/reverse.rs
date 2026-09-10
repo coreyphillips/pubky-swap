@@ -133,11 +133,24 @@ pub async fn init_reverse_swap(
     // of a 144-block on-chain timeout.
     let cltv_expiry_delta = timelock::reverse_invoice_cltv_delta(&timelock)
         .map_err(|e| anyhow!("hold invoice CLTV delta: {e}"))?;
+    // Raised to whatever the client's own invoice check demands, if the configured value is
+    // shorter. Left as configured, the default hour is well under the three-plus hours that check
+    // needs, and every reverse swap was refused at the invoice step.
+    let expiry_secs = invoice_expiry_secs.max(timelock::reverse_invoice_min_expiry_secs(
+        timelock.required_confirmations,
+    ));
+    if expiry_secs != invoice_expiry_secs {
+        tracing::debug!(
+            "raising the hold invoice expiry from {invoice_expiry_secs}s to {expiry_secs}s, \
+             which is the shortest a client will accept at {} confirmations",
+            timelock.required_confirmations
+        );
+    }
     let hold = ln
         .create_hold_invoice(HoldInvoiceRequest {
             payment_hash,
             amount_msat: invoice_amount_msat,
-            expiry_secs: invoice_expiry_secs,
+            expiry_secs,
             cltv_expiry_delta,
             memo: "pubky-swap reverse".to_string(),
         })

@@ -15,6 +15,27 @@ pub enum SwapDirection {
     Reverse,
 }
 
+impl SwapDirection {
+    /// The one spelling of a direction: what the CLI accepts, what serde writes, and what any
+    /// human-readable output should print.
+    ///
+    /// It exists so that nothing reaches for `{:?}`. Debug renders `Reverse`, which was the only
+    /// capitalised spelling anywhere in the system, so anything parsing it had to know to
+    /// case-fold, and anything comparing it against a configured value silently did not match.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SwapDirection::Submarine => "submarine",
+            SwapDirection::Reverse => "reverse",
+        }
+    }
+}
+
+impl std::fmt::Display for SwapDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkSpec {
@@ -110,6 +131,30 @@ mod tests {
         ] {
             assert_eq!(spec.to_bitcoin_network(), network);
             assert_eq!(NetworkSpec::from_bitcoin_network(network).unwrap(), spec);
+        }
+    }
+}
+
+#[cfg(test)]
+mod direction_tests {
+    use super::*;
+
+    /// One spelling, everywhere.
+    ///
+    /// `as_str` has to match what the CLI parses and what serde writes, or a value printed for a
+    /// human cannot be pasted back in as a flag.
+    #[test]
+    fn a_direction_prints_the_way_it_is_parsed() {
+        assert_eq!(SwapDirection::Submarine.as_str(), "submarine");
+        assert_eq!(SwapDirection::Reverse.as_str(), "reverse");
+        assert_eq!(SwapDirection::Reverse.to_string(), "reverse");
+        for d in [SwapDirection::Submarine, SwapDirection::Reverse] {
+            let wire = serde_json::to_string(&d).unwrap();
+            assert_eq!(
+                wire,
+                format!("\"{}\"", d.as_str()),
+                "serde and as_str must agree"
+            );
         }
     }
 }
