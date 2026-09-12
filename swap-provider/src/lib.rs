@@ -42,6 +42,8 @@ use bitcoin::{Network, OutPoint, PublicKey, Txid};
 use lightning_backend::LndBackend;
 use lightning_backend::{LightningBackend, LndConfig, StubBackend};
 use pubky_transport::Transport;
+mod reply_transport;
+use reply_transport::ReplyTransport;
 use std::collections::HashMap;
 use std::sync::Arc;
 use swap_common::chain::{run_blocking, ChainWatcher};
@@ -418,7 +420,7 @@ pub type SharedOffer = Arc<RwLock<Option<SwapOffer>>>;
 /// Shared execution context handed to message handlers and spawned driver tasks.
 #[derive(Clone)]
 struct ExecCtx {
-    transport: Arc<Transport>,
+    transport: Arc<ReplyTransport>,
     ln: Arc<dyn LightningBackend>,
     chain: Option<Arc<dyn ChainWatcher>>,
     wallet: Option<Arc<dyn OnchainWallet>>,
@@ -648,8 +650,7 @@ async fn finish_driver_run(
     match result {
         Ok(state) if state.is_terminal() => {
             progress.set_terminal(state.clone());
-            send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
-            evict_peer_if_idle(ctx, peer).await;
+            notify_terminal_peer(ctx, progress, peer, swap_id, state).await;
         }
         Ok(state) => {
             // A non-terminal return means the driver handed control back rather than finishing:
@@ -689,8 +690,7 @@ async fn finish_driver_run(
                     error!("swap {swap_id} failed permanently: {e}");
                     let state = SwapState::Failed(e.to_string());
                     progress.set_terminal(state.clone());
-                    send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
-                    evict_peer_if_idle(ctx, peer).await;
+                    notify_terminal_peer(ctx, progress, peer, swap_id, state).await;
                 }
             }
         }
@@ -901,7 +901,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         );
     }
 
-    let transport = Arc::new(transport);
+    let transport = Arc::new(ReplyTransport::direct(transport));
     let ctx = ExecCtx {
         transport: transport.clone(),
         ln,
@@ -932,8 +932,6 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     spawn_record_pruner(&ctx);
     // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
     spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
-    // Accept iroh rendezvous connections (the doorbell), if enabled and built with `--features iroh`.
-    maybe_spawn_iroh_rendezvous(&ctx, &config);
 
     // The offer is rebuilt periodically rather than once at startup.
     //
@@ -962,6 +960,8 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         );
         *offer.write().await = Some(built);
     }
+
+    maybe_spawn_iroh_rendezvous(&ctx, &config, offer.clone());
 
     spawn_offer_refresher(
         &ctx,
@@ -1306,7 +1306,11 @@ fn build_offer(
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
         features: if capable {
-            vec!["boltz-taproot-v1".into(), "swap-status-v1".into()]
+            let mut features = vec!["boltz-taproot-v1".into(), "swap-status-v1".into()];
+            if cfg!(feature = "iroh") && config.rendezvous_iroh {
+                features.push("session-rpc-v1".into());
+            }
+            features
         } else {
             Vec::new()
         },
@@ -1328,7 +1332,12 @@ async fn handle_message(
                 .await?;
         }
         SwapMessage::SwapStatusRequest(req) => {
-            match status_snapshot(ctx.store.as_ref(), sender, &req) {
+            match status_snapshot(
+                ctx.store.as_ref(),
+                sender,
+                ctx.transport.authorization(),
+                &req,
+            ) {
                 Ok(snapshot) => {
                     ctx.transport
                         .send(sender, &SwapMessage::SwapStatusSnapshot(snapshot))
@@ -1474,7 +1483,12 @@ async fn handle_message(
                 )
                 .await;
             }
-            match replay_record(ctx.store.as_ref(), sender, &req) {
+            match replay_record(
+                ctx.store.as_ref(),
+                sender,
+                ctx.transport.authorization(),
+                &req,
+            ) {
                 Ok(Some(mut record)) => {
                     if record.pending_hold_invoice.is_some() {
                         let reservation = Some(reserve_pending_swap(ctx, &record).await?);
@@ -1637,10 +1651,17 @@ async fn complete_invoice_intent(
     Ok(record)
 }
 
+fn authorized_peer(record: &SwapRecord, sender: &str, authorization: Option<(&str, &str)>) -> bool {
+    pubky_transport::same_pubky(&record.peer, sender)
+        && record.peer_account.as_deref() == authorization.map(|(account, _)| account)
+        && record.peer_authorization_scope.as_deref() == authorization.map(|(_, scope)| scope)
+}
+
 /// Find an already admitted creation without spending another quote or generating new keys.
 fn replay_record(
     store: &dyn SwapStore,
     sender: &str,
+    authorization: Option<(&str, &str)>,
     request: &SwapRequest,
 ) -> Result<Option<SwapRecord>> {
     for record in store.load_all_checked()? {
@@ -1650,7 +1671,7 @@ fn replay_record(
         if original.quote_id != request.quote_id {
             continue;
         }
-        if !pubky_transport::same_pubky(&record.peer, sender) {
+        if !authorized_peer(&record, sender, authorization) {
             return Err(anyhow!("unknown or expired quote"));
         }
         if original != request {
@@ -1670,6 +1691,7 @@ fn replay_record(
 fn status_snapshot(
     store: &dyn SwapStore,
     sender: &str,
+    authorization: Option<(&str, &str)>,
     request: &SwapStatusRequest,
 ) -> Result<SwapStatusSnapshot> {
     let record = match (request.swap_id, request.quote_id) {
@@ -1683,7 +1705,7 @@ fn status_snapshot(
         _ => return Err(anyhow!("exactly one of swap_id and quote_id is required")),
     }
     .ok_or(SwapLookupError::NotFound)?;
-    if !pubky_transport::same_pubky(&record.peer, sender) {
+    if !authorized_peer(&record, sender, authorization) {
         return Err(SwapLookupError::NotFound.into());
     }
     if record.pending_hold_invoice.is_some() {
@@ -1739,7 +1761,11 @@ async fn reserve_for_swap(
 ) -> Result<risk::ReservationGuard> {
     let guard = ctx
         .risk
-        .reserve(peer, swap_id, onchain_amount_sat)
+        .reserve(
+            ctx.transport.account().unwrap_or(peer),
+            swap_id,
+            onchain_amount_sat,
+        )
         .map_err(|reason| anyhow!("{reason}"))?;
 
     check_funding_balance(ctx, direction, onchain_amount_sat).await?;
@@ -1752,7 +1778,11 @@ async fn reserve_pending_swap(
 ) -> Result<risk::ReservationGuard> {
     let guard = ctx
         .risk
-        .reserve_pending(&record.peer, record.swap_id, record.onchain_amount_sat)
+        .reserve_pending(
+            record.peer_account.as_deref().unwrap_or(&record.peer),
+            record.swap_id,
+            record.onchain_amount_sat,
+        )
         .map_err(|reason| anyhow!("{reason}"))?;
     check_funding_balance(ctx, record.direction, record.onchain_amount_sat).await?;
     Ok(guard)
@@ -1907,6 +1937,11 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         swap_id,
         direction: SwapDirection::Reverse,
         peer: sender.to_string(),
+        peer_account: ctx.transport.account().map(str::to_owned),
+        peer_authorization_scope: ctx
+            .transport
+            .authorization()
+            .map(|(_, scope)| scope.to_owned()),
         network: NetworkSpec::from_bitcoin_network(ctx.network)?,
         payment_hash_hex: hex::encode(swap.payment_hash),
         onchain_amount_sat: swap.onchain_amount_sat,
@@ -2120,6 +2155,11 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         swap_id,
         direction: SwapDirection::Submarine,
         peer: sender.to_string(),
+        peer_account: ctx.transport.account().map(str::to_owned),
+        peer_authorization_scope: ctx
+            .transport
+            .authorization()
+            .map(|(_, scope)| scope.to_owned()),
         network: NetworkSpec::from_bitcoin_network(ctx.network)?,
         payment_hash_hex: hex::encode(swap.payment_hash),
         onchain_amount_sat: swap.onchain_amount_sat,
@@ -2563,7 +2603,7 @@ fn needs_recovery(rec: &SwapRecord) -> bool {
 /// feature: a client that knows our pubky connects, and its authenticated pubky is added to the
 /// poll set (unpinned, so eviction still applies) so the swap can proceed over pubky-DM.
 #[cfg(feature = "iroh")]
-fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig) {
+fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: SharedOffer) {
     if !config.rendezvous_iroh {
         return;
     }
@@ -2585,17 +2625,36 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig) {
             return;
         }
     };
-    let transport = ctx.transport.clone();
+    let ctx = ctx.clone();
     tokio::spawn(async move {
-        match pubky_transport::p2p::RendezvousServer::bind(secret).await {
+        match pubky_transport::p2p::RendezvousServer::bind_with_sessions(secret).await {
             Ok(mut server) => {
                 match server.pubky() {
                     Ok(pk) => info!("iroh rendezvous online (doorbell) as {pk}"),
                     Err(_) => info!("iroh rendezvous online (doorbell)"),
                 }
-                while let Some(pubky) = server.next_peer().await {
-                    info!("iroh rendezvous: {pubky} connected; polling it for a swap request");
-                    transport.add_known_peer(pubky);
+                let provider = match server.pubky() {
+                    Ok(key) => key,
+                    Err(_) => return,
+                };
+                while let Some(event) = server.next_event().await {
+                    match event {
+                        pubky_transport::p2p::RendezvousEvent::Peer(pubky) => {
+                            ctx.transport.add_known_peer(pubky)
+                        }
+                        pubky_transport::p2p::RendezvousEvent::Session(request) => {
+                            let ctx = ctx.clone();
+                            let offer = offer.clone();
+                            let provider = provider.clone();
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    handle_session_request(ctx, offer, provider, request),
+                                )
+                                .await;
+                            });
+                        }
+                    }
                 }
                 warn!("iroh rendezvous accept loop ended");
             }
@@ -2604,8 +2663,53 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig) {
     });
 }
 
+#[cfg(feature = "iroh")]
+async fn handle_session_request(
+    mut ctx: ExecCtx,
+    offer: SharedOffer,
+    provider: String,
+    request: pubky_transport::p2p::SessionRpc,
+) {
+    let owner = match pubky_transport::session_rpc::verify_request(
+        &request.request,
+        &request.remote_key,
+        &provider,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(_) => return,
+    };
+    let Ok(message) = serde_json::from_value::<SwapMessage>(request.request.message) else {
+        return;
+    };
+    // Only customer requests are accepted over this protocol.
+    if !matches!(
+        message,
+        SwapMessage::OfferRequest(_)
+            | SwapMessage::QuoteRequest(_)
+            | SwapMessage::SwapRequest(_)
+            | SwapMessage::SwapStatusRequest(_)
+    ) {
+        return;
+    }
+    let Some(current) = offer.read().await.clone() else {
+        return;
+    };
+    ctx.transport = Arc::new(
+        ctx.transport
+            .session(owner, request.request.scope, request.reply),
+    );
+    if handle_message(&ctx, &current, &request.remote_key, message)
+        .await
+        .is_err()
+    {
+        warn!("could not handle authorized session swap request");
+    }
+}
+
 #[cfg(not(feature = "iroh"))]
-fn maybe_spawn_iroh_rendezvous(_ctx: &ExecCtx, config: &ProviderConfig) {
+fn maybe_spawn_iroh_rendezvous(_ctx: &ExecCtx, config: &ProviderConfig, _offer: SharedOffer) {
     if config.rendezvous_iroh {
         warn!("--rendezvous-iroh set but this build lacks the `iroh` feature; ignoring");
     }
@@ -2654,8 +2758,22 @@ fn spawn_peer_reaper(ctx: &ExecCtx, idle_ttl: Duration) {
     });
 }
 
+async fn notify_terminal_peer(
+    ctx: &ExecCtx,
+    progress: &StoreProgress,
+    peer: &str,
+    swap_id: Uuid,
+    state: SwapState,
+) {
+    if progress.snapshot().peer_account.is_some() {
+        return;
+    }
+    send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
+    evict_peer_if_idle(ctx, peer).await;
+}
+
 async fn send_final_status(
-    transport: &Transport,
+    transport: &ReplyTransport,
     peer: &str,
     swap_id: Uuid,
     result: Result<SwapState>,
@@ -2676,7 +2794,7 @@ async fn send_final_status(
 }
 
 async fn reject(
-    transport: &Transport,
+    transport: &ReplyTransport,
     sender: &str,
     swap_id: Option<Uuid>,
     quote_id: Option<Uuid>,
@@ -2686,7 +2804,7 @@ async fn reject(
 }
 
 async fn reject_request(
-    transport: &Transport,
+    transport: &ReplyTransport,
     sender: &str,
     request_id: Option<Uuid>,
     swap_id: Option<Uuid>,
@@ -2700,7 +2818,7 @@ async fn reject_request(
 }
 
 async fn reject_coded(
-    transport: &Transport,
+    transport: &ReplyTransport,
     sender: &str,
     request_id: Option<Uuid>,
     swap_id: Option<Uuid>,

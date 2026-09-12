@@ -162,7 +162,7 @@ async fn invoice_creation_recovers_after_a_lost_rpc_response_without_a_second_in
         swap_id: Some(record.swap_id),
         quote_id: None,
     };
-    let pending = status_snapshot(store.as_ref(), "owner", &request).unwrap_err();
+    let pending = status_snapshot(store.as_ref(), "owner", None, &request).unwrap_err();
     assert!(matches!(
         pending.downcast_ref::<SwapLookupError>(),
         Some(SwapLookupError::Pending)
@@ -184,10 +184,15 @@ async fn invoice_creation_recovers_after_a_lost_rpc_response_without_a_second_in
     );
     assert!(reverse_swap_from_record(&completed, TimelockParams::default()).is_ok());
     assert_eq!(
-        replay_record(&restarted, "owner", record.swap_request.as_ref().unwrap())
-            .unwrap()
-            .unwrap()
-            .swap_accept,
+        replay_record(
+            &restarted,
+            "owner",
+            None,
+            record.swap_request.as_ref().unwrap()
+        )
+        .unwrap()
+        .unwrap()
+        .swap_accept,
         completed.swap_accept
     );
     std::fs::remove_dir_all(directory).unwrap();
@@ -228,9 +233,9 @@ fn an_unreadable_record_is_never_reported_as_a_missing_quote() {
         swap_id: None,
         quote_id: Some(request.quote_id),
     };
-    let error = status_snapshot(&store, "owner", &query).unwrap_err();
+    let error = status_snapshot(&store, "owner", None, &query).unwrap_err();
     assert!(error.downcast_ref::<SwapLookupError>().is_none());
-    assert!(replay_record(&store, "owner", request).is_err());
+    assert!(replay_record(&store, "owner", None, request).is_err());
     assert!(ensure_reverse_hash_available(&store, &record.payment_hash().unwrap()).is_err());
     std::fs::remove_dir_all(directory).unwrap();
 }
@@ -339,25 +344,25 @@ fn creation_replay_survives_restart_and_rejects_changed_requests() {
 
     // A fresh store instance has none of the provider's in-memory quotes.
     let restarted = JsonFileSwapStore::new(&directory).unwrap();
-    let replay = replay_record(&restarted, "owner", request)
+    let replay = replay_record(&restarted, "owner", None, request)
         .unwrap()
         .unwrap();
     assert_eq!(serde_json::to_value(&replay.swap_accept).unwrap(), expected);
-    assert!(replay_record(&restarted, "other", request).is_err());
+    assert!(replay_record(&restarted, "other", None, request).is_err());
     let mut changed = request.clone();
     changed.payment_hash_hex = hex::encode([4; 32]);
-    assert!(replay_record(&restarted, "owner", &changed).is_err());
+    assert!(replay_record(&restarted, "owner", None, &changed).is_err());
     changed = request.clone();
     changed.client_claim_pubkey_hex = changed.client_refund_pubkey_hex.clone();
-    assert!(replay_record(&restarted, "owner", &changed).is_err());
+    assert!(replay_record(&restarted, "owner", None, &changed).is_err());
     changed = request.clone();
     changed.script_type = SwapScript::P2wsh;
-    assert!(replay_record(&restarted, "owner", &changed).is_err());
+    assert!(replay_record(&restarted, "owner", None, &changed).is_err());
 
     let mut completed = record.clone();
     completed.state = SwapState::Claimed;
     restarted.mark_terminal(&completed).unwrap();
-    let replay = replay_record(&restarted, "owner", request)
+    let replay = replay_record(&restarted, "owner", None, request)
         .unwrap()
         .unwrap();
     assert_eq!(serde_json::to_value(&replay.swap_accept).unwrap(), expected);
@@ -376,7 +381,7 @@ fn status_recovery_is_correlated_owner_only_and_contains_no_secrets() {
         swap_id: Some(record.swap_id),
         quote_id: None,
     };
-    let snapshot = status_snapshot(&store, "owner", &request).unwrap();
+    let snapshot = status_snapshot(&store, "owner", None, &request).unwrap();
     assert_eq!(snapshot.request_id, request.request_id);
     assert_eq!(snapshot.required_confirmations, 2);
     assert_eq!(snapshot.accept.swap_id, record.swap_id);
@@ -389,25 +394,57 @@ fn status_recovery_is_correlated_owner_only_and_contains_no_secrets() {
     ] {
         assert!(!public_json.contains(secret));
     }
-    assert!(status_snapshot(&store, "other", &request).is_err());
+    assert!(status_snapshot(&store, "other", None, &request).is_err());
     let by_quote = SwapStatusRequest {
         swap_id: None,
         quote_id: Some(record.swap_request.as_ref().unwrap().quote_id),
         ..request.clone()
     };
     assert_eq!(
-        status_snapshot(&store, "owner", &by_quote)
+        status_snapshot(&store, "owner", None, &by_quote)
             .unwrap()
             .accept
             .swap_id,
         record.swap_id
     );
-    assert!(status_snapshot(&store, "other", &by_quote).is_err());
+    assert!(status_snapshot(&store, "other", None, &by_quote).is_err());
     let ambiguous = SwapStatusRequest {
         swap_id: request.swap_id,
         ..by_quote
     };
-    assert!(status_snapshot(&store, "owner", &ambiguous).is_err());
+    assert!(status_snapshot(&store, "owner", None, &ambiguous).is_err());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn session_recovery_requires_the_original_account_and_transport_key() {
+    let directory = std::env::temp_dir().join(format!("session-status-{}", Uuid::new_v4()));
+    let store = JsonFileSwapStore::new(&directory).unwrap();
+    let mut record = accepted_record(SwapDirection::Submarine, SwapScript::TaprootBoltz);
+    record.peer_account = Some("ring-account".into());
+    record.peer_authorization_scope = Some("scope".into());
+    store.put(&record).unwrap();
+    let query = SwapStatusRequest {
+        request_id: Some(Uuid::new_v4()),
+        swap_id: Some(record.swap_id),
+        quote_id: None,
+    };
+    let request = record.swap_request.as_ref().unwrap();
+    assert!(status_snapshot(&store, "owner", Some(("ring-account", "scope")), &query).is_ok());
+    assert!(
+        replay_record(&store, "owner", Some(("ring-account", "scope")), request)
+            .unwrap()
+            .is_some()
+    );
+    for (peer, account) in [
+        ("other", Some(("ring-account", "scope"))),
+        ("owner", Some(("other-account", "scope"))),
+        ("owner", None),
+        ("owner", Some(("ring-account", "other-scope"))),
+    ] {
+        assert!(status_snapshot(&store, peer, account, &query).is_err());
+        assert!(replay_record(&store, peer, account, request).is_err());
+    }
     std::fs::remove_dir_all(directory).unwrap();
 }
 

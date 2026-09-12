@@ -86,6 +86,12 @@ pub struct SwapRecord {
     pub direction: SwapDirection,
     /// Counterparty pubky, used to send the final `SwapStatusUpdate` after resume.
     pub peer: String,
+    /// Account that authorized a delegated session key. Absent for root-key DM peers.
+    #[serde(default)]
+    pub peer_account: Option<String>,
+    /// Application wallet namespace that authorized the delegated key.
+    #[serde(default)]
+    pub peer_authorization_scope: Option<String>,
     pub network: NetworkSpec,
 
     // --- HTLC / spend reconstruction ---
@@ -308,6 +314,8 @@ impl SwapRecord {
             role: SwapRole::Provider,
             direction: SwapDirection::Reverse,
             peer: String::new(),
+            peer_account: None,
+            peer_authorization_scope: None,
             network: NetworkSpec::Regtest,
             payment_hash_hex: String::new(),
             onchain_amount_sat: 0,
@@ -743,6 +751,27 @@ mod tests {
     fn txid(n: u8) -> Txid {
         use bitcoin::hashes::Hash;
         Txid::from_byte_array([n; 32])
+    }
+
+    /// A record written before delegated sessions existed has no `peer_account`, and must still
+    /// load as a plain DM peer rather than failing the whole store open.
+    #[test]
+    fn session_delivery_survives_restart_and_legacy_records_default_to_dm() {
+        let mut record = SwapRecord::new_progress();
+        record.peer_account = Some("account".into());
+        let mut json = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SwapRecord>(json.clone())
+                .unwrap()
+                .peer_account
+                .as_deref(),
+            Some("account")
+        );
+        json.as_object_mut().unwrap().remove("peer_account");
+        assert!(serde_json::from_value::<SwapRecord>(json)
+            .unwrap()
+            .peer_account
+            .is_none());
     }
 
     /// A swap that bumps its refund twice and then crashes has two transactions of its own that
