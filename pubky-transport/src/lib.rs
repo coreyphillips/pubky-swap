@@ -20,6 +20,9 @@ use tracing::{debug, warn};
 pub mod p2p;
 
 #[cfg(feature = "iroh")]
+pub mod session_rpc;
+
+#[cfg(feature = "iroh")]
 pub mod identity;
 
 #[derive(Error, Debug)]
