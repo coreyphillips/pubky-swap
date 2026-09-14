@@ -27,15 +27,26 @@ pub(crate) struct Dispatcher<M> {
     handler: Handler<M>,
     permits: Arc<Semaphore>,
     per_peer_capacity: usize,
+    capacity: usize,
+    /// Messages already serialized elsewhere, which would only idle on a slot while they wait.
+    exempt: fn(&M) -> bool,
 }
 
 impl<M: Send + 'static> Dispatcher<M> {
-    pub(crate) fn new(max_handlers: usize, per_peer_capacity: usize, handler: Handler<M>) -> Self {
+    pub(crate) fn new(
+        max_handlers: usize,
+        per_peer_capacity: usize,
+        capacity: usize,
+        exempt: fn(&M) -> bool,
+        handler: Handler<M>,
+    ) -> Self {
         Self {
             workers: HashMap::new(),
             handler,
             permits: Arc::new(Semaphore::new(max_handlers.max(1))),
             per_peer_capacity: per_peer_capacity.max(1),
+            capacity: capacity.max(1),
+            exempt,
         }
     }
 
@@ -46,10 +57,28 @@ impl<M: Send + 'static> Dispatcher<M> {
         // mid-handler and is replaced.
         self.workers
             .retain(|_, w| w.pending.load(Ordering::SeqCst) > 0 && !w.tx.is_closed());
+        let mut queued = self.queued();
+        if queued >= self.capacity {
+            warn!(
+                "dropping {} message(s) from {peer}: {queued} are already waiting to be handled",
+                messages.len()
+            );
+            return;
+        }
         let worker = self.workers.entry(peer.clone()).or_insert_with(|| {
-            spawn_worker(&peer, self.per_peer_capacity, &self.handler, &self.permits)
+            spawn_worker(
+                &peer,
+                self.per_peer_capacity,
+                &self.handler,
+                &self.permits,
+                self.exempt,
+            )
         });
         for message in messages {
+            if queued >= self.capacity {
+                warn!("dropping a message from {peer}: {queued} are already waiting to be handled");
+                continue;
+            }
             worker.pending.fetch_add(1, Ordering::SeqCst);
             if worker.tx.try_send(message).is_err() {
                 worker.pending.fetch_sub(1, Ordering::SeqCst);
@@ -57,6 +86,8 @@ impl<M: Send + 'static> Dispatcher<M> {
                     "dropping a message from {peer}: {} of theirs are already waiting to be handled",
                     self.per_peer_capacity
                 );
+            } else {
+                queued += 1;
             }
         }
     }
@@ -83,6 +114,7 @@ fn spawn_worker<M: Send + 'static>(
     capacity: usize,
     handler: &Handler<M>,
     permits: &Arc<Semaphore>,
+    exempt: fn(&M) -> bool,
 ) -> Worker<M> {
     let (tx, mut rx) = mpsc::channel(capacity);
     let pending = Arc::new(AtomicUsize::new(0));
@@ -92,8 +124,13 @@ fn spawn_worker<M: Send + 'static>(
     let counter = pending.clone();
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
-            let Ok(_permit) = permits.acquire().await else {
-                return;
+            let _permit = if exempt(&message) {
+                None
+            } else {
+                let Ok(permit) = permits.acquire().await else {
+                    return;
+                };
+                Some(permit)
             };
             handler(peer.clone(), message).await;
             counter.fetch_sub(1, Ordering::SeqCst);
@@ -130,7 +167,7 @@ mod tests {
     async fn a_slow_handler_holds_up_only_its_own_peer() {
         let log: Log = Arc::default();
         let start = Instant::now();
-        let mut dispatcher = Dispatcher::new(4, 8, recording(&log, start));
+        let mut dispatcher = Dispatcher::new(4, 8, 64, |_| false, recording(&log, start));
 
         dispatcher.dispatch("slow".into(), vec![0, 1, 2]);
         dispatcher.dispatch("fast".into(), vec![0, 1]);
@@ -177,14 +214,16 @@ mod tests {
                 })
             })
         };
-        let mut dispatcher = Dispatcher::new(3, 2, handler);
+        let mut dispatcher = Dispatcher::new(3, 2, 12, |_| false, handler);
 
+        // One peer flooding past its queue loses the excess rather than stalling everyone.
+        dispatcher.dispatch("flood".into(), (0..10).collect());
+        assert!(dispatcher.queued() <= 3);
+        // However many peers there are, the total waiting stays within its cap.
         for i in 0..20 {
             dispatcher.dispatch(format!("peer-{i}"), vec![0]);
         }
-        // One peer flooding past its queue loses the excess rather than stalling everyone.
-        dispatcher.dispatch("flood".into(), (0..10).collect());
-        assert!(dispatcher.queued() <= 20 + 3);
+        assert!(dispatcher.queued() <= 12);
 
         tokio::time::sleep(Duration::from_secs(60)).await;
         assert!(peak.load(Ordering::SeqCst) <= 3);

@@ -993,6 +993,9 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     let mut dispatcher = dispatch::Dispatcher::new(
         MAX_CONCURRENT_HANDLERS,
         MAX_QUEUED_PER_PEER,
+        MAX_QUEUED,
+        // These wait on admission in turn, and holding a slot meanwhile would starve other peers.
+        |msg| matches!(msg, SwapMessage::SwapRequest(_)),
         message_handler(&ctx, &offer),
     );
     let mut next_stats_log = std::time::Instant::now();
@@ -1021,6 +1024,9 @@ const MAX_CONCURRENT_HANDLERS: usize = 16;
 /// Messages one peer may have waiting to be handled before further ones are dropped. Far more
 /// than an honest client sends while waiting for a reply.
 const MAX_QUEUED_PER_PEER: usize = 32;
+
+/// Messages waiting to be handled across all peers before further ones are dropped.
+const MAX_QUEUED: usize = 512;
 
 /// Handle one peer's message, in that peer's arrival order.
 fn message_handler(ctx: &ExecCtx, offer: &SharedOffer) -> dispatch::Handler<SwapMessage> {
