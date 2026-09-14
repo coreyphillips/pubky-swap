@@ -226,6 +226,8 @@ impl Channel for DmChannel {
             }
             sleep(Duration::from_millis(500)).await;
         }
+        // A provider that restarted since the last ring has stopped polling this conversation.
+        ring_doorbell(self.doorbell, &self.provider).await;
         Err(ExchangeError::Uncertain(anyhow!(
             "timed out waiting for provider response"
         )))
@@ -389,10 +391,12 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
 
     /// Look up a creation that may have been admitted. The provider spends the quote before it
     /// persists the swap, so `not_found` and `pending` are only believed once `RECOVERY_WINDOW`
-    /// has passed.
+    /// has passed. Only a refusal of this status query is final: DMs also deliver late replies to
+    /// earlier requests, and a transport that failed may come back while the provider restarts.
     async fn recover(&self, quote_id: Uuid, cause: Error) -> Result<SwapAccept> {
         let deadline = Instant::now() + RECOVERY_WINDOW;
         loop {
+            self.preferred_unavailable.store(false, Ordering::Relaxed);
             let query = SwapStatusRequest {
                 request_id: Some(Uuid::new_v4()),
                 swap_id: None,
@@ -407,12 +411,13 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
                     info!("recovered swap {} by its quote", snapshot.accept.swap_id);
                     return Ok(snapshot.accept);
                 }
-                Ok(SwapMessage::Reject(Reject { code, .. }))
-                    if !matches!(code.as_deref(), Some("not_found" | "pending")) =>
+                Ok(SwapMessage::Reject(Reject {
+                    code, request_id, ..
+                })) if request_id == query.request_id
+                    && !matches!(code.as_deref(), Some("not_found" | "pending")) =>
                 {
                     return Err(cause);
                 }
-                Err(ExchangeError::NotSent(_)) => return Err(cause),
                 _ => {}
             }
             if Instant::now() >= deadline {
@@ -636,6 +641,8 @@ mod tests {
         NotSent,
         /// Handled by the provider, then the reply was lost.
         LostReply,
+        /// Not delivered; a late, uncorrelated refusal of an earlier request came back instead.
+        StaleReject,
     }
 
     struct Fake {
@@ -669,8 +676,12 @@ mod tests {
         request: &SwapMessage,
     ) -> std::result::Result<SwapMessage, ExchangeError> {
         let fault = fake.faults.lock().unwrap().pop_front();
-        if let Some(Fault::NotSent) = fault {
-            return Err(ExchangeError::NotSent(anyhow!("no application protocol")));
+        match fault {
+            Some(Fault::NotSent) => {
+                return Err(ExchangeError::NotSent(anyhow!("no application protocol")))
+            }
+            Some(Fault::StaleReject) => return Ok(reject("unknown or expired quote")),
+            _ => {}
         }
         fake.seen
             .lock()
@@ -845,6 +856,42 @@ mod tests {
             &provider,
             [Fault::LostReply, Fault::LostReply],
             Some(vec![Fault::LostReply]),
+        );
+        let request = swap_request(Uuid::new_v4());
+        let accept = negotiator.create(&request).await.unwrap();
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+        let stored = provider.accepted.lock().unwrap()[&request.quote_id]
+            .1
+            .swap_id;
+        assert_eq!(accept.swap_id, stored);
+    }
+
+    #[tokio::test]
+    async fn recovery_ignores_late_rejections_and_retries_a_transport_that_was_down() {
+        let provider = Arc::new(Provider::default());
+        let negotiator = negotiator(
+            &provider,
+            [Fault::NotSent, Fault::NotSent],
+            Some(vec![Fault::LostReply, Fault::StaleReject]),
+        );
+        let request = swap_request(Uuid::new_v4());
+        let accept = negotiator.create(&request).await.unwrap();
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+        // The second status query went over iroh once it was reachable again.
+        assert_eq!(negotiator.preferred().unwrap().0.seen().len(), 1);
+        let stored = provider.accepted.lock().unwrap()[&request.quote_id]
+            .1
+            .swap_id;
+        assert_eq!(accept.swap_id, stored);
+    }
+
+    #[tokio::test]
+    async fn an_unsent_status_query_does_not_end_recovery() {
+        let provider = Arc::new(Provider::default());
+        let negotiator = negotiator(
+            &provider,
+            [Fault::LostReply, Fault::LostReply, Fault::NotSent],
+            None,
         );
         let request = swap_request(Uuid::new_v4());
         let accept = negotiator.create(&request).await.unwrap();
