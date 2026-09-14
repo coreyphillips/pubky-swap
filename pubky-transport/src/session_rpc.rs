@@ -3,10 +3,13 @@
 //! The session bearer token is used only with its own homeserver. Providers read a
 //! short-lived public authorization and authenticate the transport key over QUIC.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pubky_session::{PubkySession, PublicStorage};
+use pubky_session::{Pubky, PubkyHttpClient, PubkySession, PublicStorage};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+use tracing::debug;
 
 use crate::{canonical_pubky, Result, TransportError};
 
@@ -99,42 +102,121 @@ impl SessionClient {
     }
 }
 
-/// Verify a fresh authorization through the account's Pubky-resolved homeserver.
-pub async fn verify_request(
-    request: &SessionRequest,
-    remote_key: &str,
-    provider: &str,
-) -> Result<String> {
-    let owner = canonical_pubky(&request.owner)?;
-    if owner != request.owner {
-        return Err(session_error("noncanonical swap account"));
+/// Upper bound on one lookup, including time spent waiting for a lookup slot.
+const AUTHORIZATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Matches the session request queue in `p2p`, so a full queue cannot fan out
+/// into more homeserver lookups than that.
+const MAX_CONCURRENT_LOOKUPS: usize = 16;
+
+/// Provider-side authorization checks over one long-lived Pubky storage client.
+///
+/// Sharing the client keeps its connection pool and resolver cache warm across
+/// requests. Authorization decisions are never cached: every request fetches the
+/// current record and validates it, so removal and expiry take effect at once.
+#[derive(Clone)]
+pub struct AuthorizationVerifier {
+    storage: PublicStorage,
+    provider: String,
+    lookups: Arc<Semaphore>,
+    timeout: Duration,
+}
+
+/// Where one lookup spent its time. Resolution and connection setup happen inside
+/// the HTTP client, so they are reported together with the response headers.
+#[derive(Debug, Clone, Copy)]
+struct LookupTiming {
+    queued: Duration,
+    response: Duration,
+    body: Duration,
+}
+
+impl AuthorizationVerifier {
+    /// Build a verifier with a default mainline Pubky client.
+    pub fn new(provider: &str) -> Result<Self> {
+        let started = Instant::now();
+        let client =
+            PubkyHttpClient::new().map_err(|_| session_error("Pubky resolver unavailable"))?;
+        debug!(elapsed = ?started.elapsed(), "built Pubky authorization client");
+        Self::with_client(client, provider)
     }
-    let path = authorization_path(&request.scope, remote_key)?;
-    let storage = PublicStorage::new().map_err(|_| session_error("Pubky resolver unavailable"))?;
-    let address = format!("pubky://{owner}{path}");
-    let fetch = async {
-        let mut response = storage
-            .get(address)
-            .await
-            .map_err(|_| session_error("swap authorization unavailable"))?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| session_error("invalid authorization response"))?
-        {
-            if bytes.len().saturating_add(chunk.len()) > MAX_AUTHORIZATION_BYTES {
-                return Err(session_error("swap authorization is too large"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let authorization: SwapAuthorization = serde_json::from_slice(&bytes)?;
-        validate_authorization(&authorization, &owner, remote_key, provider, now_unix()?)?;
+
+    /// Build a verifier around an already configured client.
+    pub fn with_client(client: PubkyHttpClient, provider: &str) -> Result<Self> {
+        Ok(Self {
+            storage: Pubky::with_client(client).public_storage(),
+            provider: canonical_pubky(provider)?,
+            lookups: Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
+            timeout: AUTHORIZATION_LOOKUP_TIMEOUT,
+        })
+    }
+
+    /// Verify a fresh authorization through the account's Pubky-resolved homeserver.
+    pub async fn verify(&self, request: &SessionRequest, remote_key: &str) -> Result<String> {
+        let (owner, timing) = self.verify_timed(request, remote_key).await?;
+        debug!(
+            queued = ?timing.queued,
+            response = ?timing.response,
+            body = ?timing.body,
+            "verified swap authorization"
+        );
         Ok(owner)
-    };
-    tokio::time::timeout(Duration::from_secs(15), fetch)
-        .await
-        .map_err(|_| session_error("swap authorization lookup timed out"))?
+    }
+
+    async fn verify_timed(
+        &self,
+        request: &SessionRequest,
+        remote_key: &str,
+    ) -> Result<(String, LookupTiming)> {
+        let owner = canonical_pubky(&request.owner)?;
+        if owner != request.owner {
+            return Err(session_error("noncanonical swap account"));
+        }
+        let path = authorization_path(&request.scope, remote_key)?;
+        let address = format!("pubky://{owner}{path}");
+        let fetch = async {
+            let started = Instant::now();
+            let _permit = self
+                .lookups
+                .acquire()
+                .await
+                .map_err(|_| session_error("swap authorization unavailable"))?;
+            let queued = started.elapsed();
+            let mut response = self
+                .storage
+                .get(address)
+                .await
+                .map_err(|_| session_error("swap authorization unavailable"))?;
+            let response_at = started.elapsed();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| session_error("invalid authorization response"))?
+            {
+                if bytes.len().saturating_add(chunk.len()) > MAX_AUTHORIZATION_BYTES {
+                    return Err(session_error("swap authorization is too large"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let timing = LookupTiming {
+                queued,
+                response: response_at - queued,
+                body: started.elapsed() - response_at,
+            };
+            let authorization: SwapAuthorization = serde_json::from_slice(&bytes)?;
+            validate_authorization(
+                &authorization,
+                &owner,
+                remote_key,
+                &self.provider,
+                now_unix()?,
+            )?;
+            Ok((owner, timing))
+        };
+        tokio::time::timeout(self.timeout, fetch)
+            .await
+            .map_err(|_| session_error("swap authorization lookup timed out"))?
+    }
 }
 
 /// Derive an application transport key without reusing the wallet or account key.
@@ -363,5 +445,416 @@ mod tests {
             derive_transport_secret(&[4; 32], &owner, &provider, "/pub/bitkit.to/bitkit/wallet/")
                 .unwrap()
         );
+    }
+
+    mod lookup_fixture {
+        //! A local DHT and a minimal homeserver reached through the real Pubky client:
+        //! pkarr resolution, raw-public-key TLS and HTTP/1.1 keep-alive.
+
+        use super::*;
+        use pubky_session::pkarr::dns::rdata::SVCB;
+        use pubky_session::pkarr::{Client as PkarrClient, Keypair, SignedPacket};
+        use std::collections::HashMap;
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        const SCOPE: &str = "/pub/bitkit.to/bitkit/wallet/";
+
+        enum Reply {
+            Body(Vec<u8>),
+            Stall,
+        }
+
+        #[derive(Default)]
+        struct Counters {
+            accepted: AtomicUsize,
+            open: AtomicUsize,
+            requests: AtomicUsize,
+            in_flight: AtomicUsize,
+            peak_in_flight: AtomicUsize,
+        }
+
+        /// Counts a connection as open until its task finishes or is aborted.
+        struct OpenConnection(Arc<Counters>);
+
+        impl Drop for OpenConnection {
+            fn drop(&mut self) {
+                self.0.open.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        struct Homeserver {
+            dht: mainline::Testnet,
+            owner: String,
+            transport_key: String,
+            provider: String,
+            files: Arc<Mutex<HashMap<String, Reply>>>,
+            counters: Arc<Counters>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl Homeserver {
+            async fn start() -> Self {
+                let dht = mainline::Testnet::builder(3).build().unwrap();
+                let homeserver = Keypair::random();
+                let owner = Keypair::random();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+
+                let pkarr = pkarr_client(&dht);
+                let root = ".".try_into().unwrap();
+                let mut endpoint = SVCB::new(1, ".".try_into().unwrap());
+                endpoint.set_port(port);
+                endpoint.set_ipv4hint(&[Ipv4Addr::LOCALHOST.to_bits()]);
+                let packet = SignedPacket::builder()
+                    .https(root, endpoint, 3600)
+                    .address(
+                        ".".try_into().unwrap(),
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        3600,
+                    )
+                    .sign(&homeserver)
+                    .unwrap();
+                pkarr.publish(&packet).await.unwrap();
+                let homeserver_name = homeserver.public_key().to_z32();
+                let packet = SignedPacket::builder()
+                    .https(
+                        "_pubky".try_into().unwrap(),
+                        SVCB::new(0, homeserver_name.as_str().try_into().unwrap()),
+                        3600,
+                    )
+                    .sign(&owner)
+                    .unwrap();
+                pkarr.publish(&packet).await.unwrap();
+
+                let files = Arc::new(Mutex::new(HashMap::new()));
+                let counters = Arc::new(Counters::default());
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(
+                    homeserver.to_rpk_rustls_server_config(),
+                ));
+                let server =
+                    tokio::spawn(serve(listener, acceptor, files.clone(), counters.clone()));
+                Self {
+                    dht,
+                    owner: owner.public_key().to_z32(),
+                    transport_key: identity_from_secret(&[21; 32]),
+                    provider: identity_from_secret(&[22; 32]),
+                    files,
+                    counters,
+                    server,
+                }
+            }
+
+            fn verifier(&self) -> AuthorizationVerifier {
+                let mut builder = PubkyHttpClient::builder();
+                builder.pkarr(|pkarr| {
+                    pkarr
+                        .no_default_network()
+                        .no_relays()
+                        .bootstrap(&self.dht.bootstrap)
+                        .dht_report_policy(pubky_session::pkarr::dht::ReportPolicy::testnet())
+                        .request_timeout(Duration::from_millis(100))
+                });
+                AuthorizationVerifier::with_client(builder.build().unwrap(), &self.provider)
+                    .unwrap()
+            }
+
+            fn request(&self) -> SessionRequest {
+                SessionRequest {
+                    owner: self.owner.clone(),
+                    scope: SCOPE.into(),
+                    message: serde_json::json!({}),
+                }
+            }
+
+            fn path(&self) -> String {
+                authorization_path(SCOPE, &self.transport_key).unwrap()
+            }
+
+            fn authorize(&self, provider: &str, expires_at: u64) {
+                let authorization = SwapAuthorization {
+                    version: 1,
+                    owner: self.owner.clone(),
+                    transport_key: self.transport_key.clone(),
+                    provider: provider.into(),
+                    expires_at,
+                };
+                self.reply(Reply::Body(serde_json::to_vec(&authorization).unwrap()));
+            }
+
+            fn reply(&self, reply: Reply) {
+                self.files.lock().unwrap().insert(self.path(), reply);
+            }
+
+            fn remove(&self) {
+                self.files.lock().unwrap().remove(&self.path());
+            }
+
+            fn requests(&self) -> usize {
+                self.counters.requests.load(Ordering::SeqCst)
+            }
+        }
+
+        fn pkarr_client(dht: &mainline::Testnet) -> PkarrClient {
+            PkarrClient::builder()
+                .no_default_network()
+                .no_relays()
+                .bootstrap(&dht.bootstrap)
+                .dht_report_policy(pubky_session::pkarr::dht::ReportPolicy::testnet())
+                .build()
+                .unwrap()
+        }
+
+        async fn serve(
+            listener: TcpListener,
+            acceptor: tokio_rustls::TlsAcceptor,
+            files: Arc<Mutex<HashMap<String, Reply>>>,
+            counters: Arc<Counters>,
+        ) {
+            // Connection tasks live in the set, so aborting the server closes them too.
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counters.accepted.fetch_add(1, Ordering::SeqCst);
+                counters.open.fetch_add(1, Ordering::SeqCst);
+                let open = OpenConnection(counters.clone());
+                let (acceptor, files, counters) =
+                    (acceptor.clone(), files.clone(), counters.clone());
+                connections.spawn(async move {
+                    let _open = open;
+                    if let Ok(stream) = acceptor.accept(stream).await {
+                        let _ = serve_connection(stream, &files, &counters).await;
+                    }
+                });
+            }
+        }
+
+        async fn serve_connection(
+            stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+            files: &Mutex<HashMap<String, Reply>>,
+            counters: &Counters,
+        ) -> std::io::Result<()> {
+            let mut stream = BufReader::new(stream);
+            loop {
+                let mut request_line = String::new();
+                if stream.read_line(&mut request_line).await? == 0 {
+                    return Ok(());
+                }
+                loop {
+                    let mut header = String::new();
+                    if stream.read_line(&mut header).await? == 0 {
+                        return Ok(());
+                    }
+                    if header == "\r\n" {
+                        break;
+                    }
+                }
+                counters.requests.fetch_add(1, Ordering::SeqCst);
+                let in_flight = counters.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                counters
+                    .peak_in_flight
+                    .fetch_max(in_flight, Ordering::SeqCst);
+                // Long enough for concurrent lookups to overlap at the server.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                counters.in_flight.fetch_sub(1, Ordering::SeqCst);
+                let path = request_line.split(' ').nth(1).unwrap_or_default();
+                let reply = match files.lock().unwrap().get(path) {
+                    Some(Reply::Body(body)) => Some(Some(body.clone())),
+                    Some(Reply::Stall) => Some(None),
+                    None => None,
+                };
+                let body = match reply {
+                    Some(Some(body)) => body,
+                    Some(None) => {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        return Ok(());
+                    }
+                    None => {
+                        stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                            .await?;
+                        continue;
+                    }
+                };
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(&body).await?;
+                stream.flush().await?;
+            }
+        }
+
+        impl Drop for Homeserver {
+            fn drop(&mut self) {
+                self.server.abort();
+            }
+        }
+
+        async fn wait_for(condition: impl Fn() -> bool) -> bool {
+            for _ in 0..100 {
+                if condition() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn repeated_lookups_reuse_one_connection_and_fetch_every_time() {
+            let homeserver = Homeserver::start().await;
+            let expires = now_unix().unwrap() + AUTHORIZATION_LIFETIME;
+            homeserver.authorize(&homeserver.provider, expires);
+            let request = homeserver.request();
+
+            let verifier = homeserver.verifier();
+            let (owner, cold) = verifier
+                .verify_timed(&request, &homeserver.transport_key)
+                .await
+                .unwrap();
+            assert_eq!(owner, homeserver.owner);
+            let mut warm = Vec::new();
+            for _ in 0..5 {
+                let (_, timing) = verifier
+                    .verify_timed(&request, &homeserver.transport_key)
+                    .await
+                    .unwrap();
+                warm.push(timing);
+            }
+            // Every decision came from a fresh fetch, over the one pooled connection.
+            assert_eq!(homeserver.requests(), 6);
+            assert_eq!(homeserver.counters.accepted.load(Ordering::SeqCst), 1);
+
+            // A second client is what every request used to pay for.
+            let (_, fresh_client) = homeserver
+                .verifier()
+                .verify_timed(&request, &homeserver.transport_key)
+                .await
+                .unwrap();
+            assert_eq!(homeserver.counters.accepted.load(Ordering::SeqCst), 2);
+            eprintln!("cold lookup: {cold:?}");
+            eprintln!("warm lookups: {warm:?}");
+            eprintln!("second client, first lookup: {fresh_client:?}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn concurrent_lookups_share_the_client_and_stay_bounded() {
+            let homeserver = Homeserver::start().await;
+            let expires = now_unix().unwrap() + AUTHORIZATION_LIFETIME;
+            homeserver.authorize(&homeserver.provider, expires);
+            let verifier = homeserver.verifier();
+            let request = Arc::new(homeserver.request());
+            let lookups: Vec<_> = (0..MAX_CONCURRENT_LOOKUPS * 2)
+                .map(|_| {
+                    let (verifier, request) = (verifier.clone(), request.clone());
+                    let key = homeserver.transport_key.clone();
+                    tokio::spawn(async move { verifier.verify(&request, &key).await })
+                })
+                .collect();
+            for lookup in lookups {
+                assert_eq!(lookup.await.unwrap().unwrap(), homeserver.owner);
+            }
+            assert_eq!(homeserver.requests(), MAX_CONCURRENT_LOOKUPS * 2);
+            let peak = homeserver.counters.peak_in_flight.load(Ordering::SeqCst);
+            assert!(peak > 1 && peak <= MAX_CONCURRENT_LOOKUPS, "{peak}");
+            // The pool may race a few extra connections, so this is recorded rather than bounded.
+            eprintln!(
+                "connections for {} concurrent lookups: {}",
+                MAX_CONCURRENT_LOOKUPS * 2,
+                homeserver.counters.accepted.load(Ordering::SeqCst)
+            );
+            assert_eq!(Arc::strong_count(&verifier.lookups), 1);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn every_request_sees_the_current_authorization() {
+            let homeserver = Homeserver::start().await;
+            let verifier = homeserver.verifier();
+            let request = homeserver.request();
+            let key = homeserver.transport_key.clone();
+            let now = now_unix().unwrap();
+            let valid = now + AUTHORIZATION_LIFETIME;
+
+            homeserver.authorize(&homeserver.provider, valid);
+            assert!(verifier.verify(&request, &key).await.is_ok());
+
+            homeserver.remove();
+            assert!(verifier.verify(&request, &key).await.is_err());
+
+            homeserver.authorize(&homeserver.provider, valid);
+            assert!(verifier.verify(&request, &key).await.is_ok());
+
+            homeserver.authorize(&homeserver.owner, valid);
+            assert!(verifier.verify(&request, &key).await.is_err());
+
+            homeserver.authorize(&homeserver.provider, now);
+            assert!(verifier.verify(&request, &key).await.is_err());
+
+            homeserver.authorize(&homeserver.provider, valid);
+            let other_key = identity_from_secret(&[23; 32]);
+            assert!(verifier.verify(&request, &other_key).await.is_err());
+            let mut other_owner = homeserver.request();
+            other_owner.owner = homeserver.provider.clone();
+            assert!(verifier.verify(&other_owner, &key).await.is_err());
+            let mut noncanonical = homeserver.request();
+            noncanonical.owner = format!("pubky{}", homeserver.owner);
+            assert!(verifier.verify(&noncanonical, &key).await.is_err());
+
+            assert!(verifier.verify(&request, &key).await.is_ok());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn oversized_slow_and_unavailable_homeservers_are_rejected() {
+            let homeserver = Homeserver::start().await;
+            let mut verifier = homeserver.verifier();
+            let request = homeserver.request();
+            let key = homeserver.transport_key.clone();
+
+            homeserver.reply(Reply::Body(vec![b' '; MAX_AUTHORIZATION_BYTES + 1]));
+            let error = verifier.verify(&request, &key).await.unwrap_err();
+            assert!(error.to_string().contains("too large"), "{error}");
+
+            verifier.timeout = Duration::from_millis(500);
+            homeserver.reply(Reply::Stall);
+            let error = verifier.verify(&request, &key).await.unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{error}");
+
+            // Waiting for a lookup slot counts against the same deadline.
+            homeserver.authorize(&homeserver.provider, now_unix().unwrap() + 60);
+            let slots = verifier
+                .lookups
+                .clone()
+                .acquire_many_owned(MAX_CONCURRENT_LOOKUPS as u32)
+                .await
+                .unwrap();
+            let error = verifier.verify(&request, &key).await.unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{error}");
+            drop(slots);
+            verifier.timeout = AUTHORIZATION_LOOKUP_TIMEOUT;
+            assert!(verifier.verify(&request, &key).await.is_ok());
+
+            homeserver.server.abort();
+            assert!(wait_for(|| homeserver.counters.open.load(Ordering::SeqCst) == 0).await);
+            let error = verifier.verify(&request, &key).await.unwrap_err();
+            assert!(error.to_string().contains("unavailable"), "{error}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn dropping_the_verifier_closes_its_connections() {
+            let homeserver = Homeserver::start().await;
+            homeserver.authorize(&homeserver.provider, now_unix().unwrap() + 60);
+            let verifier = homeserver.verifier();
+            let request = homeserver.request();
+            verifier
+                .verify(&request, &homeserver.transport_key)
+                .await
+                .unwrap();
+            let clone = verifier.clone();
+            drop(verifier);
+            assert_eq!(homeserver.counters.open.load(Ordering::SeqCst), 1);
+            drop(clone);
+            assert!(wait_for(|| homeserver.counters.open.load(Ordering::SeqCst) == 0).await);
+        }
     }
 }
