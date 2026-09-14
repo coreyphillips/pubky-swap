@@ -257,6 +257,9 @@ pub struct Negotiator<P, F> {
     preferred_unavailable: AtomicBool,
 }
 
+const RECOVERY_WINDOW: Duration = Duration::from_secs(60);
+const RECOVERY_POLL: Duration = Duration::from_millis(500);
+
 impl<P: Channel, F: Channel> Negotiator<P, F> {
     pub fn new(preferred: Option<P>, fallback: Option<F>) -> Self {
         Self {
@@ -278,7 +281,7 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
         &self,
         request: &SwapMessage,
         expected: fn(&SwapMessage) -> bool,
-    ) -> Result<Exchanged> {
+    ) -> std::result::Result<Exchanged, ExchangeError> {
         let mut uncertain = false;
         let mut last_error = None;
         if let Some(preferred) = self.preferred.as_ref() {
@@ -304,13 +307,22 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
                 }
             }
         }
-        let Some(fallback) = self.fallback.as_ref() else {
-            return Err(last_error.unwrap_or_else(|| anyhow!("no transport to the provider")));
+        let error = match self.fallback.as_ref() {
+            Some(fallback) => match fallback.exchange(request, expected).await {
+                Ok(reply) => return Ok(Exchanged { reply, uncertain }),
+                Err(ExchangeError::Uncertain(error)) => {
+                    uncertain = true;
+                    error
+                }
+                Err(ExchangeError::NotSent(error)) => error,
+            },
+            None => last_error.unwrap_or_else(|| anyhow!("no transport to the provider")),
         };
-        match fallback.exchange(request, expected).await {
-            Ok(reply) => Ok(Exchanged { reply, uncertain }),
-            Err(error) => Err(error.into_inner()),
-        }
+        Err(if uncertain {
+            ExchangeError::Uncertain(error)
+        } else {
+            ExchangeError::NotSent(error)
+        })
     }
 
     /// The provider's current offer.
@@ -319,7 +331,12 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
         let request = SwapMessage::OfferRequest(OfferRequest { request_id });
         let expected =
             |m: &SwapMessage| matches!(m, SwapMessage::Offer(o) if o.request_id.is_some());
-        match self.exchange(&request, expected).await?.reply {
+        match self
+            .exchange(&request, expected)
+            .await
+            .map_err(ExchangeError::into_inner)?
+            .reply
+        {
             SwapMessage::Offer(offer) if offer.request_id == request_id => Ok(offer),
             SwapMessage::Offer(_) => Err(anyhow!("offer answers a different request")),
             other => Err(rejection(other)),
@@ -329,7 +346,12 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
     pub async fn quote(&self, request: &QuoteRequest) -> Result<Quote> {
         let message = SwapMessage::QuoteRequest(request.clone());
         let expected = |m: &SwapMessage| matches!(m, SwapMessage::Quote(_));
-        match self.exchange(&message, expected).await?.reply {
+        match self
+            .exchange(&message, expected)
+            .await
+            .map_err(ExchangeError::into_inner)?
+            .reply
+        {
             // An older provider does not echo the identifier.
             SwapMessage::Quote(quote)
                 if quote.request_id.is_none() || quote.request_id == request.request_id =>
@@ -345,25 +367,19 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
     pub async fn create(&self, request: &SwapRequest) -> Result<SwapAccept> {
         let message = SwapMessage::SwapRequest(request.clone());
         let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapAccept(_));
-        let exchanged = self.exchange(&message, expected).await?;
-        let accept = match exchanged.reply {
-            SwapMessage::SwapAccept(accept) => accept,
-            other if exchanged.uncertain => {
-                // The first attempt may have been admitted while the resend was refused.
-                let query = SwapStatusRequest {
-                    request_id: Some(Uuid::new_v4()),
-                    swap_id: None,
-                    quote_id: Some(request.quote_id),
-                };
-                match self.status(&query).await {
-                    Ok(snapshot) => {
-                        info!("recovered swap {} by its quote", snapshot.accept.swap_id);
-                        snapshot.accept
-                    }
-                    Err(_) => return Err(rejection(other)),
-                }
-            }
-            other => return Err(rejection(other)),
+        let accept = match self.exchange(&message, expected).await {
+            Ok(Exchanged {
+                reply: SwapMessage::SwapAccept(accept),
+                ..
+            }) => accept,
+            // The first attempt may have been admitted while the resend was refused.
+            Ok(Exchanged {
+                reply,
+                uncertain: true,
+            }) => self.recover(request.quote_id, rejection(reply)).await?,
+            Ok(Exchanged { reply, .. }) => return Err(rejection(reply)),
+            Err(ExchangeError::Uncertain(error)) => self.recover(request.quote_id, error).await?,
+            Err(ExchangeError::NotSent(error)) => return Err(error),
         };
         if accept.quote_id != request.quote_id {
             return Err(anyhow!("acceptance is for a different quote"));
@@ -371,10 +387,52 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
         Ok(accept)
     }
 
+    /// Look up a creation that may have been admitted. The provider spends the quote before it
+    /// persists the swap, so `not_found` and `pending` are only believed once `RECOVERY_WINDOW`
+    /// has passed.
+    async fn recover(&self, quote_id: Uuid, cause: Error) -> Result<SwapAccept> {
+        let deadline = Instant::now() + RECOVERY_WINDOW;
+        loop {
+            let query = SwapStatusRequest {
+                request_id: Some(Uuid::new_v4()),
+                swap_id: None,
+                quote_id: Some(quote_id),
+            };
+            let message = SwapMessage::SwapStatusRequest(query.clone());
+            let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapStatusSnapshot(_));
+            match self.exchange(&message, expected).await.map(|e| e.reply) {
+                Ok(SwapMessage::SwapStatusSnapshot(snapshot))
+                    if snapshot.request_id == query.request_id =>
+                {
+                    info!("recovered swap {} by its quote", snapshot.accept.swap_id);
+                    return Ok(snapshot.accept);
+                }
+                Ok(SwapMessage::Reject(Reject { code, .. }))
+                    if !matches!(code.as_deref(), Some("not_found" | "pending")) =>
+                {
+                    return Err(cause);
+                }
+                Err(ExchangeError::NotSent(_)) => return Err(cause),
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(cause.context(format!(
+                    "the provider may have created a swap for quote {quote_id}; query its status before requesting another"
+                )));
+            }
+            sleep(RECOVERY_POLL).await;
+        }
+    }
+
     pub async fn status(&self, request: &SwapStatusRequest) -> Result<SwapStatusSnapshot> {
         let message = SwapMessage::SwapStatusRequest(request.clone());
         let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapStatusSnapshot(_));
-        match self.exchange(&message, expected).await?.reply {
+        match self
+            .exchange(&message, expected)
+            .await
+            .map_err(ExchangeError::into_inner)?
+            .reply
+        {
             SwapMessage::SwapStatusSnapshot(snapshot)
                 if snapshot.request_id == request.request_id =>
             {
@@ -478,6 +536,8 @@ mod tests {
         /// Refuse a creation whose quote was already spent, as a provider still admitting the
         /// first attempt does when the resend races it.
         refuse_replays: AtomicBool,
+        /// Status queries answered `pending` before the admitted swap is reported.
+        pending_status_replies: AtomicUsize,
     }
 
     impl Provider {
@@ -497,6 +557,17 @@ mod tests {
                     SwapMessage::SwapAccept(accept)
                 }
                 SwapMessage::SwapStatusRequest(query) => {
+                    let pending = &self.pending_status_replies;
+                    if pending.load(Ordering::SeqCst) > 0 {
+                        pending.fetch_sub(1, Ordering::SeqCst);
+                        return SwapMessage::Reject(Reject {
+                            code: Some("pending".into()),
+                            request_id: None,
+                            swap_id: None,
+                            quote_id: None,
+                            reason: "invoice creation is pending".into(),
+                        });
+                    }
                     let accepted = self.accepted.lock().unwrap();
                     match query.quote_id.and_then(|id| accepted.get(&id)) {
                         Some((_, accept)) => SwapMessage::SwapStatusSnapshot(SwapStatusSnapshot {
@@ -756,6 +827,25 @@ mod tests {
         let provider = Arc::new(Provider::default());
         provider.refuse_replays.store(true, Ordering::SeqCst);
         let negotiator = negotiator(&provider, [Fault::LostReply], Some(vec![]));
+        let request = swap_request(Uuid::new_v4());
+        let accept = negotiator.create(&request).await.unwrap();
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+        let stored = provider.accepted.lock().unwrap()[&request.quote_id]
+            .1
+            .swap_id;
+        assert_eq!(accept.swap_id, stored);
+    }
+
+    #[tokio::test]
+    async fn a_lost_reply_on_every_transport_is_recovered_through_status() {
+        let provider = Arc::new(Provider::default());
+        provider.refuse_replays.store(true, Ordering::SeqCst);
+        provider.pending_status_replies.store(1, Ordering::SeqCst);
+        let negotiator = negotiator(
+            &provider,
+            [Fault::LostReply, Fault::LostReply],
+            Some(vec![Fault::LostReply]),
+        );
         let request = swap_request(Uuid::new_v4());
         let accept = negotiator.create(&request).await.unwrap();
         assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
