@@ -3,7 +3,8 @@
 //! The session bearer token is used only with its own homeserver. Providers read a
 //! short-lived public authorization and authenticate the transport key over QUIC.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pubky_session::{Pubky, PubkyHttpClient, PubkySession, PublicStorage};
@@ -107,6 +108,12 @@ const AUTHORIZATION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Matches the session request queue in `p2p`, so a full queue cannot fan out
 /// into more homeserver lookups than that.
 const MAX_CONCURRENT_LOOKUPS: usize = 16;
+/// The Pubky client keeps a resolver entry for every account it has looked up and
+/// never evicts them. Owners arrive before they are authorized, so the client is
+/// replaced once it has seen this many.
+const MAX_OWNERS_PER_CLIENT: usize = 1024;
+
+type ClientFactory = dyn Fn() -> Result<PubkyHttpClient> + Send + Sync;
 
 /// Provider-side authorization checks over one long-lived Pubky storage client.
 ///
@@ -115,10 +122,17 @@ const MAX_CONCURRENT_LOOKUPS: usize = 16;
 /// current record and validates it, so removal and expiry take effect at once.
 #[derive(Clone)]
 pub struct AuthorizationVerifier {
-    storage: PublicStorage,
+    factory: Arc<ClientFactory>,
+    client: Arc<Mutex<SharedClient>>,
     provider: String,
     lookups: Arc<Semaphore>,
     timeout: Duration,
+    max_owners: usize,
+}
+
+struct SharedClient {
+    storage: PublicStorage,
+    owners: HashSet<String>,
 }
 
 /// Where one lookup spent its time. Resolution and connection setup happen inside
@@ -133,21 +147,46 @@ struct LookupTiming {
 impl AuthorizationVerifier {
     /// Build a verifier with a default mainline Pubky client.
     pub fn new(provider: &str) -> Result<Self> {
-        let started = Instant::now();
-        let client =
-            PubkyHttpClient::new().map_err(|_| session_error("Pubky resolver unavailable"))?;
-        debug!(elapsed = ?started.elapsed(), "built Pubky authorization client");
-        Self::with_client(client, provider)
+        Self::with_client_factory(
+            || PubkyHttpClient::new().map_err(|_| session_error("Pubky resolver unavailable")),
+            provider,
+        )
     }
 
-    /// Build a verifier around an already configured client.
-    pub fn with_client(client: PubkyHttpClient, provider: &str) -> Result<Self> {
+    /// Build a verifier whose clients come from `factory`, which is called again
+    /// whenever the current client is replaced.
+    pub fn with_client_factory(
+        factory: impl Fn() -> Result<PubkyHttpClient> + Send + Sync + 'static,
+        provider: &str,
+    ) -> Result<Self> {
+        let provider = canonical_pubky(provider)?;
+        let factory: Arc<ClientFactory> = Arc::new(factory);
+        let storage = build_storage(factory.as_ref())?;
         Ok(Self {
-            storage: Pubky::with_client(client).public_storage(),
-            provider: canonical_pubky(provider)?,
+            factory,
+            client: Arc::new(Mutex::new(SharedClient {
+                storage,
+                owners: HashSet::new(),
+            })),
+            provider,
             lookups: Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
             timeout: AUTHORIZATION_LOOKUP_TIMEOUT,
+            max_owners: MAX_OWNERS_PER_CLIENT,
         })
+    }
+
+    /// The shared storage client, replaced first if `owner` would take it past its
+    /// owner limit. Lookups already running keep the old client until they finish.
+    fn storage_for(&self, owner: &str) -> Result<PublicStorage> {
+        let mut client = self.client.lock().unwrap_or_else(PoisonError::into_inner);
+        if !client.owners.contains(owner) {
+            if client.owners.len() >= self.max_owners {
+                client.storage = build_storage(self.factory.as_ref())?;
+                client.owners.clear();
+            }
+            client.owners.insert(owner.to_string());
+        }
+        Ok(client.storage.clone())
     }
 
     /// Verify a fresh authorization through the account's Pubky-resolved homeserver.
@@ -182,7 +221,7 @@ impl AuthorizationVerifier {
                 .map_err(|_| session_error("swap authorization unavailable"))?;
             let queued = started.elapsed();
             let mut response = self
-                .storage
+                .storage_for(&owner)?
                 .get(address)
                 .await
                 .map_err(|_| session_error("swap authorization unavailable"))?;
@@ -217,6 +256,13 @@ impl AuthorizationVerifier {
             .await
             .map_err(|_| session_error("swap authorization lookup timed out"))?
     }
+}
+
+fn build_storage(factory: &ClientFactory) -> Result<PublicStorage> {
+    let started = Instant::now();
+    let client = factory()?;
+    debug!(elapsed = ?started.elapsed(), "built Pubky authorization client");
+    Ok(Pubky::with_client(client).public_storage())
 }
 
 /// Derive an application transport key without reusing the wallet or account key.
@@ -549,17 +595,25 @@ mod tests {
             }
 
             fn verifier(&self) -> AuthorizationVerifier {
-                let mut builder = PubkyHttpClient::builder();
-                builder.pkarr(|pkarr| {
-                    pkarr
-                        .no_default_network()
-                        .no_relays()
-                        .bootstrap(&self.dht.bootstrap)
-                        .dht_report_policy(pubky_session::pkarr::dht::ReportPolicy::testnet())
-                        .request_timeout(Duration::from_millis(100))
-                });
-                AuthorizationVerifier::with_client(builder.build().unwrap(), &self.provider)
-                    .unwrap()
+                let bootstrap = self.dht.bootstrap.clone();
+                AuthorizationVerifier::with_client_factory(
+                    move || {
+                        let mut builder = PubkyHttpClient::builder();
+                        builder.pkarr(|pkarr| {
+                            pkarr
+                                .no_default_network()
+                                .no_relays()
+                                .bootstrap(&bootstrap)
+                                .dht_report_policy(
+                                    pubky_session::pkarr::dht::ReportPolicy::testnet(),
+                                )
+                                .request_timeout(Duration::from_millis(100))
+                        });
+                        Ok(builder.build().unwrap())
+                    },
+                    &self.provider,
+                )
+                .unwrap()
             }
 
             fn request(&self) -> SessionRequest {
@@ -838,6 +892,37 @@ mod tests {
             assert!(wait_for(|| homeserver.counters.open.load(Ordering::SeqCst) == 0).await);
             let error = verifier.verify(&request, &key).await.unwrap_err();
             assert!(error.to_string().contains("unavailable"), "{error}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn client_is_replaced_after_too_many_owners() {
+            let homeserver = Homeserver::start().await;
+            homeserver.authorize(&homeserver.provider, now_unix().unwrap() + 60);
+            let mut verifier = homeserver.verifier();
+            verifier.max_owners = 2;
+            let request = homeserver.request();
+            let key = homeserver.transport_key.clone();
+            let strangers: Vec<_> = (30..33)
+                .map(|seed| identity_from_secret(&[seed; 32]))
+                .collect();
+
+            verifier.verify(&request, &key).await.unwrap();
+            let mut stranger = homeserver.request();
+            stranger.owner = strangers[0].clone();
+            assert!(verifier.verify(&stranger, &key).await.is_err());
+            // Known owners do not count again.
+            verifier.verify(&request, &key).await.unwrap();
+            assert_eq!(homeserver.counters.accepted.load(Ordering::SeqCst), 1);
+
+            for owner in &strangers[1..] {
+                stranger.owner = owner.clone();
+                assert!(verifier.verify(&stranger, &key).await.is_err());
+            }
+            let owners = verifier.client.lock().unwrap().owners.len();
+            assert!(owners <= 2, "{owners}");
+            // The replacement client still verifies, over a new connection.
+            verifier.verify(&request, &key).await.unwrap();
+            assert_eq!(homeserver.counters.accepted.load(Ordering::SeqCst), 2);
         }
 
         #[tokio::test(flavor = "multi_thread")]
