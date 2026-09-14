@@ -142,6 +142,9 @@ struct PeerPoll {
     due: Instant,
     idle_streak: u32,
     failure_streak: u32,
+    /// Consecutive polls that hit the deadline. Each one doubles the next deadline, because a
+    /// conversation is downloaded whole and a long one can need more than the base timeout.
+    timeout_streak: u32,
     in_flight: bool,
     /// Woken since its last poll started, so the next one skips any backoff and goes ahead of
     /// peers that are merely overdue.
@@ -158,6 +161,7 @@ impl PeerPoll {
             due: now,
             idle_streak: 0,
             failure_streak: 0,
+            timeout_streak: 0,
             in_flight: false,
             woken: false,
             last_delivery: None,
@@ -178,6 +182,8 @@ pub struct PeerInbox<M> {
     refresh_now: bool,
     next_refresh: Instant,
     next_stats_log: Instant,
+    /// Whether the next free slot goes to a woken peer rather than an overdue one.
+    woken_turn: bool,
 }
 
 impl<M: 'static> PeerInbox<M> {
@@ -200,6 +206,7 @@ impl<M: 'static> PeerInbox<M> {
             refresh_now: true,
             next_refresh: now,
             next_stats_log: now + STATS_LOG_INTERVAL,
+            woken_turn: true,
         }
     }
 
@@ -258,6 +265,7 @@ impl<M: 'static> PeerInbox<M> {
             tokio::select! {
                 Some((peer, latency, outcome)) = self.in_flight.next(), if !self.in_flight.is_empty() => {
                     if let Some(messages) = self.complete(&peer, latency, outcome) {
+                        self.publish(Instant::now());
                         return PeerBatch { peer, messages };
                     }
                 }
@@ -290,22 +298,40 @@ impl<M: 'static> PeerInbox<M> {
         if free == 0 {
             return;
         }
-        // Woken peers first, then longest-overdue, so a large peer set cannot starve the peers at
-        // the back of it and a doorbell is not queued behind that backlog.
-        let mut due: Vec<(bool, Instant, String)> = self
-            .peers
-            .iter()
-            .filter(|(_, p)| !p.in_flight && p.due <= now)
-            .map(|(peer, p)| (!p.woken, p.due, peer.clone()))
-            .collect();
-        due.sort();
-        for (_, _, peer) in due.into_iter().take(free) {
+        // Slots alternate between woken and overdue peers, longest-overdue first within each. A
+        // doorbell then waits behind at most one overdue poll, and peers that keep getting woken
+        // cannot hold every slot. Only the earliest `free` of each can start, so the rest of a
+        // large backlog is not sorted.
+        let mut woken = Vec::new();
+        let mut overdue = Vec::new();
+        for (peer, p) in &self.peers {
+            if !p.in_flight && p.due <= now {
+                if p.woken {
+                    woken.push((p.due, peer));
+                } else {
+                    overdue.push((p.due, peer));
+                }
+            }
+        }
+        let mut woken = earliest(woken, free);
+        let mut overdue = earliest(overdue, free);
+        for _ in 0..free {
+            let take_woken = (self.woken_turn && !woken.is_empty()) || overdue.is_empty();
+            let Some(peer) = (if take_woken {
+                woken.pop()
+            } else {
+                overdue.pop()
+            }) else {
+                break;
+            };
+            self.woken_turn = !take_woken;
+            let mut deadline = self.config.poll_timeout;
             if let Some(p) = self.peers.get_mut(&peer) {
                 p.in_flight = true;
                 p.woken = false;
+                deadline = backoff(deadline, p.timeout_streak, deadline.saturating_mul(4));
             }
             let poll = (self.fetch)(peer.clone());
-            let deadline = self.config.poll_timeout;
             self.in_flight.push(Box::pin(async move {
                 let started = Instant::now();
                 let outcome = match timeout(deadline, poll).await {
@@ -336,6 +362,7 @@ impl<M: 'static> PeerInbox<M> {
                 entry.map(|p| {
                     p.idle_streak = 0;
                     p.failure_streak = 0;
+                    p.timeout_streak = 0;
                     p.last_delivery = Some(now);
                     p.hot_until = now + hold;
                     (p, active)
@@ -346,6 +373,7 @@ impl<M: 'static> PeerInbox<M> {
                 let cap = self.config.idle_max_interval;
                 entry.map(|p| {
                     p.failure_streak = 0;
+                    p.timeout_streak = 0;
                     if now < p.hot_until {
                         return (p, active);
                     }
@@ -369,6 +397,7 @@ impl<M: 'static> PeerInbox<M> {
                 stats.timed_out_polls += 1;
                 let cap = self.config.failure_max_interval;
                 entry.map(|p| {
+                    p.timeout_streak = p.timeout_streak.saturating_add(1);
                     p.failure_streak = p.failure_streak.saturating_add(1);
                     let interval = backoff(active, p.failure_streak, cap);
                     (p, interval)
@@ -420,6 +449,16 @@ impl<M: 'static> PeerInbox<M> {
             "peer poll stats"
         );
     }
+}
+
+/// The `n` earliest-due peers, earliest last.
+fn earliest(mut due: Vec<(Instant, &String)>, n: usize) -> Vec<String> {
+    if due.len() > n {
+        due.select_nth_unstable(n);
+        due.truncate(n);
+    }
+    due.sort_unstable_by(|a, b| b.cmp(a));
+    due.into_iter().map(|(_, peer)| peer.clone()).collect()
 }
 
 /// `base * 2^streak`, capped.
@@ -787,6 +826,47 @@ mod tests {
         let woken_at = Instant::now();
         while inbox.recv().await.peer != "late" {}
         assert!(woken_at.elapsed() <= Duration::from_millis(110));
+    }
+
+    /// Peers that are woken again during every poll cannot keep an overdue peer from its turn.
+    #[tokio::test(start_paused = true)]
+    async fn repeated_wakes_do_not_starve_overdue_peers() {
+        let fake = Fake::new(vec![
+            ("noisy-a", Behaviour::Messages(Vec::new())),
+            ("noisy-b", Behaviour::Messages(Vec::new())),
+            ("overdue", Behaviour::Messages(vec![Duration::ZERO])),
+        ]);
+        let waker = Arc::new(PollWaker::default());
+        let config = PollConfig {
+            max_in_flight: 2,
+            ..PollConfig::default()
+        };
+        let mut inbox = fake.inbox(config, waker.clone());
+        let ringer = waker.clone();
+        let _ringing = tokio::spawn(async move {
+            loop {
+                ringer.wake("noisy-a");
+                ringer.wake("noisy-b");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+        let batch = tokio::time::timeout(Duration::from_secs(1), inbox.recv()).await;
+        assert_eq!(batch.expect("the overdue peer was polled").peer, "overdue");
+    }
+
+    /// A healthy conversation that takes longer than the base deadline to download is still read.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_finite_poll_gets_a_longer_deadline() {
+        let fetch: Fetch<Duration> = Box::new(|_| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_secs(11)).await;
+                Ok(vec![Duration::ZERO])
+            })
+        });
+        let list: ListPeers = Box::new(|| vec!["long".to_string()]);
+        let mut inbox = PeerInbox::new(PollConfig::default(), list, fetch, Arc::default());
+        let batch = tokio::time::timeout(Duration::from_secs(35), inbox.recv()).await;
+        assert_eq!(batch.expect("the conversation was read").peer, "long");
     }
 
     /// However many peers there are, only `max_in_flight` polls run at once, a caller that is not
