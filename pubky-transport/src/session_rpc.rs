@@ -111,7 +111,7 @@ pub async fn verify_request(
     }
     let path = authorization_path(&request.scope, remote_key)?;
     let storage = PublicStorage::new().map_err(|_| session_error("Pubky resolver unavailable"))?;
-    let address = format!("{owner}{path}");
+    let address = format!("pubky://{owner}{path}");
     let fetch = async {
         let mut response = storage
             .get(address)
