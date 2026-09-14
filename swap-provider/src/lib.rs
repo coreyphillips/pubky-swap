@@ -2637,19 +2637,31 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: Sh
                     Ok(key) => key,
                     Err(_) => return,
                 };
+                // Built once so session requests share its connection pool and resolver
+                // cache. It drops with this task when the accept loop ends.
+                let verifier =
+                    match pubky_transport::session_rpc::AuthorizationVerifier::new(&provider) {
+                        Ok(verifier) => Some(verifier),
+                        Err(e) => {
+                            warn!("session swap requests disabled: {e}");
+                            None
+                        }
+                    };
                 while let Some(event) = server.next_event().await {
                     match event {
                         pubky_transport::p2p::RendezvousEvent::Peer(pubky) => {
                             ctx.transport.add_known_peer(pubky)
                         }
                         pubky_transport::p2p::RendezvousEvent::Session(request) => {
+                            let Some(verifier) = verifier.clone() else {
+                                continue;
+                            };
                             let ctx = ctx.clone();
                             let offer = offer.clone();
-                            let provider = provider.clone();
                             tokio::spawn(async move {
                                 let _ = tokio::time::timeout(
                                     Duration::from_secs(60),
-                                    handle_session_request(ctx, offer, provider, request),
+                                    handle_session_request(ctx, offer, verifier, request),
                                 )
                                 .await;
                             });
@@ -2667,16 +2679,10 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: Sh
 async fn handle_session_request(
     mut ctx: ExecCtx,
     offer: SharedOffer,
-    provider: String,
+    verifier: pubky_transport::session_rpc::AuthorizationVerifier,
     request: pubky_transport::p2p::SessionRpc,
 ) {
-    let owner = match pubky_transport::session_rpc::verify_request(
-        &request.request,
-        &request.remote_key,
-        &provider,
-    )
-    .await
-    {
+    let owner = match verifier.verify(&request.request, &request.remote_key).await {
         Ok(owner) => owner,
         Err(_) => return,
     };
