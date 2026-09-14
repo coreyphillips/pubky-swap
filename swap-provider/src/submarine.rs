@@ -18,7 +18,7 @@ use crate::reverse::{OnchainWallet, ProgressSink, Resume};
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
-use lightning_backend::{LightningBackend, PaymentStatus};
+use lightning_backend::{LightningBackend, LightningError, PaymentStatus};
 use std::time::Duration;
 use swap_common::chain::{
     run_blocking, select_funding, ChainWatcher, FundingSelection, DEFAULT_MAX_OVERPAY_SAT,
@@ -426,9 +426,23 @@ pub async fn drive_submarine_swap(
                         payment = Some(p);
                         break;
                     }
-                    Err(e) => {
+                    // Only a failure the node reported, or a call the backend refused before
+                    // sending anything, is definitive.
+                    Err(
+                        e @ (LightningError::PaymentFailed(_) | LightningError::NotImplemented(_)),
+                    ) => {
                         warn!("Submarine swap: invoice payment failed: {e}");
                         return Ok(SwapState::Failed(format!("invoice payment failed: {e}")));
+                    }
+                    // A transport error can arrive after the node accepted the payment, which may
+                    // still settle. The recorded intent makes the next run ask the node instead
+                    // of paying again.
+                    Err(e) => {
+                        warn!(
+                            "Submarine swap: the payment call broke ({e}); the payment may still \
+                             be out, checking with the node"
+                        );
+                        return Ok(SwapState::InvoicePending);
                     }
                 }
             }
@@ -602,6 +616,8 @@ mod tests {
         cltv_limit: Mutex<Option<u32>>,
         /// The final CLTV the decoded invoice demands.
         min_final_cltv_expiry: u32,
+        /// Accept the payment, then lose the update stream before a final status arrives.
+        stream_breaks: bool,
     }
     impl MockLn {
         fn new(payment_hash: [u8; 32], pay_preimage: Option<[u8; 32]>) -> Self {
@@ -612,7 +628,12 @@ mod tests {
                 status: Mutex::new(lightning_backend::PaymentStatus::Unknown),
                 cltv_limit: Mutex::new(None),
                 min_final_cltv_expiry: 80,
+                stream_breaks: false,
             }
+        }
+        fn with_broken_stream(mut self) -> Self {
+            self.stream_breaks = true;
+            self
         }
         /// Decode to an invoice demanding this much final CLTV.
         fn with_min_final_cltv(mut self, blocks: u32) -> Self {
@@ -669,6 +690,9 @@ mod tests {
         ) -> lightning_backend::Result<PaymentResult> {
             *self.cltv_limit.lock().unwrap() = cltv_limit;
             *self.paid.lock().unwrap() = true;
+            if self.stream_breaks {
+                return Err(LightningError::Backend("status: Unavailable".into()));
+            }
             match self.pay_preimage {
                 Some(preimage) => Ok(PaymentResult {
                     preimage,
@@ -1114,6 +1138,112 @@ mod tests {
             chain.broadcasts().is_empty(),
             "no on-chain claim when the invoice payment fails"
         );
+    }
+
+    /// The node accepted the payment and the update stream broke before it settled. That says
+    /// nothing about the payment, so the swap stays live and a later run claims once it settles.
+    #[tokio::test]
+    async fn a_payment_stream_that_breaks_after_submission_still_claims() {
+        use std::sync::Arc;
+        use swap_common::store::{JsonFileSwapStore, SwapRecord, SwapStore};
+        use swap_common::{NetworkSpec, SwapDirection};
+
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let ln = MockLn::new(ph, Some(preimage)).with_broken_stream();
+        let (swap, _) = make_swap(&ln).await;
+
+        let outpoint = funding_outpoint();
+        let swap_id = uuid::Uuid::new_v4();
+        let record = SwapRecord {
+            swap_id,
+            direction: SwapDirection::Submarine,
+            peer: "client".into(),
+            network: NetworkSpec::Regtest,
+            payment_hash_hex: hex::encode(swap.payment_hash),
+            onchain_amount_sat: ONCHAIN_SAT,
+            fee_rate_sat_vb: swap.fee_rate_sat_vb,
+            htlc_script_hex: hex::encode(swap.htlc_script.as_bytes()),
+            timeout_height: TIMEOUT,
+            secret_key_hex: hex::encode(swap.claim_key.secret_bytes()),
+            invoice: swap.invoice.clone(),
+            max_routing_fee_msat: swap.max_routing_fee_msat,
+            required_confirmations: 2,
+            funding_txid_hex: Some(outpoint.txid.to_string()),
+            funding_vout: Some(outpoint.vout),
+            state: SwapState::LockupConfirmed,
+            ..SwapRecord::new_progress()
+        };
+        let dir = std::env::temp_dir().join(format!("pubky-swap-broken-stream-{swap_id}"));
+        let store: Arc<dyn SwapStore> = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+        store.put(&record).unwrap();
+
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
+                outpoint,
+                value_sat: ONCHAIN_SAT,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        let run = |rec: SwapRecord| {
+            let store = store.clone();
+            let (ln, chain, wallet) = (&ln, &chain, &wallet);
+            async move {
+                let resumed = crate::submarine_swap_from_record(&rec, params()).unwrap();
+                let resume = rec.resume();
+                let already_paid = rec.invoice_pay_started_at_unix.is_some();
+                let progress = crate::StoreProgress {
+                    store,
+                    record: std::sync::Mutex::new(rec),
+                };
+                drive_submarine_swap(
+                    ln,
+                    chain,
+                    wallet,
+                    &resumed,
+                    2,
+                    Duration::ZERO,
+                    &resume,
+                    already_paid,
+                    &progress,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let first = run(record).await;
+        assert_eq!(first, SwapState::InvoicePending);
+        let rec = store.get(swap_id).unwrap().unwrap();
+        assert!(!rec.state.is_terminal());
+        assert!(rec.funds_at_risk());
+        assert_eq!(store.load_active().unwrap().len(), 1);
+        assert!(chain.broadcasts().is_empty());
+
+        // The payment settles after the stream is gone.
+        *ln.paid.lock().unwrap() = false;
+        *ln.status.lock().unwrap() = PaymentStatus::Succeeded(PaymentResult {
+            preimage,
+            fee_msat: 0,
+        });
+        let second = run(rec).await;
+
+        assert_eq!(second, SwapState::Claimed);
+        assert!(
+            !*ln.paid.lock().unwrap(),
+            "the invoice must not be paid twice"
+        );
+        let broadcasts = chain.broadcasts();
+        assert_eq!(broadcasts.len(), 1);
+        assert_eq!(
+            extract_preimage(&broadcasts[0], &outpoint, &ph),
+            Some(preimage)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A client that funds only a block or two before its own refund branch opens must not get

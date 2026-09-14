@@ -368,7 +368,12 @@ impl LightningBackend for LndBackend {
                 .map_err(|s| LightningError::Backend(s.to_string()))?;
             let payment = match update {
                 Some(p) => p,
-                None => return Err(LightningError::PaymentFailed("payment stream ended".into())),
+                // Not a failure: the stream closing says nothing about the payment it carried.
+                None => {
+                    return Err(LightningError::Backend(
+                        "payment stream ended before a final status".into(),
+                    ))
+                }
             };
             // lnrpc.Payment.PaymentStatus: UNKNOWN=0, IN_FLIGHT=1, SUCCEEDED=2, FAILED=3
             match payment.status {
