@@ -933,8 +933,10 @@ mod tests {
             let Provider {
                 endpoint,
                 mut requests,
+                ..
             } = Provider::start([22; 32], Default::default()).await;
-            let client = Provider::client_for(&endpoint, [21; 32]).await;
+            let client: crate::p2p::SessionRpcClient =
+                Provider::client_for(&endpoint, [21; 32]).await;
             tokio::spawn(async move {
                 while let Some(rpc) = requests.recv().await {
                     if verifier.verify(&rpc.request, &rpc.remote_key).await.is_ok() {

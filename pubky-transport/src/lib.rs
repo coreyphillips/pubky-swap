@@ -11,6 +11,7 @@ use pubky_messenger::PrivateMessengerClient;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -38,6 +39,9 @@ pub enum TransportError {
     /// iroh P2P rendezvous error (feature `iroh`; see [`p2p`]).
     #[error("iroh error: {0}")]
     Iroh(String),
+    /// A request that certainly never left this process, so it is safe to send it another way.
+    #[error("request not sent: {0}")]
+    NotSent(String),
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
@@ -184,6 +188,7 @@ pub struct Transport {
     known_peers: Arc<PeerSet>,
     /// Processed message IDs, for deduplication across polls.
     processed_messages: Arc<RwLock<HashSet<String>>>,
+    homeserver_requests: AtomicU64,
 }
 
 /// Soft cap on the dedup set so it cannot grow without bound over long sessions.
@@ -193,13 +198,27 @@ impl Transport {
     /// Sign into an existing account using its Ed25519 secret without deriving another key.
     /// The account must already be registered with a homeserver.
     pub async fn from_secret_key(secret: [u8; 32]) -> Result<Self> {
+        let transport = Self::unsigned(secret)?;
+        transport.sign_in().await?;
+        Ok(transport)
+    }
+
+    /// A transport for `secret` that has not contacted its homeserver. Sending and polling need
+    /// [`sign_in`](Self::sign_in) first, so a caller that may never use DMs can defer it.
+    pub fn unsigned(secret: [u8; 32]) -> Result<Self> {
         let messenger = PrivateMessengerClient::new(pkarr::Keypair::from_secret_key(&secret))
             .map_err(|error| TransportError::Messenger(format!("create messenger: {error}")))?;
-        messenger
+        Ok(Self::wrap(messenger))
+    }
+
+    /// Sign in to the account's homeserver.
+    pub async fn sign_in(&self) -> Result<()> {
+        self.count_homeserver_requests(1);
+        self.messenger
             .sign_in()
             .await
             .map_err(|error| TransportError::Messenger(format!("sign in: {error}")))?;
-        Ok(Self::wrap(messenger))
+        Ok(())
     }
 
     /// Create a transport from a Pubky recovery file + passphrase.
@@ -208,22 +227,18 @@ impl Transport {
         let messenger =
             PrivateMessengerClient::from_recovery_file(&recovery_bytes, Some(passphrase))
                 .map_err(|e| TransportError::Messenger(format!("create messenger: {e}")))?;
-        messenger
-            .sign_in()
-            .await
-            .map_err(|e| TransportError::Messenger(format!("sign in: {e}")))?;
-        Ok(Self::wrap(messenger))
+        let transport = Self::wrap(messenger);
+        transport.sign_in().await?;
+        Ok(transport)
     }
 
     /// Create a transport from a Pubky recovery phrase (+ optional passphrase).
     pub async fn from_recovery_phrase(mnemonic: &str, passphrase: Option<&str>) -> Result<Self> {
         let messenger = PrivateMessengerClient::from_recovery_phrase(mnemonic, passphrase, None)
             .map_err(|e| TransportError::Messenger(format!("create messenger: {e}")))?;
-        messenger
-            .sign_in()
-            .await
-            .map_err(|e| TransportError::Messenger(format!("sign in: {e}")))?;
-        Ok(Self::wrap(messenger))
+        let transport = Self::wrap(messenger);
+        transport.sign_in().await?;
+        Ok(transport)
     }
 
     fn wrap(messenger: PrivateMessengerClient) -> Self {
@@ -231,7 +246,30 @@ impl Transport {
             messenger,
             known_peers: Arc::new(PeerSet::default()),
             processed_messages: Arc::new(RwLock::new(HashSet::new())),
+            homeserver_requests: AtomicU64::new(0),
         }
+    }
+
+    /// Homeserver requests made by sign-in, sends and conversation reads, for comparing DM
+    /// negotiation with other transports. Sign-in and a send count one each; a conversation read
+    /// counts its two listings and one fetch per message returned.
+    pub fn homeserver_requests(&self) -> u64 {
+        self.homeserver_requests.load(Ordering::Relaxed)
+    }
+
+    fn count_homeserver_requests(&self, count: usize) {
+        self.homeserver_requests
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    async fn conversation(
+        &self,
+        peer: &PublicKey,
+    ) -> Result<Vec<pubky_messenger::DecryptedMessage>> {
+        let messages = self.messenger.get_messages(peer).await;
+        let fetched = messages.as_ref().map_or(0, Vec::len);
+        self.count_homeserver_requests(2 + fetched);
+        messages.map_err(|e| TransportError::Messenger(format!("get messages: {e}")))
     }
 
     /// This transport's own public key (pkarr) string.
@@ -320,6 +358,7 @@ impl Transport {
         let payload = serde_json::to_string(msg)?;
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
+        self.count_homeserver_requests(1);
         self.messenger
             .send_message(&peer, &payload)
             .await
@@ -346,11 +385,7 @@ impl Transport {
     pub async fn mark_conversation_seen(&self, peer_pkarr: &str) -> Result<usize> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
-        let messages = self
-            .messenger
-            .get_messages(&peer)
-            .await
-            .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
+        let messages = self.conversation(&peer).await?;
 
         let mut marked = 0;
         if let Ok(mut processed) = self.processed_messages.write() {
@@ -380,11 +415,7 @@ impl Transport {
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
-        let messages = self
-            .messenger
-            .get_messages(&peer)
-            .await
-            .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
+        let messages = self.conversation(&peer).await?;
 
         // Anything sent before this peer joined the poll set belongs to a conversation that had
         // already ended.

@@ -115,10 +115,16 @@ struct Cli {
 
     /// Do not ring the provider's iroh P2P rendezvous (doorbell) before negotiating.
     ///
-    /// Ringing is on by default: a provider that has never heard of you cannot find your quote
-    /// request otherwise. Only worth turning off for a provider you know already follows you.
+    /// Ringing is on by default: a provider that has never heard of you cannot find a DM quote
+    /// request otherwise. Only worth turning off for a provider you know already follows you. It
+    /// does not stop requests over iroh; `--negotiation dm` does.
     #[arg(long)]
     no_rendezvous_iroh: bool,
+
+    /// Transport for requests to the provider: `auto` (iroh when the provider supports it, Pubky
+    /// DMs otherwise), `iroh` (never DMs), or `dm` (never iroh).
+    #[arg(long)]
+    negotiation: Option<String>,
 
     /// Drive any swaps a previous run left in flight, then exit without starting a new one.
     ///
@@ -184,6 +190,8 @@ struct Overrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     rendezvous_iroh: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    negotiation: Option<swap_client::negotiate::Negotiation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     resume_only: Option<bool>,
 }
 
@@ -232,6 +240,7 @@ impl Cli {
             // configuration layers alone, which is what `flag` exists for, and only `--no-...`
             // has anything to say.
             rendezvous_iroh: self.no_rendezvous_iroh.then_some(false),
+            negotiation: self.negotiation.as_deref().map(str::parse).transpose()?,
             resume_only: flag(self.resume_only),
         })
     }

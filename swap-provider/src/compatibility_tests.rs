@@ -534,3 +534,197 @@ fn negotiation_only_providers_do_not_advertise_execution_capabilities() {
         .iter()
         .any(|feature| feature == "swap-status-v1"));
 }
+
+#[cfg(feature = "iroh")]
+mod direct_requests {
+    use super::*;
+    use pubky_transport::p2p::DirectRpc;
+
+    fn context(store: Arc<JsonFileSwapStore>, swap_id: Uuid) -> ExecCtx {
+        let config = ProviderConfig::default();
+        let transport = Transport::unsigned([40; 32]).unwrap();
+        ExecCtx {
+            transport: Arc::new(ReplyTransport::direct(transport)),
+            ln: Arc::new(IntentLightning::new(store.clone(), swap_id)),
+            chain: None,
+            wallet: None,
+            network: Network::Regtest,
+            required_confirmations: config.required_confirmations,
+            timelock: timelock_params(&config),
+            onchain_fee_rate_sat_vb: 2,
+            invoice_expiry_secs: config.invoice_expiry_secs,
+            max_routing_fee_msat: config.max_routing_fee_msat,
+            quote_ttl_secs: config.quote_ttl_secs,
+            quotes: Arc::new(Mutex::new(HashMap::new())),
+            store,
+            risk: risk::RiskManager::new(risk_limits(&config)),
+            min_onchain_reserve_sat: 0,
+            // Nothing new may start: every reply below comes from what is already persisted.
+            capable: false,
+        }
+    }
+
+    fn offer() -> SharedOffer {
+        let offer = build_offer(
+            &ProviderConfig::default(),
+            &pubky_transport::identity_from_secret(&[40; 32]),
+            Network::Regtest,
+            None,
+            2,
+            true,
+        )
+        .unwrap();
+        Arc::new(RwLock::new(Some(offer)))
+    }
+
+    /// Send one request as `remote_key` would arrive over the direct protocol.
+    async fn ask(ctx: &ExecCtx, remote_key: &str, message: SwapMessage) -> Option<SwapMessage> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = DirectRpc {
+            remote_key: remote_key.into(),
+            message: serde_json::to_value(message).unwrap(),
+            reply,
+        };
+        handle_direct_request(ctx.clone(), offer(), request).await;
+        let bytes = answer.await.ok()?;
+        Some(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn owned_record(owner: &str) -> SwapRecord {
+        let mut record = accepted_record(SwapDirection::Reverse, SwapScript::TaprootBoltz);
+        record.peer = owner.into();
+        record.swap_request.as_mut().unwrap().client_pkarr = owner.into();
+        record
+    }
+
+    #[tokio::test]
+    async fn a_creation_made_over_dms_is_recovered_over_a_direct_request_after_restart() {
+        let directory = std::env::temp_dir().join(format!("direct-replay-{}", Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[41; 32]);
+        let record = owned_record(&owner);
+        let request = record.swap_request.clone().unwrap();
+        JsonFileSwapStore::new(&directory)
+            .unwrap()
+            .put(&record)
+            .unwrap();
+
+        // A provider that restarted: a fresh store and no in-memory quotes.
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let ctx = context(store.clone(), record.swap_id);
+        let replay = ask(&ctx, &owner, SwapMessage::SwapRequest(request.clone())).await;
+        let Some(SwapMessage::SwapAccept(accept)) = replay else {
+            panic!("expected the original acceptance, got {replay:?}");
+        };
+        assert_eq!(
+            serde_json::to_value(&accept).unwrap(),
+            serde_json::to_value(&record.swap_accept).unwrap()
+        );
+        // Replaying created nothing.
+        assert_eq!(store.load_all_checked().unwrap().len(), 1);
+
+        let status = SwapStatusRequest {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: None,
+            quote_id: Some(request.quote_id),
+        };
+        let reply = ask(&ctx, &owner, SwapMessage::SwapStatusRequest(status.clone())).await;
+        let Some(SwapMessage::SwapStatusSnapshot(snapshot)) = reply else {
+            panic!("expected a status snapshot, got {reply:?}");
+        };
+        assert_eq!(snapshot.request_id, status.request_id);
+        assert_eq!(snapshot.accept.swap_id, record.swap_id);
+
+        // Another root key learns nothing about it, even when it names the owner in the request.
+        let stranger = pubky_transport::identity_from_secret(&[42; 32]);
+        let reply = ask(&ctx, &stranger, SwapMessage::SwapStatusRequest(status)).await;
+        assert!(
+            matches!(&reply, Some(SwapMessage::Reject(r)) if r.code.as_deref() == Some("not_found")),
+            "{reply:?}"
+        );
+        let reply = ask(&ctx, &stranger, SwapMessage::SwapRequest(request)).await;
+        assert!(matches!(reply, Some(SwapMessage::Reject(_))), "{reply:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_root_key_cannot_reach_a_swap_made_under_a_scoped_session() {
+        let directory = std::env::temp_dir().join(format!("direct-session-{}", Uuid::new_v4()));
+        let key = pubky_transport::identity_from_secret(&[43; 32]);
+        let mut record = owned_record(&key);
+        record.peer_account = Some("ring-account".into());
+        record.peer_authorization_scope = Some("/pub/bitkit.to/bitkit/wallet/".into());
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        store.put(&record).unwrap();
+        let ctx = context(store, record.swap_id);
+
+        let status = SwapStatusRequest {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: Some(record.swap_id),
+            quote_id: None,
+        };
+        let reply = ask(&ctx, &key, SwapMessage::SwapStatusRequest(status)).await;
+        assert!(
+            matches!(&reply, Some(SwapMessage::Reject(r)) if r.code.as_deref() == Some("not_found")),
+            "{reply:?}"
+        );
+        let request = record.swap_request.clone().unwrap();
+        let reply = ask(&ctx, &key, SwapMessage::SwapRequest(request)).await;
+        assert!(matches!(reply, Some(SwapMessage::Reject(_))), "{reply:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_requests_quote_for_their_key_and_refuse_provider_messages() {
+        let directory = std::env::temp_dir().join(format!("direct-quote-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let ctx = context(store, Uuid::new_v4());
+        let client = pubky_transport::identity_from_secret(&[44; 32]);
+
+        let request_id = Some(Uuid::new_v4());
+        let reply = ask(
+            &ctx,
+            &client,
+            SwapMessage::OfferRequest(OfferRequest { request_id }),
+        )
+        .await;
+        assert!(
+            matches!(&reply, Some(SwapMessage::Offer(o)) if o.request_id == request_id
+                && o.features.iter().any(|f| f == "direct-rpc-v1")),
+            "{reply:?}"
+        );
+
+        let quote = QuoteRequest {
+            request_id,
+            offer_id: Uuid::nil(),
+            client_pkarr: client.clone(),
+            direction: SwapDirection::Reverse,
+            amount_sat: 100_000,
+            protocol_version: PROTOCOL_VERSION,
+            features: Vec::new(),
+        };
+        let reply = ask(&ctx, &client, SwapMessage::QuoteRequest(quote.clone())).await;
+        let Some(SwapMessage::Quote(issued)) = reply else {
+            panic!("expected a quote, got {reply:?}");
+        };
+        assert_eq!(issued.request_id, request_id);
+        assert!(same_pubky_quote(&ctx, issued.quote_id, &client).await);
+
+        // A request naming somebody else's key is refused.
+        let other = pubky_transport::identity_from_secret(&[45; 32]);
+        let reply = ask(&ctx, &other, SwapMessage::QuoteRequest(quote)).await;
+        assert!(matches!(reply, Some(SwapMessage::Reject(_))), "{reply:?}");
+
+        // Only customer requests are handled; anything else gets no reply at all.
+        let reply = ask(&ctx, &client, SwapMessage::Quote(issued)).await;
+        assert!(reply.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    async fn same_pubky_quote(ctx: &ExecCtx, quote_id: Uuid, peer: &str) -> bool {
+        ctx.quotes
+            .lock()
+            .await
+            .get(&quote_id)
+            .is_some_and(|quote| quote.peer == peer)
+    }
+}
