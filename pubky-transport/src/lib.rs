@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
 
+mod inbox;
+
 #[cfg(feature = "iroh")]
 pub mod p2p;
 
@@ -105,6 +107,18 @@ impl PeerSet {
         }
     }
 
+    /// Polled peers by canonical key, since a peer may be tracked under a prefixed spelling.
+    fn canonical_keys(&self) -> HashSet<String> {
+        self.peers
+            .read()
+            .map(|p| {
+                p.keys()
+                    .map(|k| canonical_pubky(k).unwrap_or_else(|_| k.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn all(&self) -> Vec<String> {
         self.peers
             .read()
@@ -182,12 +196,24 @@ pub struct Transport {
     messenger: PrivateMessengerClient,
     /// Peers to poll for messages (a coordinator/provider polls all known peers).
     known_peers: Arc<PeerSet>,
-    /// Processed message IDs, for deduplication across polls.
-    processed_messages: Arc<RwLock<HashSet<String>>>,
+    /// What has been delivered and acknowledged, per peer.
+    inboxes: inbox::Inboxes,
 }
 
-/// Soft cap on the dedup set so it cannot grow without bound over long sessions.
-const MAX_PROCESSED_IDS: usize = 10_000;
+/// A message returned by [`Transport::poll_from`] or [`Transport::poll_all`].
+#[derive(Debug, Clone)]
+pub struct Inbound<M> {
+    pub peer: String,
+    pub message: M,
+    pub receipt: Receipt,
+}
+
+/// Identifies a delivered message for [`Transport::acknowledge`].
+#[derive(Debug, Clone)]
+pub struct Receipt {
+    peer: PublicKey,
+    id: pubky_messenger::MessageId,
+}
 
 impl Transport {
     /// Sign into an existing account using its Ed25519 secret without deriving another key.
@@ -227,10 +253,12 @@ impl Transport {
     }
 
     fn wrap(messenger: PrivateMessengerClient) -> Self {
+        let known_peers = Arc::new(PeerSet::default());
+        let polled = known_peers.clone();
         Self {
             messenger,
-            known_peers: Arc::new(PeerSet::default()),
-            processed_messages: Arc::new(RwLock::new(HashSet::new())),
+            known_peers,
+            inboxes: inbox::Inboxes::sparing(move || polled.canonical_keys()),
         }
     }
 
@@ -327,165 +355,145 @@ impl Transport {
         Ok(())
     }
 
-    /// Receive and deserialize new (non-duplicate) messages from a specific peer.
+    /// Treat everything already in a conversation as read, without downloading any of it.
     ///
-    /// Messages that fail to deserialize into `M` are skipped (they may be a different
-    /// message type from the same peer); they are not marked processed, so a caller
-    /// expecting a different type can still read them.
-    /// Treat everything already in a conversation as read, without parsing any of it.
-    ///
-    /// A conversation lives on the homeserver and is returned in full on every poll; the dedup set
-    /// that stops a message being handled twice lives in this process and starts empty. So a fresh
-    /// process reads the whole history and hands the caller messages from previous runs. For a
-    /// request/response exchange that is not a stale duplicate, it is a wrong answer: a client that
+    /// A fresh process has no receive state for a conversation that already has a history on the
+    /// homeserver. For a request/response exchange, that history is a wrong answer: a client that
     /// asked a provider for a price yesterday, and asks again today, is handed yesterday's quote
     /// and refuses it as expired, having never seen the reply to the question it actually asked.
     ///
-    /// Call this immediately before sending a request. Anything already in the conversation is,
-    /// by definition, not the answer to a question that has not been asked yet.
+    /// Call this immediately before sending a request. It only lists the conversation, and a reply
+    /// can only be written after the request it answers, so it cannot hide that reply.
     pub async fn mark_conversation_seen(&self, peer_pkarr: &str) -> Result<usize> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
-        let messages = self
-            .messenger
-            .get_messages(&peer)
-            .await
-            .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
-
-        let mut marked = 0;
-        if let Ok(mut processed) = self.processed_messages.write() {
-            for msg in &messages {
-                if processed.len() >= MAX_PROCESSED_IDS {
-                    processed.clear();
-                }
-                if processed.insert(Self::message_id(peer_pkarr, msg)) {
-                    marked += 1;
-                }
-            }
-        }
+        let marked = self
+            .inboxes
+            .acknowledge_listed(&self.messenger, &peer)
+            .await?;
         debug!("marked {marked} existing message(s) from {peer_pkarr} as already seen");
         Ok(marked)
     }
 
-    /// The identity of a message, for deduplication.
-    fn message_id(peer_pkarr: &str, msg: &pubky_messenger::DecryptedMessage) -> String {
-        format!(
-            "{}-{}-{}",
-            peer_pkarr,
-            msg.timestamp,
-            blake3::hash(msg.content.as_bytes()).to_hex()
-        )
+    /// Receive, deserialize and acknowledge new messages from a specific peer.
+    ///
+    /// Acknowledging on receipt suits a caller that has nothing to redo if it stops before acting
+    /// on a message. One that does should use [`poll_from`](Self::poll_from) and acknowledge after
+    /// dispatch.
+    pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
+        let inbound = self.poll_from(peer_pkarr).await?;
+        let mut messages = Vec::with_capacity(inbound.len());
+        for m in inbound {
+            self.acknowledge(&m.receipt).await;
+            messages.push(m.message);
+        }
+        Ok(messages)
     }
 
-    pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
+    /// Messages from a peer that have not been acknowledged, oldest first.
+    ///
+    /// A message is returned by every poll until [`acknowledge`](Self::acknowledge) is called with
+    /// its receipt. Only the first delivery downloads it. Messages that do not deserialize into `M`
+    /// are acknowledged here.
+    pub async fn poll_from<M: DeserializeOwned>(
+        &self,
+        peer_pkarr: &str,
+    ) -> Result<Vec<Inbound<M>>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
-        let messages = self
-            .messenger
-            .get_messages(&peer)
-            .await
-            .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
 
         // Anything sent before this peer joined the poll set belongs to a conversation that had
         // already ended.
         //
-        // A conversation lives on the homeserver and comes back in full on every poll, while the
-        // set that stops a message being handled twice lives in this process and starts empty. A
-        // provider that restarted, or that added a returning peer when it rang the doorbell, read
-        // that peer's entire history and answered every request in it again: one quote request
-        // drew nine quotes, eight of them for amounts nobody was asking about any more, with the
-        // real answer somewhere in the middle. The client refuses a quote whose amount does not
-        // match, so this cost correctness rather than money, but it made a swap after any restart
-        // a matter of luck.
+        // Receive state lives in this process and starts empty, so a provider that restarted, or
+        // that dropped a returning peer's state, would otherwise read that peer's whole history
+        // and answer every request in it again: one quote request drew nine quotes, eight of them
+        // for amounts nobody was asking about any more. The client refuses a quote whose amount
+        // does not match, so this cost correctness rather than money, but it made a swap after any
+        // restart a matter of luck.
         //
         // Discarding them loses nothing: a client waits thirty seconds for a reply before giving
         // up, and a quote expires within minutes, so a message that predates our interest in this
-        // peer has nobody left listening for its answer.
+        // peer has nobody left listening for its answer. A swap that was accepted is recovered
+        // from the provider's store by a status request, not by rereading the message.
         let floor = self
             .known_peers
             .polling_from(peer_pkarr)
             .map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
 
-        let mut parsed = Vec::new();
-        for msg in messages {
-            if let Some(floor) = floor {
-                if msg.timestamp < floor {
-                    continue;
-                }
-            }
-            let message_id = Self::message_id(peer_pkarr, &msg);
-
-            let is_duplicate = self
-                .processed_messages
-                .read()
-                .map(|p| p.contains(&message_id))
-                .unwrap_or(false);
-            if is_duplicate {
-                continue;
-            }
-
-            match serde_json::from_str::<M>(&msg.content) {
-                Ok(parsed_msg) => {
-                    if let Ok(mut processed) = self.processed_messages.write() {
-                        if processed.len() >= MAX_PROCESSED_IDS {
-                            debug!("processed_messages cap reached; clearing dedup set");
-                            processed.clear();
-                        }
-                        processed.insert(message_id);
-                    }
+        let delivered = self.inboxes.poll(&self.messenger, &peer, floor).await?;
+        let mut parsed = Vec::with_capacity(delivered.len());
+        for d in delivered {
+            match serde_json::from_str::<M>(&d.message.content) {
+                Ok(message) => {
                     self.add_known_peer(peer_pkarr.to_string());
-                    parsed.push(parsed_msg);
+                    parsed.push(Inbound {
+                        peer: peer_pkarr.to_string(),
+                        message,
+                        receipt: Receipt {
+                            peer: peer.clone(),
+                            id: d.id,
+                        },
+                    });
                 }
                 Err(e) => {
-                    // Mark it seen anyway. Deserialization is deterministic, so a message that
-                    // does not parse now will not parse on the next poll either, and leaving it
-                    // unmarked meant re-fetching and re-failing on it forever. That is the shape
-                    // a counterparty running something newer takes: one message this build does
-                    // not understand, retried until the peer is evicted.
+                    // Deserialization is deterministic, so a message that does not parse now will
+                    // not parse on the next poll either. That is the shape a counterparty running
+                    // something newer takes: one message this build does not understand.
                     warn!(
                         "discarding a message from {peer_pkarr} that this build cannot parse \
                          ({e}); the sender may be running a newer protocol"
                     );
-                    if let Ok(mut processed) = self.processed_messages.write() {
-                        if processed.len() >= MAX_PROCESSED_IDS {
-                            processed.clear();
-                        }
-                        processed.insert(message_id);
-                    }
+                    self.inboxes.acknowledge(&peer, &[d.id]).await;
                 }
             }
         }
         Ok(parsed)
     }
 
-    /// Receive new messages from all known peers concurrently.
-    pub async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
+    /// Stop delivering a message returned by [`poll_from`](Self::poll_from) or
+    /// [`poll_all`](Self::poll_all).
+    pub async fn acknowledge(&self, receipt: &Receipt) {
+        self.inboxes
+            .acknowledge(&receipt.peer, std::slice::from_ref(&receipt.id))
+            .await;
+    }
+
+    /// Unacknowledged messages from all known peers, polled concurrently.
+    pub async fn poll_all<M: DeserializeOwned>(&self) -> Result<Vec<Inbound<M>>> {
         use futures::future::join_all;
 
         let peers = self.get_known_peers();
-        if peers.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let futures = peers.iter().map(|peer| {
-            let peer = peer.clone();
-            async move {
-                let res = self.receive_from::<M>(&peer).await;
-                (peer, res)
-            }
+        let polls = peers.iter().map(|peer| async move {
+            let res = self.poll_from::<M>(peer).await;
+            (peer, res)
         });
 
         let mut all = Vec::new();
-        for (peer, res) in join_all(futures).await {
+        for (peer, res) in join_all(polls).await {
             match res {
-                Ok(msgs) => all.extend(msgs.into_iter().map(|m| (peer.clone(), m))),
+                Ok(msgs) => all.extend(msgs),
                 Err(e) => debug!("failed to receive from {peer}: {e}"),
             }
         }
         Ok(all)
     }
 
-    /// Delete all messages exchanged with a peer (cleanup), and forget their dedup ids.
+    /// Receive and acknowledge new messages from all known peers concurrently.
+    pub async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
+        let inbound = self.poll_all::<M>().await?;
+        let mut all = Vec::with_capacity(inbound.len());
+        for m in inbound {
+            self.acknowledge(&m.receipt).await;
+            all.push((m.peer, m.message));
+        }
+        Ok(all)
+    }
+
+    /// Delete this side's messages in a conversation with a peer (cleanup).
+    ///
+    /// Receive state needs no change: acknowledgements for deleted messages drop out at the next
+    /// listing.
     pub async fn clear_messages_with_peer(&self, peer_pkarr: &str) -> Result<()> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
@@ -493,9 +501,6 @@ impl Transport {
             .clear_messages(&peer)
             .await
             .map_err(|e| TransportError::Messenger(format!("clear messages: {e}")))?;
-        if let Ok(mut processed) = self.processed_messages.write() {
-            processed.retain(|id| !id.starts_with(&format!("{peer_pkarr}-")));
-        }
         Ok(())
     }
 
@@ -505,9 +510,6 @@ impl Transport {
             if let Err(e) = self.clear_messages_with_peer(&peer).await {
                 warn!("failed to clear messages with {peer}: {e}");
             }
-        }
-        if let Ok(mut processed) = self.processed_messages.write() {
-            processed.clear();
         }
         Ok(())
     }
@@ -684,6 +686,14 @@ mod tests {
         set.touch_or_add("a".into(), false);
         // A just-added peer is not idle for an hour.
         assert!(set.idle_unpinned(Duration::from_secs(3600)).is_empty());
+    }
+
+    #[test]
+    fn prefixed_peers_are_protected_under_their_canonical_key() {
+        let key = pkarr::Keypair::random().public_key().to_string();
+        let set = PeerSet::default();
+        set.touch_or_add(format!("pk:{key}"), false);
+        assert!(set.canonical_keys().contains(&key));
     }
 
     #[test]
