@@ -137,36 +137,33 @@ impl Inboxes {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         slots.clock += 1;
         let now = slots.clock;
-        if let Some(slot) = slots.by_peer.get_mut(peer) {
-            slot.last_used = now;
-            return slot.inbox.clone();
-        }
-        if slots.by_peer.len() >= MAX_RETAINED_INBOXES {
+        let slot = slots
+            .by_peer
+            .entry(peer.to_string())
+            .or_insert_with(|| Slot {
+                inbox: Arc::default(),
+                last_used: now,
+            });
+        slot.last_used = now;
+        let inbox = slot.inbox.clone();
+        if slots.by_peer.len() > MAX_RETAINED_INBOXES {
             let polled = (self.polled)();
-            // Trim to below the cap, which polled peers may have pushed it past. An inbox in use
-            // is shared with the caller holding it; dropping ours only means the next caller
-            // starts a fresh one.
-            while slots.by_peer.len() >= MAX_RETAINED_INBOXES {
+            // Trim to the cap, which polled peers may have pushed it past, on every access so it
+            // is restored once they leave. An inbox in use is shared with the caller holding it;
+            // dropping ours only means the next caller starts a fresh one.
+            while slots.by_peer.len() > MAX_RETAINED_INBOXES {
                 let Some(oldest) = slots
                     .by_peer
                     .iter()
-                    .filter(|(peer, _)| !polled.contains(*peer))
+                    .filter(|(other, _)| other.as_str() != peer && !polled.contains(*other))
                     .min_by_key(|(_, slot)| slot.last_used)
-                    .map(|(peer, _)| peer.clone())
+                    .map(|(other, _)| other.clone())
                 else {
                     break;
                 };
                 slots.by_peer.remove(&oldest);
             }
         }
-        let inbox = Arc::new(AsyncMutex::new(Inbox::default()));
-        slots.by_peer.insert(
-            peer.to_string(),
-            Slot {
-                inbox: inbox.clone(),
-                last_used: now,
-            },
-        );
         inbox
     }
 
@@ -786,6 +783,24 @@ mod tests {
         polled.lock().unwrap().clear();
         inboxes.inbox("newcomer");
         assert_eq!(inboxes.retained(), MAX_RETAINED_INBOXES);
+    }
+
+    #[test]
+    fn the_cap_is_restored_by_a_known_peer_once_polled_peers_leave() {
+        let polled = Arc::new(Mutex::new(HashSet::new()));
+        let inboxes = Inboxes::sparing({
+            let polled = polled.clone();
+            move || polled.lock().unwrap().clone()
+        });
+        for i in 0..MAX_RETAINED_INBOXES + 10 {
+            let peer = format!("peer-{i}");
+            polled.lock().unwrap().insert(peer.clone());
+            inboxes.inbox(&peer);
+        }
+        polled.lock().unwrap().clear();
+        let kept = inboxes.inbox("peer-0");
+        assert_eq!(inboxes.retained(), MAX_RETAINED_INBOXES);
+        assert!(Arc::ptr_eq(&kept, &inboxes.inbox("peer-0")));
     }
 
     #[tokio::test(start_paused = true)]
