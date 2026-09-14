@@ -12,8 +12,8 @@
 //!   acknowledges it after dispatch;
 //! - acknowledged: never downloaded again while it stays listed.
 //!
-//! Receive state lives in memory. A restarted process, or a peer whose inbox was dropped to keep
-//! retention bounded, downloads that peer's side of the conversation once more. What it may act on
+//! Receive state lives in memory. A restarted process, or a returning peer whose inbox was dropped
+//! to keep retention bounded, downloads that peer's side of the conversation once more. What it may act on
 //! is then decided by the caller's timestamp floor (when the peer joined the poll set), not by what
 //! this module remembers, so losing the state costs requests and never revives stale work.
 //!
@@ -33,7 +33,8 @@ use tracing::debug;
 use crate::{Result, TransportError};
 
 /// Inboxes kept for peers, including ones no longer polled. A returning peer whose inbox was kept
-/// costs a listing rather than a download of its whole history. Dropping one is always safe.
+/// costs a listing rather than a download of its whole history. Inboxes of polled peers are never
+/// dropped, so the cap can be exceeded.
 pub(crate) const MAX_RETAINED_INBOXES: usize = 1024;
 
 /// The part of the messenger an inbox needs, so the delivery rules can be tested without a
@@ -110,12 +111,27 @@ struct Slots {
     clock: u64,
 }
 
-#[derive(Default)]
 pub(crate) struct Inboxes {
     slots: Mutex<Slots>,
+    /// Whether a peer is still polled. Its inbox is never dropped: the caller's floor for it is
+    /// when it joined, so a fresh inbox would deliver everything it acknowledged since.
+    polled: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+impl Default for Inboxes {
+    fn default() -> Self {
+        Self::sparing(|_| false)
+    }
 }
 
 impl Inboxes {
+    pub(crate) fn sparing(polled: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            slots: Mutex::default(),
+            polled: Box::new(polled),
+        }
+    }
+
     fn inbox(&self, peer: &str) -> Arc<AsyncMutex<Inbox>> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         slots.clock += 1;
@@ -130,6 +146,7 @@ impl Inboxes {
             if let Some(oldest) = slots
                 .by_peer
                 .iter()
+                .filter(|(peer, _)| !(self.polled)(peer))
                 .min_by_key(|(_, slot)| slot.last_used)
                 .map(|(peer, _)| peer.clone())
             {
@@ -172,8 +189,11 @@ impl Inboxes {
         let Discovery { pending, failures } = mailbox.discover(peer, &mut inbox.state).await?;
         log_failures(peer, &failures);
 
-        let listed: HashSet<&MessageId> = pending.iter().map(|p| &p.id).collect();
-        inbox.delivered.retain(|id, _| listed.contains(id));
+        // A directory that failed to list says nothing about whether its messages still exist.
+        if failures.is_empty() {
+            let listed: HashSet<&MessageId> = pending.iter().map(|p| &p.id).collect();
+            inbox.delivered.retain(|id, _| listed.contains(id));
+        }
 
         let mut order = Vec::new();
         let mut fetch = Vec::new();
@@ -731,6 +751,23 @@ mod tests {
             inboxes.inbox(&format!("peer-{i}"));
         }
         assert_eq!(inboxes.retained(), MAX_RETAINED_INBOXES);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_polled_peer_keeps_its_inbox_past_the_cap() {
+        let p = pair();
+        let client = p.client.key.public_key().to_string();
+        let inboxes = Inboxes::sparing(move |peer| peer == client);
+        p.conversation.publish(&p.client.key, 100, "quote request");
+        poll_and_ack(&inboxes, &p.provider, &p.client, Some(0)).await;
+
+        for i in 0..MAX_RETAINED_INBOXES + 10 {
+            inboxes.inbox(&format!("peer-{i}"));
+        }
+
+        assert!(poll_and_ack(&inboxes, &p.provider, &p.client, Some(0))
+            .await
+            .is_empty());
     }
 
     /// Requests and simulated time for repeated swaps between the same client and provider, as the

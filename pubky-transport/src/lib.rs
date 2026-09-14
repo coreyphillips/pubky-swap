@@ -241,10 +241,12 @@ impl Transport {
     }
 
     fn wrap(messenger: PrivateMessengerClient) -> Self {
+        let known_peers = Arc::new(PeerSet::default());
+        let polled = known_peers.clone();
         Self {
             messenger,
-            known_peers: Arc::new(PeerSet::default()),
-            inboxes: inbox::Inboxes::default(),
+            known_peers,
+            inboxes: inbox::Inboxes::sparing(move |peer| polled.polling_from(peer).is_some()),
         }
     }
 
