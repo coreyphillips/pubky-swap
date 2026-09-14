@@ -990,19 +990,24 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     info!("Provider running; waiting for quote/swap requests...");
     loop {
         let messages = transport
-            .receive_all::<SwapMessage>()
+            .poll_all::<SwapMessage>()
             .await
             .unwrap_or_default();
-        for (sender, msg) in messages {
+        for inbound in messages {
             // No offer yet means the daemon is still working out what it can serve. Nothing to
-            // quote against, so nothing to answer; the message stays unprocessed and comes round
-            // again on the next poll.
+            // quote against, so nothing to answer; the message stays unacknowledged and comes
+            // round again on the next poll.
             let Some(current) = offer.read().await.clone() else {
                 continue;
             };
-            if let Err(e) = handle_message(&ctx, &current, &sender, msg).await {
+            let sender = &inbound.peer;
+            // Acknowledged whether or not handling succeeded. Most errors would recur on every
+            // retry, and a swap request that was accepted is replayed from the store if the
+            // client asks again.
+            if let Err(e) = handle_message(&ctx, &current, sender, inbound.message).await {
                 warn!("error handling message from {sender}: {e}");
             }
+            transport.acknowledge(&inbound.receipt).await;
         }
         sleep(Duration::from_millis(200)).await;
     }
