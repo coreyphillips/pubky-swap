@@ -926,6 +926,41 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn an_open_connection_does_not_extend_authorization() {
+            use crate::p2p::fixture::Provider;
+            let homeserver = Homeserver::start().await;
+            let verifier = homeserver.verifier();
+            let Provider {
+                endpoint,
+                mut requests,
+            } = Provider::start([22; 32], Default::default()).await;
+            let client = Provider::client_for(&endpoint, [21; 32]).await;
+            tokio::spawn(async move {
+                while let Some(rpc) = requests.recv().await {
+                    if verifier.verify(&rpc.request, &rpc.remote_key).await.is_ok() {
+                        let _ = rpc.reply.send(b"authorized".to_vec());
+                    }
+                }
+            });
+            let request = homeserver.request();
+            let now = now_unix().unwrap();
+            let valid = now + AUTHORIZATION_LIFETIME;
+
+            homeserver.authorize(&homeserver.provider, valid);
+            assert_eq!(client.request(&request).await.unwrap(), b"authorized");
+            homeserver.remove();
+            assert!(client.request(&request).await.is_err());
+            homeserver.authorize(&homeserver.provider, now);
+            assert!(client.request(&request).await.is_err());
+            homeserver.authorize(&homeserver.provider, valid);
+            assert_eq!(client.request(&request).await.unwrap(), b"authorized");
+            // Every decision above was made over the same connection.
+            assert_eq!(client.connections_established(), 1);
+            client.close().await;
+            endpoint.close().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn dropping_the_verifier_closes_its_connections() {
             let homeserver = Homeserver::start().await;
             homeserver.authorize(&homeserver.provider, now_unix().unwrap() + 60);
