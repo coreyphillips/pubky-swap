@@ -17,7 +17,7 @@ use lightning_backend::{LightningBackend, LndConfig};
 use pubky_transport::Transport;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
 use swap_common::store::{JsonFileSwapStore, Resume};
@@ -26,7 +26,7 @@ use swap_common::validate::{self, ClientPolicy, DecodedHoldInvoice};
 use swap_common::wallet::OnchainWallet;
 use swap_common::{messages::*, SwapDirection, SwapState};
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::reverse::{execute_reverse_swap, ReverseClaim};
@@ -1083,20 +1083,42 @@ async fn await_message<F, T>(
     transport: &Transport,
     provider: &str,
     timeout_secs: u64,
-    mut extract: F,
+    extract: F,
 ) -> Result<T>
 where
     F: FnMut(SwapMessage) -> Option<T>,
 {
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    poll_until(
+        deadline,
+        || transport.receive_from::<SwapMessage>(provider),
+        extract,
+    )
+    .await
+}
+
+async fn poll_until<R, Fut, F, T>(
+    deadline: tokio::time::Instant,
+    mut read: R,
+    mut extract: F,
+) -> Result<T>
+where
+    R: FnMut() -> Fut,
+    Fut: std::future::Future<Output = pubky_transport::Result<Vec<SwapMessage>>>,
+    F: FnMut(SwapMessage) -> Option<T>,
+{
+    let timed_out = || anyhow!("timed out waiting for provider response");
     loop {
-        if Instant::now() > deadline {
-            return Err(anyhow!("timed out waiting for provider response"));
-        }
-        let msgs = transport
-            .receive_from::<SwapMessage>(provider)
-            .await
-            .unwrap_or_default();
+        // The deadline bounds the read itself, not just the gaps between reads: a stalled
+        // homeserver would otherwise hold the wait open for as long as it liked.
+        let msgs = match tokio::time::timeout_at(deadline, read()).await {
+            Ok(Ok(msgs)) => msgs,
+            Ok(Err(e)) => {
+                debug!("reading from the provider failed, retrying: {e}");
+                Vec::new()
+            }
+            Err(_) => return Err(timed_out()),
+        };
         for m in msgs {
             if let SwapMessage::Reject(r) = &m {
                 return Err(anyhow!("provider rejected: {}", r.reason));
@@ -1105,6 +1127,66 @@ where
                 return Ok(t);
             }
         }
-        sleep(Duration::from_millis(500)).await;
+        if tokio::time::timeout_at(deadline, sleep(Duration::from_millis(500)))
+            .await
+            .is_err()
+        {
+            return Err(timed_out());
+        }
+    }
+}
+
+#[cfg(test)]
+mod await_tests {
+    use super::*;
+    use std::cell::Cell;
+    use swap_common::messages::Reject;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_read_cannot_outlast_the_deadline() {
+        let start = tokio::time::Instant::now();
+        let result: Result<()> = poll_until(
+            start + Duration::from_secs(30),
+            std::future::pending,
+            |_| None,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_reads_are_retried() {
+        let start = tokio::time::Instant::now();
+        let reads = Cell::new(0);
+        let result: Result<()> = poll_until(
+            start + Duration::from_secs(30),
+            || {
+                reads.set(reads.get() + 1);
+                let n = reads.get();
+                async move {
+                    if n < 3 {
+                        Err(pubky_transport::TransportError::Messenger(
+                            "unavailable".into(),
+                        ))
+                    } else {
+                        Ok(vec![SwapMessage::Reject(Reject {
+                            code: None,
+                            request_id: None,
+                            swap_id: None,
+                            quote_id: None,
+                            reason: "no".into(),
+                        })])
+                    }
+                }
+            },
+            |_| None,
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("provider rejected"));
+        assert_eq!(reads.get(), 3);
     }
 }

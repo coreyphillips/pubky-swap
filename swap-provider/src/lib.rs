@@ -18,6 +18,7 @@ compile_error!(
      reached by pubkys it already follows."
 );
 
+mod dispatch;
 pub mod preflight;
 pub mod pricing;
 pub(crate) mod recovery;
@@ -41,7 +42,7 @@ use bitcoin::{Network, OutPoint, PublicKey, Txid};
 #[cfg(feature = "lnd")]
 use lightning_backend::LndBackend;
 use lightning_backend::{LightningBackend, LndConfig, StubBackend};
-use pubky_transport::Transport;
+use pubky_transport::{PollConfig, Transport};
 use std::collections::HashMap;
 use std::sync::Arc;
 use swap_common::chain::{run_blocking, ChainWatcher};
@@ -988,24 +989,67 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     }
 
     info!("Provider running; waiting for quote/swap requests...");
+    let mut inbox = transport.receiver::<SwapMessage>(PollConfig::default());
+    let mut dispatcher = dispatch::Dispatcher::new(
+        MAX_CONCURRENT_HANDLERS,
+        MAX_QUEUED_PER_PEER,
+        message_handler(&ctx, &offer),
+    );
+    let mut next_stats_log = std::time::Instant::now();
     loop {
-        let messages = transport
-            .receive_all::<SwapMessage>()
-            .await
-            .unwrap_or_default();
-        for (sender, msg) in messages {
-            // No offer yet means the daemon is still working out what it can serve. Nothing to
-            // quote against, so nothing to answer; the message stays unprocessed and comes round
-            // again on the next poll.
+        let batch = inbox.recv().await;
+        dispatcher.dispatch(batch.peer, batch.messages);
+        if std::time::Instant::now() >= next_stats_log {
+            let polls = inbox.stats();
+            debug!(
+                peers = polls.peers,
+                active_peers = polls.active_peers,
+                failed_polls = polls.failed_polls,
+                timed_out_polls = polls.timed_out_polls,
+                queued_messages = dispatcher.queued(),
+                busy_peers = dispatcher.busy_peers(),
+                "message intake"
+            );
+            next_stats_log = std::time::Instant::now() + Duration::from_secs(60);
+        }
+    }
+}
+
+/// Handlers allowed to run at once across all peers.
+const MAX_CONCURRENT_HANDLERS: usize = 16;
+
+/// Messages one peer may have waiting to be handled before further ones are dropped. Far more
+/// than an honest client sends while waiting for a reply.
+const MAX_QUEUED_PER_PEER: usize = 32;
+
+/// Handle one peer's message, in that peer's arrival order.
+fn message_handler(ctx: &ExecCtx, offer: &SharedOffer) -> dispatch::Handler<SwapMessage> {
+    let ctx = ctx.clone();
+    let offer = offer.clone();
+    // Admission reads the store and then writes to it (a payment hash may fund only one
+    // contract), so two swap requests handled at the same moment could both pass the check.
+    // Swap requests therefore still go one at a time; everything else runs alongside.
+    let admission = Arc::new(Mutex::new(()));
+    Arc::new(move |sender: String, msg: SwapMessage| {
+        let ctx = ctx.clone();
+        let offer = offer.clone();
+        let admission = admission.clone();
+        Box::pin(async move {
+            // No offer yet means the daemon is still working out what it can serve, and there is
+            // nothing to quote against. The sender's own timeout covers the unanswered message.
             let Some(current) = offer.read().await.clone() else {
-                continue;
+                return;
+            };
+            let _admitting = if matches!(msg, SwapMessage::SwapRequest(_)) {
+                Some(admission.lock().await)
+            } else {
+                None
             };
             if let Err(e) = handle_message(&ctx, &current, &sender, msg).await {
                 warn!("error handling message from {sender}: {e}");
             }
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
+        })
+    })
 }
 
 /// A shared HTTP client for the configured beignet daemon.
