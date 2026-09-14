@@ -182,7 +182,7 @@ impl RiskManager {
         let mut guards = Vec::new();
         for rec in active {
             match self.reserve_inner(
-                &rec.peer,
+                rec.peer_account.as_deref().unwrap_or(&rec.peer),
                 rec.swap_id,
                 rec.onchain_amount_sat,
                 ReservationMode::Funded,
@@ -500,6 +500,24 @@ mod tests {
             m.reserve("alice", Uuid::new_v4(), 100_000),
             Err(RejectReason::PeerExposureExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn delegated_keys_share_the_account_exposure_limit_after_restart() {
+        let manager = RiskManager::new(limits());
+        let mut record = SwapRecord::new_progress();
+        record.swap_id = Uuid::new_v4();
+        record.peer = "delegated-key".into();
+        record.peer_account = Some("ring-account".into());
+        record.onchain_amount_sat = 350_000;
+        let _guards = manager.restore(&[record]);
+        assert!(matches!(
+            manager.reserve("ring-account", Uuid::new_v4(), 100_000),
+            Err(RejectReason::PeerExposureExceeded { .. })
+        ));
+        assert!(manager
+            .reserve("other-account", Uuid::new_v4(), 100_000)
+            .is_ok());
     }
 
     /// A swap that already exists is always driven, whatever the limits now say: its funds are
