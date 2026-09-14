@@ -19,6 +19,10 @@ use tracing::{debug, warn};
 #[cfg(feature = "iroh")]
 pub mod p2p;
 
+pub mod poll;
+
+pub use poll::{PeerBatch, PeerInbox, PollConfig, PollStats};
+
 #[cfg(feature = "iroh")]
 pub mod identity;
 
@@ -181,6 +185,8 @@ pub struct Transport {
     known_peers: Arc<PeerSet>,
     /// Processed message IDs, for deduplication across polls.
     processed_messages: Arc<RwLock<HashSet<String>>>,
+    /// Prompts the scheduler behind [`receiver`](Self::receiver).
+    poll_waker: Arc<poll::PollWaker>,
 }
 
 /// Soft cap on the dedup set so it cannot grow without bound over long sessions.
@@ -228,6 +234,7 @@ impl Transport {
             messenger,
             known_peers: Arc::new(PeerSet::default()),
             processed_messages: Arc::new(RwLock::new(HashSet::new())),
+            poll_waker: Arc::new(poll::PollWaker::default()),
         }
     }
 
@@ -239,16 +246,19 @@ impl Transport {
     /// Track a peer so it is polled by [`receive_all`], and refresh its last-seen time.
     ///
     /// If the peer is already tracked its pinned status is preserved; this only bumps last-seen
-    /// (so re-adding a pinned peer does not unpin it).
+    /// (so re-adding a pinned peer does not unpin it). Either way the peer is polled promptly by
+    /// [`receiver`](Self::receiver), whatever backoff it had built up while quiet.
     pub fn add_known_peer(&self, peer_pkarr: String) {
-        self.known_peers.touch_or_add(peer_pkarr, false);
+        self.known_peers.touch_or_add(peer_pkarr.clone(), false);
+        self.poll_waker.wake(&peer_pkarr);
     }
 
     /// Track a peer and mark it pinned, so it is polled but never idle-reaped (only an explicit
     /// [`evict_peer`](Self::evict_peer) removes it). Use for operator-curated follows and a
     /// client's configured provider.
     pub fn pin_peer(&self, peer_pkarr: String) {
-        self.known_peers.touch_or_add(peer_pkarr, true);
+        self.known_peers.touch_or_add(peer_pkarr.clone(), true);
+        self.poll_waker.wake(&peer_pkarr);
     }
 
     /// Snapshot of currently known peers.
@@ -267,6 +277,7 @@ impl Transport {
     /// poll set. Removes pinned peers too.
     pub async fn evict_peer(&self, pubky: &str) {
         self.known_peers.remove(pubky);
+        self.poll_waker.changed();
         if let Err(e) = self.messenger.delete_follow(pubky).await {
             debug!("evict_peer: best-effort unfollow of {pubky} failed: {e}");
         }
@@ -309,6 +320,7 @@ impl Transport {
             .await
             .map_err(|e| TransportError::Messenger(format!("unfollow {pubky}: {e}")))?;
         self.known_peers.remove(pubky);
+        self.poll_waker.changed();
         Ok(())
     }
 
@@ -377,6 +389,7 @@ impl Transport {
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
+        let known = self.known_peers.polling_from(peer_pkarr).is_some();
         let messages = self
             .messenger
             .get_messages(&peer)
@@ -402,6 +415,11 @@ impl Transport {
             .known_peers
             .polling_from(peer_pkarr)
             .map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
+        // Evicted during the read: with no floor left this would parse the whole history and
+        // re-add the peer.
+        if known && floor.is_none() {
+            return Ok(Vec::new());
+        }
 
         let mut parsed = Vec::new();
         for msg in messages {
@@ -430,7 +448,9 @@ impl Transport {
                         }
                         processed.insert(message_id);
                     }
-                    self.add_known_peer(peer_pkarr.to_string());
+                    // Not `add_known_peer`: the scheduler already treats a delivering peer as
+                    // active, and a wake would cost it an extra poll.
+                    self.known_peers.touch_or_add(peer_pkarr.to_string(), false);
                     parsed.push(parsed_msg);
                 }
                 Err(e) => {
@@ -455,7 +475,37 @@ impl Transport {
         Ok(parsed)
     }
 
-    /// Receive new messages from all known peers concurrently.
+    /// Poll every known peer while the returned inbox is read, delivering each peer's new messages
+    /// as soon as its own poll completes.
+    ///
+    /// Unlike [`receive_all`](Self::receive_all), a slow or stalled peer delays nobody else, and
+    /// quiet or failing peers back off. See [`poll`] for the limits. Run one per transport: a
+    /// second receiver would split the wake-ups between them.
+    pub fn receiver<M: DeserializeOwned + 'static>(
+        self: &Arc<Self>,
+        config: PollConfig,
+    ) -> PeerInbox<M> {
+        let transport = self.clone();
+        let list: poll::ListPeers = Box::new(move || transport.get_known_peers());
+        let transport = self.clone();
+        let fetch: poll::Fetch<M> = Box::new(move |peer: String| {
+            let transport = transport.clone();
+            Box::pin(async move {
+                // An evicted peer has no poll window, so reading it now would return its whole
+                // history.
+                if transport.known_peers.polling_from(&peer).is_none() {
+                    return Ok(Vec::new());
+                }
+                // Cancelling this at the poll deadline is safe: messages are only marked seen
+                // after the network read, with no await between that and returning them.
+                transport.receive_from::<M>(&peer).await
+            })
+        });
+        PeerInbox::new(config, list, fetch, self.poll_waker.clone())
+    }
+
+    /// Receive new messages from all known peers concurrently, returning once every poll has
+    /// finished. Long-running receivers want [`receiver`](Self::receiver).
     pub async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
         use futures::future::join_all;
 
