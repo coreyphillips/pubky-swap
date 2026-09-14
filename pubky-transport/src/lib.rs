@@ -389,6 +389,7 @@ impl Transport {
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
+        let known = self.known_peers.polling_from(peer_pkarr).is_some();
         let messages = self
             .messenger
             .get_messages(&peer)
@@ -414,6 +415,11 @@ impl Transport {
             .known_peers
             .polling_from(peer_pkarr)
             .map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
+        // Evicted during the read: with no floor left this would parse the whole history and
+        // re-add the peer.
+        if known && floor.is_none() {
+            return Ok(Vec::new());
+        }
 
         let mut parsed = Vec::new();
         for msg in messages {
