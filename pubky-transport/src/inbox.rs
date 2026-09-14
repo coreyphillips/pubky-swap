@@ -113,19 +113,20 @@ struct Slots {
 
 pub(crate) struct Inboxes {
     slots: Mutex<Slots>,
-    /// Whether a peer is still polled. Its inbox is never dropped: the caller's floor for it is
-    /// when it joined, so a fresh inbox would deliver everything it acknowledged since.
-    polled: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    /// The canonical keys of peers still polled. Their inboxes are never dropped: the caller's
+    /// floor for a polled peer is when it joined, so a fresh inbox would deliver everything it
+    /// acknowledged since.
+    polled: Box<dyn Fn() -> HashSet<String> + Send + Sync>,
 }
 
 impl Default for Inboxes {
     fn default() -> Self {
-        Self::sparing(|_| false)
+        Self::sparing(HashSet::new)
     }
 }
 
 impl Inboxes {
-    pub(crate) fn sparing(polled: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+    pub(crate) fn sparing(polled: impl Fn() -> HashSet<String> + Send + Sync + 'static) -> Self {
         Self {
             slots: Mutex::default(),
             polled: Box::new(polled),
@@ -141,15 +142,20 @@ impl Inboxes {
             return slot.inbox.clone();
         }
         if slots.by_peer.len() >= MAX_RETAINED_INBOXES {
-            // An inbox in use is shared with the caller holding it; dropping ours only means the
-            // next caller starts a fresh one.
-            if let Some(oldest) = slots
-                .by_peer
-                .iter()
-                .filter(|(peer, _)| !(self.polled)(peer))
-                .min_by_key(|(_, slot)| slot.last_used)
-                .map(|(peer, _)| peer.clone())
-            {
+            let polled = (self.polled)();
+            // Trim to below the cap, which polled peers may have pushed it past. An inbox in use
+            // is shared with the caller holding it; dropping ours only means the next caller
+            // starts a fresh one.
+            while slots.by_peer.len() >= MAX_RETAINED_INBOXES {
+                let Some(oldest) = slots
+                    .by_peer
+                    .iter()
+                    .filter(|(peer, _)| !polled.contains(*peer))
+                    .min_by_key(|(_, slot)| slot.last_used)
+                    .map(|(peer, _)| peer.clone())
+                else {
+                    break;
+                };
                 slots.by_peer.remove(&oldest);
             }
         }
@@ -222,6 +228,18 @@ impl Inboxes {
                     }
                 }
             }
+        }
+
+        if !failures.is_empty() {
+            // Held bodies were listed before, so a failed listing does not withhold them.
+            let listed: HashSet<MessageId> = order.iter().cloned().collect();
+            order.extend(
+                inbox
+                    .delivered
+                    .keys()
+                    .filter(|id| !listed.contains(*id))
+                    .cloned(),
+            );
         }
 
         let mut out = Vec::new();
@@ -753,11 +771,28 @@ mod tests {
         assert_eq!(inboxes.retained(), MAX_RETAINED_INBOXES);
     }
 
+    #[test]
+    fn the_cap_is_restored_once_polled_peers_leave() {
+        let polled = Arc::new(Mutex::new(HashSet::new()));
+        let inboxes = Inboxes::sparing({
+            let polled = polled.clone();
+            move || polled.lock().unwrap().clone()
+        });
+        for i in 0..MAX_RETAINED_INBOXES + 10 {
+            let peer = format!("peer-{i}");
+            polled.lock().unwrap().insert(peer.clone());
+            inboxes.inbox(&peer);
+        }
+        polled.lock().unwrap().clear();
+        inboxes.inbox("newcomer");
+        assert_eq!(inboxes.retained(), MAX_RETAINED_INBOXES);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_polled_peer_keeps_its_inbox_past_the_cap() {
         let p = pair();
         let client = p.client.key.public_key().to_string();
-        let inboxes = Inboxes::sparing(move |peer| peer == client);
+        let inboxes = Inboxes::sparing(move || HashSet::from([client.clone()]));
         p.conversation.publish(&p.client.key, 100, "quote request");
         poll_and_ack(&inboxes, &p.provider, &p.client, Some(0)).await;
 

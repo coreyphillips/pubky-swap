@@ -9,7 +9,7 @@
 use pkarr::PublicKey;
 use pubky_messenger::PrivateMessengerClient;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -105,6 +105,18 @@ impl PeerSet {
                     polling_from: now_unix(),
                 });
         }
+    }
+
+    /// Polled peers by canonical key, since a peer may be tracked under a prefixed spelling.
+    fn canonical_keys(&self) -> HashSet<String> {
+        self.peers
+            .read()
+            .map(|p| {
+                p.keys()
+                    .map(|k| canonical_pubky(k).unwrap_or_else(|_| k.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn all(&self) -> Vec<String> {
@@ -246,7 +258,7 @@ impl Transport {
         Self {
             messenger,
             known_peers,
-            inboxes: inbox::Inboxes::sparing(move |peer| polled.polling_from(peer).is_some()),
+            inboxes: inbox::Inboxes::sparing(move || polled.canonical_keys()),
         }
     }
 
@@ -674,6 +686,14 @@ mod tests {
         set.touch_or_add("a".into(), false);
         // A just-added peer is not idle for an hour.
         assert!(set.idle_unpinned(Duration::from_secs(3600)).is_empty());
+    }
+
+    #[test]
+    fn prefixed_peers_are_protected_under_their_canonical_key() {
+        let key = pkarr::Keypair::random().public_key().to_string();
+        let set = PeerSet::default();
+        set.touch_or_add(format!("pk:{key}"), false);
+        assert!(set.canonical_keys().contains(&key));
     }
 
     #[test]
