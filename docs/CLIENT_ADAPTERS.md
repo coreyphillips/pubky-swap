@@ -5,8 +5,10 @@ An external application can negotiate swaps using `pubky-transport` and the type
 claim keys, and preimages. An adapter for an application that already owns that material should
 use the transport and protocol types directly.
 
-The provider continues to exchange encrypted Pubky messages. Boltz REST and WebSocket translation
-belongs in a separate process on the user's device.
+The provider answers the same requests over encrypted Pubky messages and, when both sides support
+it, over iroh request streams. [Transports](transports.md) describes which carries what and how a
+client falls back. Boltz REST and WebSocket translation belongs in a separate process on the
+user's device.
 
 ## Contract selection
 

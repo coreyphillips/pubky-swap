@@ -1309,6 +1309,7 @@ fn build_offer(
             let mut features = vec!["boltz-taproot-v1".into(), "swap-status-v1".into()];
             if cfg!(feature = "iroh") && config.rendezvous_iroh {
                 features.push("session-rpc-v1".into());
+                features.push("direct-rpc-v1".into());
             }
             features
         } else {
@@ -2652,6 +2653,17 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: Sh
                         pubky_transport::p2p::RendezvousEvent::Peer(pubky) => {
                             ctx.transport.add_known_peer(pubky)
                         }
+                        pubky_transport::p2p::RendezvousEvent::Direct(request) => {
+                            let ctx = ctx.clone();
+                            let offer = offer.clone();
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    handle_direct_request(ctx, offer, request),
+                                )
+                                .await;
+                            });
+                        }
                         pubky_transport::p2p::RendezvousEvent::Session(request) => {
                             let Some(verifier) = verifier.clone() else {
                                 continue;
@@ -2686,19 +2698,9 @@ async fn handle_session_request(
         Ok(owner) => owner,
         Err(_) => return,
     };
-    let Ok(message) = serde_json::from_value::<SwapMessage>(request.request.message) else {
+    let Some(message) = customer_request(request.request.message) else {
         return;
     };
-    // Only customer requests are accepted over this protocol.
-    if !matches!(
-        message,
-        SwapMessage::OfferRequest(_)
-            | SwapMessage::QuoteRequest(_)
-            | SwapMessage::SwapRequest(_)
-            | SwapMessage::SwapStatusRequest(_)
-    ) {
-        return;
-    }
     let Some(current) = offer.read().await.clone() else {
         return;
     };
@@ -2712,6 +2714,43 @@ async fn handle_session_request(
     {
         warn!("could not handle authorized session swap request");
     }
+}
+
+/// Answer a request from the root key that authenticated the connection. No homeserver lookup is
+/// needed, and the sender owns exactly what the same key owns over DMs.
+#[cfg(feature = "iroh")]
+async fn handle_direct_request(
+    mut ctx: ExecCtx,
+    offer: SharedOffer,
+    request: pubky_transport::p2p::DirectRpc,
+) {
+    let Some(message) = customer_request(request.message) else {
+        return;
+    };
+    let Some(current) = offer.read().await.clone() else {
+        return;
+    };
+    ctx.transport = Arc::new(ctx.transport.root_key(request.reply));
+    if handle_message(&ctx, &current, &request.remote_key, message)
+        .await
+        .is_err()
+    {
+        warn!("could not handle direct swap request");
+    }
+}
+
+/// Only customer requests are accepted over the request/reply protocols.
+#[cfg(feature = "iroh")]
+fn customer_request(message: serde_json::Value) -> Option<SwapMessage> {
+    let message = serde_json::from_value::<SwapMessage>(message).ok()?;
+    matches!(
+        message,
+        SwapMessage::OfferRequest(_)
+            | SwapMessage::QuoteRequest(_)
+            | SwapMessage::SwapRequest(_)
+            | SwapMessage::SwapStatusRequest(_)
+    )
+    .then_some(message)
 }
 
 #[cfg(not(feature = "iroh"))]

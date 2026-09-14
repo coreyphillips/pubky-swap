@@ -4866,6 +4866,7 @@ dependencies = [
  "pubky-transport",
  "rand 0.8.6",
  "serde",
+ "serde_json",
  "swap-common",
  "swap-config",
  "tokio",

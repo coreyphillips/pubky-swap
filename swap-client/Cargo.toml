@@ -27,6 +27,7 @@ pubky-transport.workspace = true
 swap-common.workspace = true
 swap-config.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 lightning-backend.workspace = true
 beignet-backend = { workspace = true, optional = true }
 bitcoin.workspace = true

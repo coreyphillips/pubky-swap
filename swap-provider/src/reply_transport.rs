@@ -48,6 +48,18 @@ impl ReplyTransport {
         }
     }
 
+    /// Reply on the request's stream as the root key that sent it. With no account or scope,
+    /// ownership checks treat the sender exactly as they treat the same key over DMs.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn root_key(&self, reply: oneshot::Sender<Vec<u8>>) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            reply: Some(Mutex::new(Some(reply))),
+            account: None,
+            scope: None,
+        }
+    }
+
     pub(crate) async fn send<T: Serialize>(
         &self,
         peer: &str,
@@ -64,7 +76,8 @@ impl ReplyTransport {
         {
             let _ = sender.send(bytes);
         }
-        // Session clients poll durable status; background updates do not become root-key DMs.
+        // Stream clients poll durable status. Background updates from a driver spawned by this
+        // request land here too and are dropped rather than sent as DMs.
         Ok(())
     }
 }
