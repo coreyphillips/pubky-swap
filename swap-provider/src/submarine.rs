@@ -272,10 +272,39 @@ pub async fn drive_submarine_swap(
     let funding_value_sat =
         match run_blocking(|| chain.outpoint_status(&swap.htlc_spk, &funding_outpoint))? {
             Some(utxo) if utxo.confirmations >= required_confirmations => utxo.value_sat,
+            // Depth decides whether to pay. Once a payment may be out, the claim is owed at any
+            // depth and only needs the output to exist.
+            Some(utxo) if already_attempted_payment => {
+                warn!(
+                    "Submarine swap: funding is at {} of {required_confirmations} confirmations, \
+                     but a payment may already be out; claiming anyway",
+                    utxo.confirmations
+                );
+                utxo.value_sat
+            }
             _ => {
                 if run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))?.is_some() {
                     info!("Submarine swap: funding already spent (prior claim); done");
                     return Ok(SwapState::Claimed);
+                }
+                if already_attempted_payment {
+                    // Only a payment the node says failed makes this safe to give up. Anything
+                    // else may have bought the preimage, and the funding can still reappear.
+                    if let PaymentStatus::Failed(reason) = ln
+                        .payment_status(swap.payment_hash)
+                        .await
+                        .map_err(|e| anyhow!("payment status: {e}"))?
+                    {
+                        return Ok(SwapState::Failed(format!(
+                            "invoice payment failed: {reason}"
+                        )));
+                    }
+                    warn!(
+                        "Submarine swap: funding is not visible on chain, but a payment may \
+                         already be out; waiting for it to reappear"
+                    );
+                    sleep(poll).await;
+                    return Ok(SwapState::InvoicePending);
                 }
                 warn!(
                     "Submarine swap: funding no longer confirmed at required depth (reorg?); not \
@@ -294,31 +323,15 @@ pub async fn drive_submarine_swap(
         );
     }
 
-    // Claim-window guard: paying is irreversible, but the on-chain claim that recovers the money
-    // is a race against the client's refund branch. A client that funds late -- or a funding that
-    // confirms slowly -- can leave only a block or two before that branch opens, and the client
-    // can fee-bump its refund past our claim. Refusing to pay costs nothing: the client simply
-    // refunds its own funding.
-    let tip = run_blocking(|| chain.tip_height())?;
-    if let Err(violation) =
-        timelock::check_submarine_before_pay(tip, swap.timeout_height, &swap.timelock)
-    {
-        warn!(
-            "Submarine swap: not paying the invoice, {violation}. The client's on-chain funding \
-             is untouched and refunds to them at the timeout."
-        );
-        return Ok(SwapState::Failed(format!(
-            "insufficient claim window: {violation}"
-        )));
-    }
-
     // 2. Pay the invoice to learn the preimage. A failure costs nothing on-chain: the client
     //    simply refunds after the timeout.
     //
     //    Ask the node first. A driver resumed after a crash cannot tell from its own state
     //    whether a payment went out, and the two possibilities want opposite actions: paying
     //    again risks paying twice, while assuming it was paid abandons an HTLC we have already
-    //    bought. The node knows, so ask it.
+    //    bought. The node knows, so ask it, and before any check that only makes sense ahead of
+    //    a new payment: a resumed driver past the claim-window boundary still owes the claim on
+    //    a payment that already went out.
     // A payment that is in flight, or that the node cannot account for, is waited on here rather
     // than by returning and having the whole driver re-enter. Handing back meant re-running the
     // funding lookup, the spend lookup and the reorg guard on every two-second poll, which is
@@ -338,8 +351,8 @@ pub async fn drive_submarine_swap(
                 break;
             }
             PaymentStatus::InFlight => {
-                // Wait it out rather than launching a second attempt. The claim-window gate above
-                // bounds how long this can go on.
+                // Wait it out rather than launching a second attempt. The payment's own CLTV
+                // limit bounds how long this can go on.
                 info!("Submarine swap: a payment is already in flight; waiting for it to settle");
                 sleep(poll).await;
             }
@@ -360,6 +373,24 @@ pub async fn drive_submarine_swap(
                     );
                     sleep(poll).await;
                     continue;
+                }
+
+                // Claim-window guard: paying is irreversible, but the on-chain claim that
+                // recovers the money is a race against the client's refund branch. A client that
+                // funds late, or a funding that confirms slowly, can leave only a block or two
+                // before that branch opens, and the client can fee-bump its refund past our
+                // claim. Refusing to pay costs nothing: the client simply refunds its own funding.
+                let tip = run_blocking(|| chain.tip_height())?;
+                if let Err(violation) =
+                    timelock::check_submarine_before_pay(tip, swap.timeout_height, &swap.timelock)
+                {
+                    warn!(
+                        "Submarine swap: not paying the invoice, {violation}. The client's \
+                         on-chain funding is untouched and refunds to them at the timeout."
+                    );
+                    return Ok(SwapState::Failed(format!(
+                        "insufficient claim window: {violation}"
+                    )));
                 }
 
                 // Bound how far out the outgoing HTLC may expire, and refuse if there is no room
@@ -466,59 +497,72 @@ pub async fn drive_submarine_swap(
     let deadline = swap
         .timeout_height
         .saturating_sub(swap_common::timelock::CLAIM_ABORT_MARGIN);
-    let cfg = SpendWatchConfig::claim(
-        CLAIM_FEE_TARGET_BLOCKS,
-        swap.fee_rate_sat_vb,
-        fee_rate_cap(
-            swap.onchain_amount_sat,
-            claim_vsize,
-            DEFAULT_MAX_FEE_BPS,
-            ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+    // Our spends so far, including the ones earlier passes of the loop below put on the wire, so
+    // each pass adopts the live claim instead of reading it as a rival's.
+    let ours = std::sync::Mutex::new(resume.our_spends.clone());
+    let on_spend = |txid: Txid| {
+        ours.lock().unwrap().push(txid);
+        progress.spend_broadcast(txid);
+    };
+    loop {
+        let known_ours = ours.lock().unwrap().clone();
+        let cfg = SpendWatchConfig::claim(
+            CLAIM_FEE_TARGET_BLOCKS,
             swap.fee_rate_sat_vb,
-        ),
-        poll,
-        FINALITY_DEPTH,
-        deadline,
-    )
-    .with_known_ours(resume.our_spends.clone());
-    match confirm_or_bump(
-        chain,
-        &swap.htlc_spk,
-        funding_outpoint,
-        &cfg,
-        Some(&cpfp),
-        &|txid| progress.spend_broadcast(txid),
-        build,
-    )
-    .await
-    .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?
-    {
-        SpendOutcome::Confirmed { .. } => {
-            info!("Submarine swap: invoice paid and on-chain HTLC claimed");
-            Ok(SwapState::Claimed)
-        }
-        // We paid the invoice and the client's refund confirmed anyway: a realised loss of the
-        // on-chain amount. The pre-payment claim-window check should make this unreachable, so
-        // reaching it means the timelock parameters are wrong and want the operator's attention,
-        // not a quiet `Failed`.
-        SpendOutcome::ConflictingSpend { tx } => {
-            error!(
-                "Submarine swap: LOSS. The invoice was paid but the client's refund {} confirmed \
-                 before our claim. Check --min-claim-window-blocks and --timeout-blocks.",
-                tx.compute_txid()
-            );
-            Ok(SwapState::Failed(
-                "the client's refund won the claim race after the invoice was paid".into(),
-            ))
-        }
-        SpendOutcome::DeadlineExceeded { last_txid, tip } => {
-            error!(
-                "Submarine swap: LOSS RISK. The invoice was paid but claim {last_txid} has not \
-                 confirmed by height {tip}, past its deadline. The client can now refund."
-            );
-            Ok(SwapState::Failed(
-                "the on-chain claim did not confirm before the client's refund window".into(),
-            ))
+            fee_rate_cap(
+                swap.onchain_amount_sat,
+                claim_vsize,
+                DEFAULT_MAX_FEE_BPS,
+                ABSOLUTE_MAX_FEE_RATE_SAT_VB,
+                swap.fee_rate_sat_vb,
+            ),
+            poll,
+            FINALITY_DEPTH,
+            deadline,
+        )
+        .with_known_ours(known_ours);
+        match confirm_or_bump(
+            chain,
+            &swap.htlc_spk,
+            funding_outpoint,
+            &cfg,
+            Some(&cpfp),
+            &on_spend,
+            build,
+        )
+        .await
+        .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?
+        {
+            SpendOutcome::Confirmed { .. } => {
+                info!("Submarine swap: invoice paid and on-chain HTLC claimed");
+                return Ok(SwapState::Claimed);
+            }
+            // We paid the invoice and the client's refund confirmed anyway: a realised loss of the
+            // on-chain amount. The pre-payment claim-window check should make this unreachable,
+            // so reaching it means the timelock parameters are wrong and want the operator's
+            // attention, not a quiet `Failed`.
+            SpendOutcome::ConflictingSpend { tx } => {
+                error!(
+                    "Submarine swap: LOSS. The invoice was paid but the client's refund {} \
+                     confirmed before our claim. Check --min-claim-window-blocks and \
+                     --timeout-blocks.",
+                    tx.compute_txid()
+                );
+                return Ok(SwapState::Failed(
+                    "the client's refund won the claim race after the invoice was paid".into(),
+                ));
+            }
+            // Past the deadline the claim can still win: the refund only becomes valid, it is not
+            // yet mined. Giving up here made the swap terminal and released it while our claim
+            // was still in the mempool, so keep driving it until one side confirms.
+            SpendOutcome::DeadlineExceeded { last_txid, tip } => {
+                error!(
+                    "Submarine swap: LOSS RISK. The invoice was paid but claim {last_txid} has \
+                     not confirmed by height {tip}, past its deadline. The client can now \
+                     refund; still driving the claim."
+                );
+                sleep(poll).await;
+            }
         }
     }
 }
@@ -1358,6 +1402,190 @@ mod tests {
             "the provider must not pay an invoice it cannot then claim against"
         );
         assert!(chain.broadcasts().is_empty(), "nothing should be broadcast");
+    }
+
+    /// A resumed driver whose invoice is already paid, at a tip where a new payment would be
+    /// refused. The claim-window guard used to run before the node was asked, so the swap went
+    /// terminal with the payment spent and no claim, and the client refunded on chain.
+    #[tokio::test]
+    async fn a_paid_swap_resumed_past_the_claim_window_still_claims() {
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let ln =
+            MockLn::new(ph, Some(preimage)).with_status(PaymentStatus::Succeeded(PaymentResult {
+                preimage,
+                fee_msat: 0,
+            }));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat,
+                confirmations: 3,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::ZERO,
+            &Resume {
+                funding: Some(funding_outpoint()),
+                ..Default::default()
+            },
+            true,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state, SwapState::Claimed);
+        assert!(!*ln.paid.lock().unwrap(), "must not pay a second time");
+        let broadcasts = chain.broadcasts();
+        assert_eq!(broadcasts.len(), 1, "the claim owed must be broadcast");
+        assert_eq!(
+            extract_preimage(&broadcasts[0], &funding_outpoint(), &ph),
+            Some(preimage)
+        );
+    }
+
+    /// Depth decides whether to pay, not whether to claim. A funding reorged below the required
+    /// depth after the payment went out is still claimed.
+    #[tokio::test]
+    async fn a_paid_swap_claims_against_a_funding_below_the_required_depth() {
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let ln =
+            MockLn::new(ph, Some(preimage)).with_status(PaymentStatus::Succeeded(PaymentResult {
+                preimage,
+                fee_msat: 0,
+            }));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain::new()
+            .with_tip(MOCK_TIP)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat,
+                confirmations: 1,
+            })
+            .always_final();
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::ZERO,
+            &Resume {
+                funding: Some(funding_outpoint()),
+                ..Default::default()
+            },
+            true,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state, SwapState::Claimed);
+        assert_eq!(chain.broadcasts().len(), 1);
+    }
+
+    /// The same boundary with the payment still unresolved. It may yet buy the preimage, so the
+    /// driver hands back rather than going terminal.
+    #[tokio::test]
+    async fn an_unresolved_payment_past_the_claim_window_is_not_abandoned() {
+        for status in [PaymentStatus::InFlight, PaymentStatus::Unknown] {
+            let preimage = generate_preimage();
+            let ln = MockLn::new(payment_hash(&preimage), Some(preimage)).with_status(status);
+            let (swap, _) = make_swap(&ln).await;
+            let chain = MockChain::new()
+                .with_tip(TIMEOUT)
+                .with_funding(FundingUtxo {
+                    outpoint: funding_outpoint(),
+                    value_sat: swap.onchain_amount_sat,
+                    confirmations: 3,
+                })
+                .always_final();
+            let wallet = MockWallet { spk: dest() };
+
+            let state = drive_submarine_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &swap,
+                2,
+                Duration::ZERO,
+                &Resume {
+                    funding: Some(funding_outpoint()),
+                    ..Default::default()
+                },
+                true,
+                &(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(state, SwapState::InvoicePending);
+            assert!(!state.is_terminal());
+            assert!(!*ln.paid.lock().unwrap());
+        }
+    }
+
+    /// A claim that misses its deadline has not lost: the refund branch is open, not mined. The
+    /// driver used to return `Failed` here, releasing a paid swap with our claim in the mempool.
+    #[tokio::test]
+    async fn a_claim_past_its_deadline_is_still_driven_to_confirmation() {
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let ln =
+            MockLn::new(ph, Some(preimage)).with_status(PaymentStatus::Succeeded(PaymentResult {
+                preimage,
+                fee_msat: 0,
+            }));
+        let (swap, _) = make_swap(&ln).await;
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT)
+            .with_funding(FundingUtxo {
+                outpoint: funding_outpoint(),
+                value_sat: swap.onchain_amount_sat,
+                confirmations: 3,
+            })
+            // Sits in the mempool across several passes past the deadline, then confirms.
+            .with_confirmations(vec![
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(swap_common::chain::ASSUMED_FINAL_CONFIRMATIONS),
+            ]);
+        let wallet = MockWallet { spk: dest() };
+
+        let state = drive_submarine_swap(
+            &ln,
+            &chain,
+            &wallet,
+            &swap,
+            2,
+            Duration::ZERO,
+            &Resume {
+                funding: Some(funding_outpoint()),
+                ..Default::default()
+            },
+            true,
+            &(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(state, SwapState::Claimed);
+        assert!(!chain.broadcasts().is_empty());
     }
 
     #[tokio::test]
