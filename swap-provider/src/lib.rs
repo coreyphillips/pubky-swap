@@ -1035,6 +1035,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             .receive_all_with_receipts::<SwapMessage>()
             .await
             .unwrap_or_default();
+        let mut handled = Vec::new();
         for inbound in messages {
             // No offer yet means the daemon is still working out what it can serve. Nothing to
             // quote against, so nothing to answer; the message goes back and comes round again
@@ -1052,7 +1053,11 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
                 }
                 warn!("error handling message from {sender}: {e}");
             }
-            transport.acknowledge(&inbound.receipt);
+            handled.push(inbound.receipt);
+        }
+        // Once per batch: each call rewrites and syncs the whole journal.
+        if let Err(e) = transport.acknowledge(&handled) {
+            warn!("could not record handled messages: {e}");
         }
         sleep(Duration::from_millis(200)).await;
     }

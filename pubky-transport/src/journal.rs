@@ -34,6 +34,8 @@ struct Entry {
 pub(crate) struct Journal {
     path: PathBuf,
     entries: HashMap<String, Entry>,
+    /// Changed since the last successful save.
+    dirty: bool,
 }
 
 impl Journal {
@@ -52,7 +54,13 @@ impl Journal {
         Ok(Self {
             path: path.to_path_buf(),
             entries: entries.into_iter().map(|e| (e.id.clone(), e)).collect(),
+            dirty: false,
         })
+    }
+
+    /// Whether memory holds state the file does not, so nothing may be delivered on its strength.
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     pub(crate) fn outcome(&self, id: &str) -> Option<Outcome> {
@@ -79,6 +87,7 @@ impl Journal {
                 outcome,
             },
         );
+        self.dirty = true;
         true
     }
 
@@ -87,6 +96,7 @@ impl Journal {
         match self.entries.get_mut(id) {
             Some(entry) if entry.outcome == Outcome::Pending => {
                 entry.outcome = Outcome::Handled;
+                self.dirty = true;
                 true
             }
             _ => false,
@@ -110,6 +120,7 @@ impl Journal {
     pub(crate) fn forget_peer(&mut self, peer: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|_, e| e.peer != peer);
+        self.dirty |= self.entries.len() != before;
         self.entries.len() != before
     }
 
@@ -139,7 +150,8 @@ impl Journal {
             fs::create_dir_all(dir)?;
         }
         // Only one writer per journal: saves run under the transport's lock on it.
-        let tmp = self.path.with_extension("tmp");
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".tmp");
         {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(&bytes)?;
@@ -149,6 +161,7 @@ impl Journal {
         if let Some(dir) = self.path.parent().and_then(|d| fs::File::open(d).ok()) {
             let _ = dir.sync_all();
         }
+        self.dirty = false;
         Ok(())
     }
 }
