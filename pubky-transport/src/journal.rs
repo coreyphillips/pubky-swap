@@ -153,7 +153,12 @@ impl Journal {
         let mut tmp = self.path.clone().into_os_string();
         tmp.push(".tmp");
         {
-            let mut file = fs::File::create(&tmp)?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            // The journal names counterparties and when they wrote, so keep it from other users.
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let mut file = options.open(&tmp)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
