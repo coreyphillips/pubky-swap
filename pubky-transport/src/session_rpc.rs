@@ -3,12 +3,15 @@
 //! The session bearer token is used only with its own homeserver. Providers read a
 //! short-lived public authorization and authenticate the transport key over QUIC.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use pubky_session::{Pubky, PubkyHttpClient, PubkySession, PublicStorage};
+use futures::StreamExt;
+use pubky_session::{pkarr, Method, PubkyHttpClient, PubkySession};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tracing::debug;
 
@@ -112,14 +115,22 @@ const MAX_CONCURRENT_LOOKUPS: usize = 16;
 /// never evicts them. Owners arrive before they are authorized, so the client is
 /// replaced once it has seen this many.
 const MAX_OWNERS_PER_CLIENT: usize = 1024;
+/// Transport choices, matching Pubky's own client.
+const ROUTE_TTL: Duration = Duration::from_secs(60);
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-type ClientFactory = dyn Fn() -> Result<PubkyHttpClient> + Send + Sync;
+type ClientFactory = dyn Fn() -> pkarr::ClientBuilder + Send + Sync;
 
-/// Provider-side authorization checks over one long-lived Pubky storage client.
+/// Provider-side authorization checks over one long-lived Pubky HTTP client.
 ///
 /// Sharing the client keeps its connection pool and resolver cache warm across
 /// requests. Authorization decisions are never cached: every request fetches the
 /// current record and validates it, so removal and expiry take effect at once.
+///
+/// `PublicStorage::get` reads the whole body of an error response before it
+/// returns, so no size limit could apply to it. Lookups send their own request
+/// instead, choosing between the homeserver's direct and ICANN endpoints the way
+/// that API does, which needs a resolver of our own.
 #[derive(Clone)]
 pub struct AuthorizationVerifier {
     factory: Arc<ClientFactory>,
@@ -131,8 +142,25 @@ pub struct AuthorizationVerifier {
 }
 
 struct SharedClient {
-    storage: PublicStorage,
-    owners: HashSet<String>,
+    http: PubkyHttpClient,
+    pkarr: pkarr::Client,
+    generation: u64,
+    /// Owners this client has seen, with the route last chosen for each.
+    owners: HashMap<String, Option<(Instant, Route)>>,
+}
+
+/// How to reach an owner's homeserver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route {
+    Direct,
+    Icann { domain: String, port: Option<u16> },
+}
+
+struct Lookup {
+    http: PubkyHttpClient,
+    pkarr: pkarr::Client,
+    generation: u64,
+    route: Option<Route>,
 }
 
 /// Where one lookup spent its time. Resolution and connection setup happen inside
@@ -147,27 +175,21 @@ struct LookupTiming {
 impl AuthorizationVerifier {
     /// Build a verifier with a default mainline Pubky client.
     pub fn new(provider: &str) -> Result<Self> {
-        Self::with_client_factory(
-            || PubkyHttpClient::new().map_err(|_| session_error("Pubky resolver unavailable")),
-            provider,
-        )
+        Self::with_client_factory(pkarr::ClientBuilder::default, provider)
     }
 
-    /// Build a verifier whose clients come from `factory`, which is called again
-    /// whenever the current client is replaced.
+    /// Build a verifier whose clients resolve through `factory`'s configuration,
+    /// which is asked for again whenever the current client is replaced.
     pub fn with_client_factory(
-        factory: impl Fn() -> Result<PubkyHttpClient> + Send + Sync + 'static,
+        factory: impl Fn() -> pkarr::ClientBuilder + Send + Sync + 'static,
         provider: &str,
     ) -> Result<Self> {
         let provider = canonical_pubky(provider)?;
         let factory: Arc<ClientFactory> = Arc::new(factory);
-        let storage = build_storage(factory.as_ref())?;
+        let client = build_client(factory.as_ref(), 0)?;
         Ok(Self {
             factory,
-            client: Arc::new(Mutex::new(SharedClient {
-                storage,
-                owners: HashSet::new(),
-            })),
+            client: Arc::new(Mutex::new(client)),
             provider,
             lookups: Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
             timeout: AUTHORIZATION_LOOKUP_TIMEOUT,
@@ -175,18 +197,87 @@ impl AuthorizationVerifier {
         })
     }
 
-    /// The shared storage client, replaced first if `owner` would take it past its
-    /// owner limit. Lookups already running keep the old client until they finish.
-    fn storage_for(&self, owner: &str) -> Result<PublicStorage> {
+    /// The shared client, replaced first if `owner` would take it past its owner
+    /// limit. Lookups already running keep the old client until they finish.
+    fn client_for(&self, owner: &str) -> Result<Lookup> {
         let mut client = self.client.lock().unwrap_or_else(PoisonError::into_inner);
-        if !client.owners.contains(owner) {
+        if !client.owners.contains_key(owner) {
             if client.owners.len() >= self.max_owners {
-                client.storage = build_storage(self.factory.as_ref())?;
-                client.owners.clear();
+                *client = build_client(self.factory.as_ref(), client.generation + 1)?;
             }
-            client.owners.insert(owner.to_string());
+            client.owners.insert(owner.to_string(), None);
         }
-        Ok(client.storage.clone())
+        let route = client.owners[owner]
+            .as_ref()
+            .filter(|(chosen, _)| chosen.elapsed() < ROUTE_TTL)
+            .map(|(_, route)| route.clone());
+        Ok(Lookup {
+            http: client.http.clone(),
+            pkarr: client.pkarr.clone(),
+            generation: client.generation,
+            route,
+        })
+    }
+
+    /// Kept only while the client that chose the route is still the shared one,
+    /// so replaced clients cannot grow the new client's owner map.
+    fn remember_route(&self, owner: &str, generation: u64, route: Route) {
+        let mut client = self.client.lock().unwrap_or_else(PoisonError::into_inner);
+        if client.generation != generation {
+            return;
+        }
+        if let Some(entry) = client.owners.get_mut(owner) {
+            *entry = Some((Instant::now(), route));
+        }
+    }
+
+    /// Send the lookup and read at most `MAX_AUTHORIZATION_BYTES` of the body,
+    /// whatever its status. Also returns how long the response headers took,
+    /// including resolution.
+    async fn fetch(&self, owner: &str, path: &str) -> Result<(Vec<u8>, Duration)> {
+        let started = Instant::now();
+        let lookup = self.client_for(owner)?;
+        let route = match lookup.route {
+            Some(route) => route,
+            None => {
+                let route = resolve_route(&lookup.pkarr, &format!("_pubky.{owner}")).await;
+                self.remember_route(owner, lookup.generation, route.clone());
+                route
+            }
+        };
+        let request = match &route {
+            Route::Direct => lookup
+                .http
+                .request(Method::GET, &format!("https://_pubky.{owner}{path}")),
+            Route::Icann { domain, port } => {
+                let authority =
+                    port.map_or_else(|| domain.clone(), |port| format!("{domain}:{port}"));
+                lookup
+                    .http
+                    .request(Method::GET, &format!("https://{authority}{path}"))
+                    .header("pubky-host", owner)
+            }
+        };
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| session_error("swap authorization unavailable"))?;
+        let response_at = started.elapsed();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| session_error("invalid authorization response"))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > MAX_AUTHORIZATION_BYTES {
+                return Err(session_error("swap authorization is too large"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !response.status().is_success() {
+            return Err(session_error("swap authorization unavailable"));
+        }
+        Ok((bytes, response_at))
     }
 
     /// Verify a fresh authorization through the account's Pubky-resolved homeserver.
@@ -211,8 +302,7 @@ impl AuthorizationVerifier {
             return Err(session_error("noncanonical swap account"));
         }
         let path = authorization_path(&request.scope, remote_key)?;
-        let address = format!("pubky://{owner}{path}");
-        let fetch = async {
+        let lookup = async {
             let started = Instant::now();
             let _permit = self
                 .lookups
@@ -220,27 +310,11 @@ impl AuthorizationVerifier {
                 .await
                 .map_err(|_| session_error("swap authorization unavailable"))?;
             let queued = started.elapsed();
-            let mut response = self
-                .storage_for(&owner)?
-                .get(address)
-                .await
-                .map_err(|_| session_error("swap authorization unavailable"))?;
-            let response_at = started.elapsed();
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| session_error("invalid authorization response"))?
-            {
-                if bytes.len().saturating_add(chunk.len()) > MAX_AUTHORIZATION_BYTES {
-                    return Err(session_error("swap authorization is too large"));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
+            let (bytes, response) = self.fetch(&owner, &path).await?;
             let timing = LookupTiming {
                 queued,
-                response: response_at - queued,
-                body: started.elapsed() - response_at,
+                response,
+                body: started.elapsed() - queued - response,
             };
             let authorization: SwapAuthorization = serde_json::from_slice(&bytes)?;
             validate_authorization(
@@ -252,17 +326,64 @@ impl AuthorizationVerifier {
             )?;
             Ok((owner, timing))
         };
-        tokio::time::timeout(self.timeout, fetch)
+        tokio::time::timeout(self.timeout, lookup)
             .await
             .map_err(|_| session_error("swap authorization lookup timed out"))?
     }
 }
 
-fn build_storage(factory: &ClientFactory) -> Result<PublicStorage> {
+fn build_client(factory: &ClientFactory, generation: u64) -> Result<SharedClient> {
     let started = Instant::now();
-    let client = factory()?;
+    let config = factory();
+    let pkarr = config
+        .clone()
+        .build()
+        .map_err(|_| session_error("Pubky resolver unavailable"))?;
+    let mut builder = PubkyHttpClient::builder();
+    builder.pkarr(|pkarr| {
+        *pkarr = config;
+        pkarr
+    });
+    let http = builder
+        .build()
+        .map_err(|_| session_error("Pubky resolver unavailable"))?;
     debug!(elapsed = ?started.elapsed(), "built Pubky authorization client");
-    Ok(Pubky::with_client(client).public_storage())
+    Ok(SharedClient {
+        http,
+        pkarr,
+        generation,
+        owners: HashMap::new(),
+    })
+}
+
+/// Pubky's transport choice: the direct endpoint unless the homeserver publishes
+/// only an ICANN domain, or also publishes one and the direct endpoint is unreachable.
+async fn resolve_route(pkarr: &pkarr::Client, qname: &str) -> Route {
+    let endpoints = pkarr.resolve_https_endpoints(qname);
+    futures::pin_mut!(endpoints);
+    let mut direct: Option<Vec<SocketAddr>> = None;
+    let mut icann = None;
+    while let Some(endpoint) = endpoints.next().await {
+        match endpoint.domain() {
+            Some(domain) => {
+                icann.get_or_insert_with(|| (domain.to_string(), endpoint.port()));
+            }
+            None => direct
+                .get_or_insert_with(Vec::new)
+                .extend(endpoint.to_socket_addrs()),
+        }
+    }
+    let Some((domain, port)) = icann else {
+        return Route::Direct;
+    };
+    if let Some(addrs) = direct {
+        for addr in addrs {
+            if let Ok(Ok(_)) = tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(addr)).await {
+                return Route::Direct;
+            }
+        }
+    }
+    Route::Icann { domain, port }
 }
 
 /// Derive an application transport key without reusing the wallet or account key.
@@ -511,6 +632,7 @@ mod tests {
 
         enum Reply {
             Body(Vec<u8>),
+            Error(Vec<u8>),
             Stall,
         }
 
@@ -598,18 +720,9 @@ mod tests {
                 let bootstrap = self.dht.bootstrap.clone();
                 AuthorizationVerifier::with_client_factory(
                     move || {
-                        let mut builder = PubkyHttpClient::builder();
-                        builder.pkarr(|pkarr| {
-                            pkarr
-                                .no_default_network()
-                                .no_relays()
-                                .bootstrap(&bootstrap)
-                                .dht_report_policy(
-                                    pubky_session::pkarr::dht::ReportPolicy::testnet(),
-                                )
-                                .request_timeout(Duration::from_millis(100))
-                        });
-                        Ok(builder.build().unwrap())
+                        let mut pkarr = pkarr_builder(&bootstrap);
+                        pkarr.request_timeout(Duration::from_millis(100));
+                        pkarr
                     },
                     &self.provider,
                 )
@@ -652,14 +765,18 @@ mod tests {
             }
         }
 
-        fn pkarr_client(dht: &mainline::Testnet) -> PkarrClient {
-            PkarrClient::builder()
+        fn pkarr_builder(bootstrap: &[String]) -> pkarr::ClientBuilder {
+            let mut builder = PkarrClient::builder();
+            builder
                 .no_default_network()
                 .no_relays()
-                .bootstrap(&dht.bootstrap)
-                .dht_report_policy(pubky_session::pkarr::dht::ReportPolicy::testnet())
-                .build()
-                .unwrap()
+                .bootstrap(bootstrap)
+                .dht_report_policy(pubky_session::pkarr::dht::ReportPolicy::testnet());
+            builder
+        }
+
+        fn pkarr_client(dht: &mainline::Testnet) -> PkarrClient {
+            pkarr_builder(&dht.bootstrap).build().unwrap()
         }
 
         async fn serve(
@@ -715,12 +832,15 @@ mod tests {
                 counters.in_flight.fetch_sub(1, Ordering::SeqCst);
                 let path = request_line.split(' ').nth(1).unwrap_or_default();
                 let reply = match files.lock().unwrap().get(path) {
-                    Some(Reply::Body(body)) => Some(Some(body.clone())),
+                    Some(Reply::Body(body)) => Some(Some(("200 OK", body.clone()))),
+                    Some(Reply::Error(body)) => {
+                        Some(Some(("500 Internal Server Error", body.clone())))
+                    }
                     Some(Reply::Stall) => Some(None),
                     None => None,
                 };
-                let body = match reply {
-                    Some(Some(body)) => body,
+                let (status, body) = match reply {
+                    Some(Some(reply)) => reply,
                     Some(None) => {
                         tokio::time::sleep(Duration::from_secs(3600)).await;
                         return Ok(());
@@ -732,7 +852,10 @@ mod tests {
                         continue;
                     }
                 };
-                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
                 stream.write_all(head.as_bytes()).await?;
                 stream.write_all(&body).await?;
                 stream.flush().await?;
@@ -869,6 +992,14 @@ mod tests {
             let error = verifier.verify(&request, &key).await.unwrap_err();
             assert!(error.to_string().contains("too large"), "{error}");
 
+            // Error bodies are held to the same limit.
+            homeserver.reply(Reply::Error(vec![b' '; MAX_AUTHORIZATION_BYTES + 1]));
+            let error = verifier.verify(&request, &key).await.unwrap_err();
+            assert!(error.to_string().contains("too large"), "{error}");
+            homeserver.reply(Reply::Error(b"{}".to_vec()));
+            let error = verifier.verify(&request, &key).await.unwrap_err();
+            assert!(error.to_string().contains("unavailable"), "{error}");
+
             verifier.timeout = Duration::from_millis(500);
             homeserver.reply(Reply::Stall);
             let error = verifier.verify(&request, &key).await.unwrap_err();
@@ -892,6 +1023,62 @@ mod tests {
             assert!(wait_for(|| homeserver.counters.open.load(Ordering::SeqCst) == 0).await);
             let error = verifier.verify(&request, &key).await.unwrap_err();
             assert!(error.to_string().contains("unavailable"), "{error}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn icann_domain_is_used_only_when_the_direct_endpoint_is_unreachable() {
+            let dht = mainline::Testnet::builder(3).build().unwrap();
+            let pkarr = pkarr_client(&dht);
+            let open = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let closed_port = closed.local_addr().unwrap().port();
+            drop(closed);
+
+            let mut routes = Vec::new();
+            for direct_port in [
+                None,
+                Some(open.local_addr().unwrap().port()),
+                Some(closed_port),
+            ] {
+                let homeserver = Keypair::random();
+                let mut builder = SignedPacket::builder();
+                if let Some(port) = direct_port {
+                    let mut direct = SVCB::new(1, ".".try_into().unwrap());
+                    direct.set_port(port);
+                    builder = builder
+                        .https(".".try_into().unwrap(), direct, 3600)
+                        .address(
+                            ".".try_into().unwrap(),
+                            IpAddr::V4(Ipv4Addr::LOCALHOST),
+                            3600,
+                        );
+                }
+                let mut icann = SVCB::new(2, "homeserver.example".try_into().unwrap());
+                icann.set_port(8443);
+                let packet = builder
+                    .https(".".try_into().unwrap(), icann, 3600)
+                    .sign(&homeserver)
+                    .unwrap();
+                pkarr.publish(&packet).await.unwrap();
+                let owner = Keypair::random();
+                let name = homeserver.public_key().to_z32();
+                let packet = SignedPacket::builder()
+                    .https(
+                        "_pubky".try_into().unwrap(),
+                        SVCB::new(0, name.as_str().try_into().unwrap()),
+                        3600,
+                    )
+                    .sign(&owner)
+                    .unwrap();
+                pkarr.publish(&packet).await.unwrap();
+                let qname = format!("_pubky.{}", owner.public_key().to_z32());
+                routes.push(resolve_route(&pkarr, &qname).await);
+            }
+            let icann = Route::Icann {
+                domain: "homeserver.example".into(),
+                port: Some(8443),
+            };
+            assert_eq!(routes, [icann.clone(), Route::Direct, icann]);
         }
 
         #[tokio::test(flavor = "multi_thread")]
