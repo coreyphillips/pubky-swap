@@ -1561,19 +1561,17 @@ async fn handle_message(
             };
             if let Err(e) = result {
                 warn!("failed to start {direction:?} swap: {e}");
-                // Not retried: handling the request again would start the swap again, and the
-                // quote it spent would turn this refusal into a misleading "unknown quote".
-                if let Err(send) = reject(
+                // A failed send is retried. The retry cannot start a second swap: the quote is
+                // single-use and a persisted start replays. At worst the client is refused
+                // with "unknown quote", which still beats waiting out its timeout.
+                return reject(
                     &ctx.transport,
                     sender,
                     None,
                     Some(quote_id),
                     &format!("swap start failed: {e}"),
                 )
-                .await
-                {
-                    warn!("could not tell {sender} the swap failed to start: {send}");
-                }
+                .await;
             }
         }
 
