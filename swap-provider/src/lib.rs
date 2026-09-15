@@ -990,18 +990,25 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     info!("Provider running; waiting for quote/swap requests...");
     loop {
         let messages = transport
-            .receive_all::<SwapMessage>()
+            .receive_all_with_receipts::<SwapMessage>()
             .await
             .unwrap_or_default();
-        for (sender, msg) in messages {
+        for inbound in messages {
             // No offer yet means the daemon is still working out what it can serve. Nothing to
-            // quote against, so nothing to answer; the message stays unprocessed and comes round
-            // again on the next poll.
+            // quote against, so nothing to answer; the message goes back and comes round again
+            // on the next poll.
             let Some(current) = offer.read().await.clone() else {
+                transport.release(&inbound.receipt);
                 continue;
             };
-            if let Err(e) = handle_message(&ctx, &current, &sender, msg).await {
-                warn!("error handling message from {sender}: {e}");
+            let sender = &inbound.peer;
+            if let Err(e) = handle_message(&ctx, &current, sender, inbound.message).await {
+                if is_reply_not_sent(&e) {
+                    warn!("could not reply to {sender}, will retry: {e}");
+                    transport.release(&inbound.receipt);
+                } else {
+                    warn!("error handling message from {sender}: {e}");
+                }
             }
         }
         sleep(Duration::from_millis(200)).await;
@@ -1327,9 +1334,7 @@ async fn handle_message(
         SwapMessage::OfferRequest(req) => {
             let mut current = offer.clone();
             current.request_id = req.request_id;
-            ctx.transport
-                .send(sender, &SwapMessage::Offer(current))
-                .await?;
+            respond(&ctx.transport, sender, &SwapMessage::Offer(current)).await?;
         }
         SwapMessage::SwapStatusRequest(req) => {
             match status_snapshot(
@@ -1339,9 +1344,12 @@ async fn handle_message(
                 &req,
             ) {
                 Ok(snapshot) => {
-                    ctx.transport
-                        .send(sender, &SwapMessage::SwapStatusSnapshot(snapshot))
-                        .await?
+                    respond(
+                        &ctx.transport,
+                        sender,
+                        &SwapMessage::SwapStatusSnapshot(snapshot),
+                    )
+                    .await?
                 }
                 Err(error) => {
                     let code = match error.downcast_ref::<SwapLookupError>() {
@@ -1364,8 +1372,18 @@ async fn handle_message(
         }
 
         SwapMessage::QuoteRequest(req) => {
+            // Refused rather than ignored: the offer refreshes while its predecessor is still
+            // advertised, so a client naming it would otherwise wait out its timeout.
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
-                return Ok(());
+                return reject_request(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    &format!("offer {} is no longer current", req.offer_id),
+                )
+                .await;
             }
             // The cheapest place to find a mismatch: nothing is quoted, nothing reserved, and no
             // key generated. Finding it later means finding it with money already committed.
@@ -1467,9 +1485,9 @@ async fn handle_message(
                 );
             }
             info!("Sending quote {} to {sender}", quote.quote_id);
-            ctx.transport
-                .send(sender, &SwapMessage::Quote(quote))
-                .await?;
+            // A failed send may still have been published, so the quote stays redeemable
+            // until it expires even though the retry issues another.
+            respond(&ctx.transport, sender, &SwapMessage::Quote(quote)).await?;
         }
 
         SwapMessage::SwapRequest(req) => {
@@ -1491,31 +1509,47 @@ async fn handle_message(
             ) {
                 Ok(Some(mut record)) => {
                     if record.pending_hold_invoice.is_some() {
-                        let reservation = Some(reserve_pending_swap(ctx, &record).await?);
-                        record = complete_invoice_intent(
-                            ctx.ln.as_ref(),
-                            ctx.store.as_ref(),
-                            record.swap_id,
-                            true,
-                        )
-                        .await?;
-                        let swap = reverse_swap_from_record(&record, ctx.timelock)?;
-                        spawn_reverse_driver(
-                            ctx,
-                            swap,
-                            record.clone(),
-                            reservation,
-                            Duration::ZERO,
-                        );
+                        let resumed = async {
+                            let reservation = Some(reserve_pending_swap(ctx, &record).await?);
+                            let completed = complete_invoice_intent(
+                                ctx.ln.as_ref(),
+                                ctx.store.as_ref(),
+                                record.swap_id,
+                                true,
+                            )
+                            .await?;
+                            let swap = reverse_swap_from_record(&completed, ctx.timelock)?;
+                            spawn_reverse_driver(
+                                ctx,
+                                swap,
+                                completed.clone(),
+                                reservation,
+                                Duration::ZERO,
+                            );
+                            anyhow::Ok(completed)
+                        }
+                        .await;
+                        record = match resumed {
+                            Ok(completed) => completed,
+                            // Refused like a failed start, so a failed send releases the request
+                            // and the pending intent is tried again on the next poll.
+                            Err(e) => {
+                                warn!("failed to resume reverse swap {}: {e}", record.swap_id);
+                                return reject(
+                                    &ctx.transport,
+                                    sender,
+                                    None,
+                                    Some(req.quote_id),
+                                    &format!("swap start failed: {e}"),
+                                )
+                                .await;
+                            }
+                        };
                     }
                     let accept = record
                         .swap_accept
                         .ok_or_else(|| anyhow!("persisted creation is missing its acceptance"))?;
-                    return ctx
-                        .transport
-                        .send(sender, &SwapMessage::SwapAccept(accept))
-                        .await
-                        .map_err(Into::into);
+                    return respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1547,14 +1581,17 @@ async fn handle_message(
             };
             if let Err(e) = result {
                 warn!("failed to start {direction:?} swap: {e}");
-                reject(
+                // A failed send is retried. The retry cannot start a second swap: the quote is
+                // single-use and a persisted start replays. At worst the client is refused
+                // with "unknown quote", which still beats waiting out its timeout.
+                return reject(
                     &ctx.transport,
                     sender,
                     None,
                     Some(quote_id),
                     &format!("swap start failed: {e}"),
                 )
-                .await?;
+                .await;
             }
         }
 
@@ -2832,19 +2869,51 @@ async fn reject_coded(
     reason: &str,
     code: Option<&str>,
 ) -> Result<()> {
-    transport
-        .send(
-            sender,
-            &SwapMessage::Reject(Reject {
-                code: code.map(str::to_string),
-                request_id,
-                swap_id,
-                quote_id,
-                reason: reason.to_string(),
-            }),
-        )
-        .await?;
-    Ok(())
+    respond(
+        transport,
+        sender,
+        &SwapMessage::Reject(Reject {
+            code: code.map(str::to_string),
+            request_id,
+            swap_id,
+            quote_id,
+            reason: reason.to_string(),
+        }),
+    )
+    .await
+}
+
+/// A reply to a request that the messenger failed to deliver.
+///
+/// Every reply sent through [`respond`] answers a request that is safe to handle again: offers,
+/// quotes and refusals are recomputed, and an admitted swap is replayed from the store. So the
+/// request is released for another poll instead of leaving the client to time out.
+#[derive(Debug)]
+struct ReplyNotSent(pubky_transport::TransportError);
+
+impl std::fmt::Display for ReplyNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reply not sent: {}", self.0)
+    }
+}
+
+impl std::error::Error for ReplyNotSent {}
+
+async fn respond(transport: &ReplyTransport, peer: &str, message: &SwapMessage) -> Result<()> {
+    transport.send(peer, message).await.map_err(reply_error)
+}
+
+/// Only a messenger failure can pass; a message that did not serialize or a bad key will fail
+/// the same way every time.
+fn reply_error(error: pubky_transport::TransportError) -> anyhow::Error {
+    match error {
+        pubky_transport::TransportError::Messenger(_) => ReplyNotSent(error).into(),
+        other => other.into(),
+    }
+}
+
+fn is_reply_not_sent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReplyNotSent>().is_some()
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {
@@ -2879,6 +2948,23 @@ fn variant_name(msg: &SwapMessage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A request whose reply the homeserver refused goes back for another poll; one that would
+    /// fail the same way again does not.
+    #[test]
+    fn only_a_failed_delivery_releases_the_request() {
+        use pubky_transport::TransportError;
+
+        let refused =
+            super::reply_error(TransportError::Messenger("send dm: 503".into())).context("quote");
+        assert!(super::is_reply_not_sent(&refused));
+
+        let malformed = super::reply_error(TransportError::InvalidPubkey("bad".into()));
+        assert!(!super::is_reply_not_sent(&malformed));
+        assert!(!super::is_reply_not_sent(&anyhow::anyhow!(
+            "unknown or expired quote"
+        )));
+    }
 
     /// One momentary Electrum failure used to delete a funded swap's record, because the driver
     /// called `store.remove` on every return including errors and every `?` in a driver
