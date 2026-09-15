@@ -817,6 +817,9 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
         _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
     };
+    let transport = transport
+        .with_receive_journal(format!("{}/receive-journal.json", config.data_dir))
+        .context("open receive journal")?;
     let provider_pkarr = transport.public_key_string();
     info!("Provider pubky: {provider_pkarr}");
 
@@ -1032,6 +1035,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             .receive_all_with_receipts::<SwapMessage>()
             .await
             .unwrap_or_default();
+        let mut handled = Vec::new();
         for inbound in messages {
             // No offer yet means the daemon is still working out what it can serve. Nothing to
             // quote against, so nothing to answer; the message goes back and comes round again
@@ -1045,10 +1049,15 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
                 if is_reply_not_sent(&e) {
                     warn!("could not reply to {sender}, will retry: {e}");
                     transport.release(&inbound.receipt);
-                } else {
-                    warn!("error handling message from {sender}: {e}");
+                    continue;
                 }
+                warn!("error handling message from {sender}: {e}");
             }
+            handled.push(inbound.receipt);
+        }
+        // Once per batch: each call rewrites and syncs the whole journal.
+        if let Err(e) = transport.acknowledge(&handled) {
+            warn!("could not record handled messages: {e}");
         }
         sleep(Duration::from_millis(200)).await;
     }
@@ -2792,7 +2801,8 @@ async fn evict_peer_if_idle(ctx: &ExecCtx, peer: &str) {
             true
         }
     };
-    if still_active {
+    // A request restored from the receive journal may not have been polled yet.
+    if still_active || ctx.transport.has_pending_messages(peer) {
         return;
     }
     ctx.transport.evict_peer(peer).await;

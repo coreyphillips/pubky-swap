@@ -11,10 +11,14 @@ use pubky_messenger::PrivateMessengerClient;
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::sync::{Arc, RwLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
+
+mod journal;
+use journal::{Journal, Outcome};
 
 #[cfg(feature = "iroh")]
 pub mod p2p;
@@ -194,6 +198,9 @@ pub struct Transport {
     known_peers: Arc<PeerSet>,
     /// Processed message IDs, for deduplication across polls.
     processed_messages: Arc<RwLock<HashSet<String>>>,
+    /// What became of delivered messages, across restarts. See
+    /// [`with_receive_journal`](Self::with_receive_journal).
+    journal: Option<Mutex<Journal>>,
 }
 
 /// Soft cap on the dedup set so it cannot grow without bound over long sessions.
@@ -241,7 +248,20 @@ impl Transport {
             messenger,
             known_peers: Arc::new(PeerSet::default()),
             processed_messages: Arc::new(RwLock::new(HashSet::new())),
+            journal: None,
         }
+    }
+
+    /// Keep delivery state in a file at `path`, so a restart neither repeats acknowledged
+    /// messages nor loses ones delivered but never [`acknowledge`](Self::acknowledge)d.
+    ///
+    /// Without it, a restarted process decides by sender timestamp alone. Peers with
+    /// unacknowledged messages are added back to the poll set, since nothing else would poll them.
+    pub fn with_receive_journal(mut self, path: impl AsRef<Path>) -> Result<Self> {
+        let journal = Journal::open(path.as_ref())?;
+        restore_pending_peers(&self.known_peers, &journal);
+        self.journal = Some(Mutex::new(journal));
+        Ok(self)
     }
 
     /// This transport's own public key (pkarr) string.
@@ -270,8 +290,26 @@ impl Transport {
     }
 
     /// Unpinned peers whose last activity is older than `ttl` (candidates for idle reaping).
+    ///
+    /// Peers with delivered but unacknowledged messages are left out, so a restored request is
+    /// not dropped from the poll set while its homeserver is unreachable.
     pub fn idle_unpinned_peers(&self, ttl: Duration) -> Vec<String> {
-        self.known_peers.idle_unpinned(ttl)
+        let mut idle = self.known_peers.idle_unpinned(ttl);
+        if let Some(journal) = &self.journal {
+            let pending = lock(journal).pending_peers();
+            idle.retain(|peer| pending.binary_search(peer).is_err());
+        }
+        idle
+    }
+
+    /// Whether `peer` has delivered messages that are not yet acknowledged.
+    pub fn has_pending_messages(&self, peer: &str) -> bool {
+        self.journal.as_ref().is_some_and(|journal| {
+            lock(journal)
+                .pending_peers()
+                .binary_search_by(|p| p.as_str().cmp(peer))
+                .is_ok()
+        })
     }
 
     /// Stop tracking a peer: drop it from the in-memory poll set and best-effort remove any
@@ -373,6 +411,14 @@ impl Transport {
                 }
             }
         }
+        if let Some(journal) = &self.journal {
+            let mut journal = lock(journal);
+            for msg in &messages {
+                let id = Self::message_id(peer_pkarr, msg);
+                journal.record(&id, peer_pkarr, msg.timestamp, Outcome::Handled);
+            }
+            save_journal(&mut journal, &self.known_peers)?;
+        }
         debug!("marked {marked} existing message(s) from {peer_pkarr} as already seen");
         Ok(marked)
     }
@@ -389,12 +435,18 @@ impl Transport {
 
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let tracked = self.known_peers.polling_from(peer_pkarr).is_some();
-        Ok(self
-            .read_conversation(peer_pkarr, tracked)
-            .await?
-            .into_iter()
-            .map(|(_, message)| message)
-            .collect())
+        let mut delivered = self.read_conversation(peer_pkarr, tracked).await?;
+        if !self.save_delivered(delivered.iter().map(|(receipt, _)| receipt)) {
+            delivered.clear();
+        }
+        if let Err(e) = acknowledge(
+            self.journal.as_ref(),
+            &self.known_peers,
+            delivered.iter().map(|(receipt, _)| receipt),
+        ) {
+            warn!("could not save the receive journal: {e}");
+        }
+        Ok(delivered.into_iter().map(|(_, message)| message).collect())
     }
 
     /// `tracked` is whether the peer was in the poll set when the caller decided to read it.
@@ -413,6 +465,7 @@ impl Transport {
         Ok(accept_batch(
             &self.known_peers,
             &self.processed_messages,
+            self.journal.as_ref(),
             peer_pkarr,
             tracked,
             messages,
@@ -421,16 +474,23 @@ impl Transport {
 
     /// Receive new messages from all known peers concurrently.
     pub async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
-        Ok(self
-            .receive_all_with_receipts()
-            .await?
+        let delivered = self.receive_all_with_receipts().await?;
+        if let Err(e) = acknowledge(
+            self.journal.as_ref(),
+            &self.known_peers,
+            delivered.iter().map(|inbound| &inbound.receipt),
+        ) {
+            warn!("could not save the receive journal: {e}");
+        }
+        Ok(delivered
             .into_iter()
             .map(|inbound| (inbound.peer, inbound.message))
             .collect())
     }
 
-    /// Like [`receive_all`](Self::receive_all), with a receipt per message so a caller that could
-    /// not finish handling one can [`release`](Self::release) it for the next poll.
+    /// Like [`receive_all`](Self::receive_all), with a receipt per message. The caller
+    /// [`acknowledge`](Self::acknowledge)s each message once handled, or
+    /// [`release`](Self::release)s one it could not finish for the next poll.
     pub async fn receive_all_with_receipts<M: DeserializeOwned>(&self) -> Result<Vec<Inbound<M>>> {
         use futures::future::join_all;
 
@@ -460,7 +520,23 @@ impl Transport {
                 Err(e) => debug!("failed to receive from {peer}: {e}"),
             }
         }
+        // One save for the whole poll, however many peers had something new.
+        if !self.save_delivered(all.iter().map(|inbound| &inbound.receipt)) {
+            all.clear();
+        }
         Ok(all)
+    }
+
+    /// Record freshly delivered messages as pending before the caller sees them, so a crash
+    /// mid-dispatch leaves the work pending. Unsaved state, from this poll or an earlier failure,
+    /// holds the messages back for a later poll: returns false after releasing them.
+    fn save_delivered<'a>(&self, receipts: impl Iterator<Item = &'a Receipt> + Clone) -> bool {
+        save_delivered(
+            self.journal.as_ref(),
+            &self.known_peers,
+            &self.processed_messages,
+            receipts,
+        )
     }
 
     /// Hand a delivered message back, so the next poll delivers it again.
@@ -469,6 +545,20 @@ impl Transport {
     /// that may pass (a reply the homeserver would not take) is otherwise gone for good.
     pub fn release(&self, receipt: &Receipt) {
         release(&self.processed_messages, receipt);
+    }
+
+    /// Record delivered messages as handled, so a restart does not deliver them again.
+    ///
+    /// Only matters with a [receive journal](Self::with_receive_journal). A message delivered and
+    /// never acknowledged is delivered again after a restart, however old it is by then. Each call
+    /// rewrites the journal, so acknowledge a batch at once. On error nothing more is delivered
+    /// until a later poll manages to save.
+    pub fn acknowledge<'a>(&self, receipts: impl IntoIterator<Item = &'a Receipt>) -> Result<()> {
+        Ok(acknowledge(
+            self.journal.as_ref(),
+            &self.known_peers,
+            receipts,
+        )?)
     }
 
     /// Delete all messages exchanged with a peer (cleanup), and forget their dedup ids.
@@ -481,6 +571,11 @@ impl Transport {
             .map_err(|e| TransportError::Messenger(format!("clear messages: {e}")))?;
         if let Ok(mut processed) = self.processed_messages.write() {
             processed.retain(|id| !id.starts_with(&format!("{peer_pkarr}-")));
+        }
+        if let Some(journal) = &self.journal {
+            let mut journal = lock(journal);
+            journal.forget_peer(peer_pkarr);
+            save_journal(&mut journal, &self.known_peers)?;
         }
         Ok(())
     }
@@ -517,12 +612,53 @@ fn release(processed_messages: &RwLock<HashSet<String>>, receipt: &Receipt) {
     }
 }
 
+fn restore_pending_peers(known_peers: &PeerSet, journal: &Journal) {
+    for peer in journal.pending_peers() {
+        known_peers.touch_or_add(peer, false);
+    }
+}
+
+fn lock(journal: &Mutex<Journal>) -> std::sync::MutexGuard<'_, Journal> {
+    journal.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Writes the journal if memory is ahead of the file.
+fn save_journal(journal: &mut Journal, known_peers: &PeerSet) -> std::io::Result<()> {
+    if !journal.is_dirty() {
+        return Ok(());
+    }
+    let now = now_unix();
+    let floor = |peer: &str| {
+        known_peers
+            .polling_from(peer)
+            .unwrap_or(now)
+            .saturating_sub(POLL_FROM_GRACE_SECS)
+    };
+    journal.save(floor)
+}
+
+fn acknowledge<'a>(
+    journal: Option<&Mutex<Journal>>,
+    known_peers: &PeerSet,
+    receipts: impl IntoIterator<Item = &'a Receipt>,
+) -> std::io::Result<()> {
+    let Some(journal) = journal else {
+        return Ok(());
+    };
+    let mut journal = lock(journal);
+    for receipt in receipts {
+        journal.acknowledge(&receipt.0);
+    }
+    save_journal(&mut journal, known_peers)
+}
+
 /// Filter one conversation read down to the messages this poll should deliver, marking them seen.
 ///
 /// `tracked` is whether the peer was in the poll set when the read began.
 fn accept_batch<M: DeserializeOwned>(
     known_peers: &PeerSet,
     processed_messages: &RwLock<HashSet<String>>,
+    journal: Option<&Mutex<Journal>>,
     peer_pkarr: &str,
     tracked: bool,
     messages: Vec<pubky_messenger::DecryptedMessage>,
@@ -553,13 +689,9 @@ fn accept_batch<M: DeserializeOwned>(
     }
     let floor = floor.map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
 
+    let mut journal = journal.map(lock);
     let mut parsed = Vec::new();
     for msg in messages {
-        if let Some(floor) = floor {
-            if msg.timestamp < floor {
-                continue;
-            }
-        }
         let message_id = Transport::message_id(peer_pkarr, &msg);
 
         let is_duplicate = processed_messages
@@ -570,6 +702,19 @@ fn accept_batch<M: DeserializeOwned>(
             continue;
         }
 
+        // A journal entry outranks the floor. Handled work stays handled however recent its
+        // timestamp, and work delivered before a restart but never acknowledged still comes back
+        // however old it is now.
+        match journal.as_ref().and_then(|j| j.outcome(&message_id)) {
+            Some(Outcome::Handled) => continue,
+            Some(Outcome::Pending) => {}
+            None => {
+                if floor.is_some_and(|floor| msg.timestamp < floor) {
+                    continue;
+                }
+            }
+        }
+
         match serde_json::from_str::<M>(&msg.content) {
             Ok(parsed_msg) => {
                 if let Ok(mut processed) = processed_messages.write() {
@@ -578,6 +723,9 @@ fn accept_batch<M: DeserializeOwned>(
                         processed.clear();
                     }
                     processed.insert(message_id.clone());
+                }
+                if let Some(journal) = journal.as_mut() {
+                    journal.record(&message_id, peer_pkarr, msg.timestamp, Outcome::Pending);
                 }
                 // A peer evicted from here on stays evicted; only an untracked read adds one.
                 if tracked {
@@ -606,7 +754,31 @@ fn accept_batch<M: DeserializeOwned>(
             }
         }
     }
+    // The pending entries are recorded but not saved: the caller saves once per poll with
+    // `save_delivered`, not once per peer.
     parsed
+}
+
+fn save_delivered<'a>(
+    journal: Option<&Mutex<Journal>>,
+    known_peers: &PeerSet,
+    processed_messages: &RwLock<HashSet<String>>,
+    receipts: impl Iterator<Item = &'a Receipt> + Clone,
+) -> bool {
+    let Some(journal) = journal else {
+        return true;
+    };
+    if receipts.clone().next().is_none() {
+        return true;
+    }
+    let Err(e) = save_journal(&mut lock(journal), known_peers) else {
+        return true;
+    };
+    warn!("could not save the receive journal, holding back delivered messages: {e}");
+    for receipt in receipts {
+        release(processed_messages, receipt);
+    }
+    false
 }
 
 /// The messaging surface the swap protocol needs from a transport.
@@ -734,8 +906,14 @@ mod poll_window_tests {
         // Evicted while the network read was awaiting.
         peers.remove("peer");
 
-        let delivered: Vec<(Receipt, u32)> =
-            accept_batch(&peers, &processed, "peer", tracked, history_and_fresh());
+        let delivered: Vec<(Receipt, u32)> = accept_batch(
+            &peers,
+            &processed,
+            None,
+            "peer",
+            tracked,
+            history_and_fresh(),
+        );
         assert!(delivered.is_empty());
         assert!(
             peers.all().is_empty(),
@@ -754,7 +932,7 @@ mod poll_window_tests {
         peers.touch_or_add("peer".into(), false);
 
         let delivered: Vec<(Receipt, u32)> =
-            accept_batch(&peers, &processed, "peer", true, history_and_fresh());
+            accept_batch(&peers, &processed, None, "peer", true, history_and_fresh());
         let delivered: Vec<u32> = delivered.into_iter().map(|(_, m)| m).collect();
         assert_eq!(delivered, vec![2]);
         assert_eq!(peers.all(), vec!["peer".to_string()]);
@@ -769,16 +947,171 @@ mod poll_window_tests {
         let conversation = || vec![message(now, "1"), message(now, "2")];
 
         let first: Vec<(Receipt, u32)> =
-            accept_batch(&peers, &processed, "peer", true, conversation());
+            accept_batch(&peers, &processed, None, "peer", true, conversation());
         assert_eq!(first.len(), 2);
         let again: Vec<(Receipt, u32)> =
-            accept_batch(&peers, &processed, "peer", true, conversation());
+            accept_batch(&peers, &processed, None, "peer", true, conversation());
         assert!(again.is_empty(), "delivered messages are not repeated");
 
         release(&processed, &first[1].0);
         let retried: Vec<(Receipt, u32)> =
-            accept_batch(&peers, &processed, "peer", true, conversation());
+            accept_batch(&peers, &processed, None, "peer", true, conversation());
         assert_eq!(retried, vec![(first[1].0.clone(), 2)]);
+    }
+
+    fn journal_path(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pubky-transport-journal-{name}-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// The in-memory state a process starts with, over the journal an earlier run left behind.
+    struct Run {
+        peers: PeerSet,
+        processed: RwLock<HashSet<String>>,
+        journal: Mutex<Journal>,
+    }
+
+    impl Run {
+        fn start(path: &Path) -> Self {
+            let run = Self {
+                peers: PeerSet::default(),
+                processed: RwLock::new(HashSet::new()),
+                journal: Mutex::new(Journal::open(path).unwrap()),
+            };
+            restore_pending_peers(&run.peers, &lock(&run.journal));
+            run
+        }
+
+        fn poll(
+            &self,
+            conversation: Vec<pubky_messenger::DecryptedMessage>,
+        ) -> Vec<(Receipt, u32)> {
+            let delivered = accept_batch(
+                &self.peers,
+                &self.processed,
+                Some(&self.journal),
+                "peer",
+                true,
+                conversation,
+            );
+            if !save_delivered(
+                Some(&self.journal),
+                &self.peers,
+                &self.processed,
+                delivered.iter().map(|(receipt, _)| receipt),
+            ) {
+                return Vec::new();
+            }
+            delivered
+        }
+
+        fn acknowledge(&self, delivered: &[(Receipt, u32)]) {
+            acknowledge(
+                Some(&self.journal),
+                &self.peers,
+                delivered.iter().map(|(receipt, _)| receipt),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_acknowledged_request_is_not_delivered_again_after_a_quick_restart() {
+        let path = journal_path("acknowledged");
+        let sent = now_unix();
+        let conversation = || vec![message(sent, "1")];
+
+        let before = Run::start(&path);
+        before.peers.touch_or_add("peer".into(), false);
+        let delivered = before.poll(conversation());
+        assert_eq!(delivered.len(), 1);
+        before.acknowledge(&delivered);
+        drop(before);
+
+        // Well inside the grace window, where the floor alone would deliver it again.
+        let after = Run::start(&path);
+        after.peers.touch_or_add("peer".into(), false);
+        assert!(after.poll(conversation()).is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_request_delivered_but_not_acknowledged_survives_a_long_outage() {
+        let path = journal_path("pending");
+        let sent = now_unix() - 3600;
+        let conversation = || vec![message(sent, "1")];
+
+        let before = Run::start(&path);
+        before.peers.peers.write().unwrap().insert(
+            "peer".into(),
+            PeerEntry {
+                pinned: false,
+                last_seen: Instant::now(),
+                polling_from: sent,
+            },
+        );
+        assert_eq!(before.poll(conversation()).len(), 1);
+        drop(before);
+
+        // Far past the grace window. The peer is back in the poll set without ringing again.
+        let after = Run::start(&path);
+        assert_eq!(after.peers.all(), vec!["peer".to_string()]);
+        let delivered = after.poll(conversation());
+        assert_eq!(delivered.iter().map(|(_, m)| *m).collect::<Vec<_>>(), [1]);
+        assert!(
+            after.poll(conversation()).is_empty(),
+            "not repeated in-process"
+        );
+        after.acknowledge(&delivered);
+        drop(after);
+
+        let last = Run::start(&path);
+        assert!(last.peers.all().is_empty());
+        last.peers.touch_or_add("peer".into(), false);
+        assert!(last.poll(conversation()).is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_no_run_delivered_is_still_suppressed_with_a_journal() {
+        let path = journal_path("history");
+        let run = Run::start(&path);
+        run.peers.touch_or_add("peer".into(), false);
+        let delivered = run.poll(history_and_fresh());
+        assert_eq!(delivered.iter().map(|(_, m)| *m).collect::<Vec<_>>(), [2]);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn nothing_is_delivered_while_the_journal_cannot_be_saved() {
+        let blocker = journal_path("unwritable");
+        let run = Run::start(&blocker.join("journal.json"));
+        // The journal's directory is a regular file, so every save fails.
+        fs::write(&blocker, b"").unwrap();
+        run.peers.touch_or_add("peer".into(), false);
+        let conversation = || vec![message(now_unix(), "1")];
+        assert!(run.poll(conversation()).is_empty());
+        assert!(run.poll(conversation()).is_empty(), "held back, not lost");
+        let _ = fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn handled_entries_below_the_floor_are_pruned_and_pending_ones_kept() {
+        let path = journal_path("prune");
+        let old = now_unix() - 7 * 24 * 3600;
+        let mut journal = Journal::open(&path).unwrap();
+        journal.record("handled", "peer", old, Outcome::Handled);
+        journal.record("pending", "peer", old, Outcome::Pending);
+        save_journal(&mut journal, &PeerSet::default()).unwrap();
+
+        let reopened = Journal::open(&path).unwrap();
+        assert_eq!(reopened.outcome("handled"), None);
+        assert_eq!(reopened.outcome("pending"), Some(Outcome::Pending));
+        let _ = fs::remove_file(&path);
     }
 }
 
