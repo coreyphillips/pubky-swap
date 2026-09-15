@@ -854,6 +854,34 @@ mod tests {
         assert!(set.idle_unpinned(Duration::from_secs(3600)).is_empty());
     }
 
+    /// A homeserver that cannot be reached must fail the read, not look like an empty
+    /// conversation, or the poller backs off as if the peer were merely quiet.
+    #[tokio::test]
+    async fn an_unreachable_homeserver_is_a_failed_read_not_an_empty_one() {
+        let mut builder = pubky_messenger::pubky::Client::builder();
+        // Resolution goes only to a relay that refuses connections, so neither conversation
+        // listing can reach a homeserver.
+        builder.pkarr(|pkarr| {
+            pkarr
+                .no_default_network()
+                .relays(&["http://127.0.0.1:1"])
+                .expect("relay url parses")
+        });
+        let client = builder.build().expect("pubky client builds");
+        let transport = Transport::wrap(PrivateMessengerClient::with_client(
+            pkarr::Keypair::random(),
+            client,
+        ));
+        let peer = pkarr::Keypair::random().public_key().to_string();
+
+        let read = transport.receive_from::<serde_json::Value>(&peer).await;
+        assert!(
+            matches!(read, Err(TransportError::Messenger(_))),
+            "expected a messenger error, got {read:?}"
+        );
+        assert!(transport.mark_conversation_seen(&peer).await.is_err());
+    }
+
     #[test]
     fn remove_drops_peer() {
         let set = PeerSet::default();
