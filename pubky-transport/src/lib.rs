@@ -389,7 +389,12 @@ impl Transport {
 
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let tracked = self.known_peers.polling_from(peer_pkarr).is_some();
-        self.read_conversation(peer_pkarr, tracked).await
+        Ok(self
+            .read_conversation(peer_pkarr, tracked)
+            .await?
+            .into_iter()
+            .map(|(_, message)| message)
+            .collect())
     }
 
     /// `tracked` is whether the peer was in the poll set when the caller decided to read it.
@@ -397,7 +402,7 @@ impl Transport {
         &self,
         peer_pkarr: &str,
         tracked: bool,
-    ) -> Result<Vec<M>> {
+    ) -> Result<Vec<(Receipt, M)>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
         let messages = self
@@ -416,6 +421,17 @@ impl Transport {
 
     /// Receive new messages from all known peers concurrently.
     pub async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
+        Ok(self
+            .receive_all_with_receipts()
+            .await?
+            .into_iter()
+            .map(|inbound| (inbound.peer, inbound.message))
+            .collect())
+    }
+
+    /// Like [`receive_all`](Self::receive_all), with a receipt per message so a caller that could
+    /// not finish handling one can [`release`](Self::release) it for the next poll.
+    pub async fn receive_all_with_receipts<M: DeserializeOwned>(&self) -> Result<Vec<Inbound<M>>> {
         use futures::future::join_all;
 
         let peers = self.get_known_peers();
@@ -436,11 +452,23 @@ impl Transport {
         let mut all = Vec::new();
         for (peer, res) in join_all(futures).await {
             match res {
-                Ok(msgs) => all.extend(msgs.into_iter().map(|m| (peer.clone(), m))),
+                Ok(msgs) => all.extend(msgs.into_iter().map(|(receipt, message)| Inbound {
+                    peer: peer.clone(),
+                    message,
+                    receipt,
+                })),
                 Err(e) => debug!("failed to receive from {peer}: {e}"),
             }
         }
         Ok(all)
+    }
+
+    /// Hand a delivered message back, so the next poll delivers it again.
+    ///
+    /// A message is marked seen as it is delivered, so one whose handling failed for a reason
+    /// that may pass (a reply the homeserver would not take) is otherwise gone for good.
+    pub fn release(&self, receipt: &Receipt) {
+        release(&self.processed_messages, receipt);
     }
 
     /// Delete all messages exchanged with a peer (cleanup), and forget their dedup ids.
@@ -471,6 +499,24 @@ impl Transport {
     }
 }
 
+/// A message delivered by [`Transport::receive_all_with_receipts`].
+#[derive(Debug)]
+pub struct Inbound<M> {
+    pub peer: String,
+    pub message: M,
+    pub receipt: Receipt,
+}
+
+/// Identifies one delivered message, for [`Transport::release`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Receipt(String);
+
+fn release(processed_messages: &RwLock<HashSet<String>>, receipt: &Receipt) {
+    if let Ok(mut processed) = processed_messages.write() {
+        processed.remove(&receipt.0);
+    }
+}
+
 /// Filter one conversation read down to the messages this poll should deliver, marking them seen.
 ///
 /// `tracked` is whether the peer was in the poll set when the read began.
@@ -480,7 +526,7 @@ fn accept_batch<M: DeserializeOwned>(
     peer_pkarr: &str,
     tracked: bool,
     messages: Vec<pubky_messenger::DecryptedMessage>,
-) -> Vec<M> {
+) -> Vec<(Receipt, M)> {
     // Anything sent before this peer joined the poll set belongs to a conversation that had
     // already ended.
     //
@@ -531,7 +577,7 @@ fn accept_batch<M: DeserializeOwned>(
                         debug!("processed_messages cap reached; clearing dedup set");
                         processed.clear();
                     }
-                    processed.insert(message_id);
+                    processed.insert(message_id.clone());
                 }
                 // A peer evicted from here on stays evicted; only an untracked read adds one.
                 if tracked {
@@ -539,7 +585,7 @@ fn accept_batch<M: DeserializeOwned>(
                 } else {
                     known_peers.touch_or_add(peer_pkarr.to_string(), false);
                 }
-                parsed.push(parsed_msg);
+                parsed.push((Receipt(message_id), parsed_msg));
             }
             Err(e) => {
                 // Mark it seen anyway. Deserialization is deterministic, so a message that
@@ -688,7 +734,7 @@ mod poll_window_tests {
         // Evicted while the network read was awaiting.
         peers.remove("peer");
 
-        let delivered: Vec<u32> =
+        let delivered: Vec<(Receipt, u32)> =
             accept_batch(&peers, &processed, "peer", tracked, history_and_fresh());
         assert!(delivered.is_empty());
         assert!(
@@ -707,10 +753,32 @@ mod poll_window_tests {
         let processed = RwLock::new(HashSet::new());
         peers.touch_or_add("peer".into(), false);
 
-        let delivered: Vec<u32> =
+        let delivered: Vec<(Receipt, u32)> =
             accept_batch(&peers, &processed, "peer", true, history_and_fresh());
+        let delivered: Vec<u32> = delivered.into_iter().map(|(_, m)| m).collect();
         assert_eq!(delivered, vec![2]);
         assert_eq!(peers.all(), vec!["peer".to_string()]);
+    }
+
+    #[test]
+    fn a_released_message_is_delivered_again_and_nothing_else_is() {
+        let peers = PeerSet::default();
+        let processed = RwLock::new(HashSet::new());
+        peers.touch_or_add("peer".into(), false);
+        let now = now_unix();
+        let conversation = || vec![message(now, "1"), message(now, "2")];
+
+        let first: Vec<(Receipt, u32)> =
+            accept_batch(&peers, &processed, "peer", true, conversation());
+        assert_eq!(first.len(), 2);
+        let again: Vec<(Receipt, u32)> =
+            accept_batch(&peers, &processed, "peer", true, conversation());
+        assert!(again.is_empty(), "delivered messages are not repeated");
+
+        release(&processed, &first[1].0);
+        let retried: Vec<(Receipt, u32)> =
+            accept_batch(&peers, &processed, "peer", true, conversation());
+        assert_eq!(retried, vec![(first[1].0.clone(), 2)]);
     }
 }
 
