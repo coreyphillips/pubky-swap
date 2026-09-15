@@ -105,6 +105,16 @@ impl PeerSet {
         }
     }
 
+    /// Bump a tracked peer's last-seen time. Unlike [`touch_or_add`](Self::touch_or_add), a peer
+    /// that is no longer tracked stays gone.
+    fn touch(&self, pubky: &str) {
+        if let Ok(mut peers) = self.peers.write() {
+            if let Some(entry) = peers.get_mut(pubky) {
+                entry.last_seen = Instant::now();
+            }
+        }
+    }
+
     fn all(&self) -> Vec<String> {
         self.peers
             .read()
@@ -380,82 +390,19 @@ impl Transport {
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
+        let tracked = self.known_peers.polling_from(peer_pkarr).is_some();
         let messages = self
             .messenger
             .get_messages(&peer)
             .await
             .map_err(|e| TransportError::Messenger(format!("get messages: {e}")))?;
-
-        // Anything sent before this peer joined the poll set belongs to a conversation that had
-        // already ended.
-        //
-        // A conversation lives on the homeserver and comes back in full on every poll, while the
-        // set that stops a message being handled twice lives in this process and starts empty. A
-        // provider that restarted, or that added a returning peer when it rang the doorbell, read
-        // that peer's entire history and answered every request in it again: one quote request
-        // drew nine quotes, eight of them for amounts nobody was asking about any more, with the
-        // real answer somewhere in the middle. The client refuses a quote whose amount does not
-        // match, so this cost correctness rather than money, but it made a swap after any restart
-        // a matter of luck.
-        //
-        // Discarding them loses nothing: a client waits thirty seconds for a reply before giving
-        // up, and a quote expires within minutes, so a message that predates our interest in this
-        // peer has nobody left listening for its answer.
-        let floor = self
-            .known_peers
-            .polling_from(peer_pkarr)
-            .map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
-
-        let mut parsed = Vec::new();
-        for msg in messages {
-            if let Some(floor) = floor {
-                if msg.timestamp < floor {
-                    continue;
-                }
-            }
-            let message_id = Self::message_id(peer_pkarr, &msg);
-
-            let is_duplicate = self
-                .processed_messages
-                .read()
-                .map(|p| p.contains(&message_id))
-                .unwrap_or(false);
-            if is_duplicate {
-                continue;
-            }
-
-            match serde_json::from_str::<M>(&msg.content) {
-                Ok(parsed_msg) => {
-                    if let Ok(mut processed) = self.processed_messages.write() {
-                        if processed.len() >= MAX_PROCESSED_IDS {
-                            debug!("processed_messages cap reached; clearing dedup set");
-                            processed.clear();
-                        }
-                        processed.insert(message_id);
-                    }
-                    self.add_known_peer(peer_pkarr.to_string());
-                    parsed.push(parsed_msg);
-                }
-                Err(e) => {
-                    // Mark it seen anyway. Deserialization is deterministic, so a message that
-                    // does not parse now will not parse on the next poll either, and leaving it
-                    // unmarked meant re-fetching and re-failing on it forever. That is the shape
-                    // a counterparty running something newer takes: one message this build does
-                    // not understand, retried until the peer is evicted.
-                    warn!(
-                        "discarding a message from {peer_pkarr} that this build cannot parse \
-                         ({e}); the sender may be running a newer protocol"
-                    );
-                    if let Ok(mut processed) = self.processed_messages.write() {
-                        if processed.len() >= MAX_PROCESSED_IDS {
-                            processed.clear();
-                        }
-                        processed.insert(message_id);
-                    }
-                }
-            }
-        }
-        Ok(parsed)
+        Ok(accept_batch(
+            &self.known_peers,
+            &self.processed_messages,
+            peer_pkarr,
+            tracked,
+            messages,
+        ))
     }
 
     /// Receive new messages from all known peers concurrently.
@@ -511,6 +458,98 @@ impl Transport {
         }
         Ok(())
     }
+}
+
+/// Filter one conversation read down to the messages this poll should deliver, marking them seen.
+///
+/// `tracked` is whether the peer was in the poll set when the read began.
+fn accept_batch<M: DeserializeOwned>(
+    known_peers: &PeerSet,
+    processed_messages: &RwLock<HashSet<String>>,
+    peer_pkarr: &str,
+    tracked: bool,
+    messages: Vec<pubky_messenger::DecryptedMessage>,
+) -> Vec<M> {
+    // Anything sent before this peer joined the poll set belongs to a conversation that had
+    // already ended.
+    //
+    // A conversation lives on the homeserver and comes back in full on every poll, while the
+    // set that stops a message being handled twice lives in this process and starts empty. A
+    // provider that restarted, or that added a returning peer when it rang the doorbell, read
+    // that peer's entire history and answered every request in it again: one quote request
+    // drew nine quotes, eight of them for amounts nobody was asking about any more, with the
+    // real answer somewhere in the middle. The client refuses a quote whose amount does not
+    // match, so this cost correctness rather than money, but it made a swap after any restart
+    // a matter of luck.
+    //
+    // Discarding them loses nothing: a client waits thirty seconds for a reply before giving
+    // up, and a quote expires within minutes, so a message that predates our interest in this
+    // peer has nobody left listening for its answer.
+    let floor = known_peers.polling_from(peer_pkarr);
+
+    // The peer was evicted while its conversation was being read. Without a floor the whole
+    // history would pass, and delivering it would put the peer back in the poll set. The messages
+    // are left unmarked so a later re-add still reads the ones inside its new window.
+    if tracked && floor.is_none() {
+        debug!("dropping a read from {peer_pkarr}: evicted while it was in flight");
+        return Vec::new();
+    }
+    let floor = floor.map(|t| t.saturating_sub(POLL_FROM_GRACE_SECS));
+
+    let mut parsed = Vec::new();
+    for msg in messages {
+        if let Some(floor) = floor {
+            if msg.timestamp < floor {
+                continue;
+            }
+        }
+        let message_id = Transport::message_id(peer_pkarr, &msg);
+
+        let is_duplicate = processed_messages
+            .read()
+            .map(|p| p.contains(&message_id))
+            .unwrap_or(false);
+        if is_duplicate {
+            continue;
+        }
+
+        match serde_json::from_str::<M>(&msg.content) {
+            Ok(parsed_msg) => {
+                if let Ok(mut processed) = processed_messages.write() {
+                    if processed.len() >= MAX_PROCESSED_IDS {
+                        debug!("processed_messages cap reached; clearing dedup set");
+                        processed.clear();
+                    }
+                    processed.insert(message_id);
+                }
+                // A peer evicted from here on stays evicted; only an untracked read adds one.
+                if tracked {
+                    known_peers.touch(peer_pkarr);
+                } else {
+                    known_peers.touch_or_add(peer_pkarr.to_string(), false);
+                }
+                parsed.push(parsed_msg);
+            }
+            Err(e) => {
+                // Mark it seen anyway. Deserialization is deterministic, so a message that
+                // does not parse now will not parse on the next poll either, and leaving it
+                // unmarked meant re-fetching and re-failing on it forever. That is the shape
+                // a counterparty running something newer takes: one message this build does
+                // not understand, retried until the peer is evicted.
+                warn!(
+                    "discarding a message from {peer_pkarr} that this build cannot parse \
+                     ({e}); the sender may be running a newer protocol"
+                );
+                if let Ok(mut processed) = processed_messages.write() {
+                    if processed.len() >= MAX_PROCESSED_IDS {
+                        processed.clear();
+                    }
+                    processed.insert(message_id);
+                }
+            }
+        }
+    }
+    parsed
 }
 
 /// The messaging surface the swap protocol needs from a transport.
@@ -611,6 +650,56 @@ mod poll_window_tests {
         let first = peers.polling_from("peer").unwrap();
         peers.touch_or_add("peer".into(), true);
         assert_eq!(peers.polling_from("peer"), Some(first));
+    }
+
+    fn message(timestamp: u64, content: &str) -> pubky_messenger::DecryptedMessage {
+        pubky_messenger::DecryptedMessage {
+            sender: "peer".into(),
+            content: content.into(),
+            timestamp,
+            verified: true,
+        }
+    }
+
+    /// A conversation holding one request from last week and one from just now.
+    fn history_and_fresh() -> Vec<pubky_messenger::DecryptedMessage> {
+        let now = now_unix();
+        vec![message(now - 7 * 24 * 3600, "1"), message(now, "2")]
+    }
+
+    #[test]
+    fn a_peer_evicted_during_its_read_is_not_delivered_or_re_added() {
+        let peers = PeerSet::default();
+        let processed = RwLock::new(HashSet::new());
+        peers.touch_or_add("peer".into(), false);
+        let tracked = peers.polling_from("peer").is_some();
+
+        // Evicted while the network read was awaiting.
+        peers.remove("peer");
+
+        let delivered: Vec<u32> =
+            accept_batch(&peers, &processed, "peer", tracked, history_and_fresh());
+        assert!(delivered.is_empty());
+        assert!(
+            peers.all().is_empty(),
+            "the result must not re-add the peer"
+        );
+        assert!(
+            processed.read().unwrap().is_empty(),
+            "dropped messages stay unread for a later re-add"
+        );
+    }
+
+    #[test]
+    fn a_peer_still_tracked_after_its_read_gets_its_window() {
+        let peers = PeerSet::default();
+        let processed = RwLock::new(HashSet::new());
+        peers.touch_or_add("peer".into(), false);
+
+        let delivered: Vec<u32> =
+            accept_batch(&peers, &processed, "peer", true, history_and_fresh());
+        assert_eq!(delivered, vec![2]);
+        assert_eq!(peers.all(), vec!["peer".to_string()]);
     }
 }
 
