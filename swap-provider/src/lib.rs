@@ -44,7 +44,7 @@ use lightning_backend::{LightningBackend, LndConfig, StubBackend};
 use pubky_transport::Transport;
 mod reply_transport;
 use reply_transport::ReplyTransport;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
@@ -234,9 +234,48 @@ fn now_unix() -> u64 {
 /// limit even before they expire.
 const MAX_TRACKED_QUOTES: usize = 10_000;
 
-/// Drop expired quotes from the map.
-fn prune_quotes(quotes: &mut HashMap<Uuid, IssuedQuote>, now: u64) {
-    quotes.retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
+/// Quotes the provider has issued and not yet seen redeemed or expire.
+///
+/// A full book evicts its oldest quote rather than refusing new ones. Refusing let anyone with
+/// enough fresh keys hold every slot for a whole TTL and turn every other client away. Evicting
+/// means a flood can only take a client's quote by issuing `MAX_TRACKED_QUOTES` more between
+/// that client's quote and its swap request, and a client that loses the race can ask again.
+/// Limiting per sender would not help: a key costs nothing.
+#[derive(Default)]
+struct QuoteBook {
+    quotes: HashMap<Uuid, IssuedQuote>,
+    /// Issuance order, oldest first. Ids already redeemed or pruned stay here until skipped or
+    /// compacted away.
+    order: VecDeque<Uuid>,
+}
+
+impl QuoteBook {
+    /// Drop expired quotes.
+    fn prune(&mut self, now: u64) {
+        self.quotes
+            .retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
+    }
+
+    fn insert(&mut self, quote_id: Uuid, quote: IssuedQuote, now: u64) {
+        self.prune(now);
+        if self.order.len() >= 2 * MAX_TRACKED_QUOTES {
+            let quotes = &self.quotes;
+            self.order.retain(|id| quotes.contains_key(id));
+        }
+        while self.quotes.len() >= MAX_TRACKED_QUOTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.quotes.remove(&oldest) {
+                debug!(
+                    "quote cache full; evicted quote {oldest} issued to {}",
+                    evicted.peer
+                );
+            }
+        }
+        self.quotes.insert(quote_id, quote);
+        self.order.push_back(quote_id);
+    }
 }
 
 /// Remove and return a still-valid quote issued to `peer` for `direction` (single-use, so a quote
@@ -247,16 +286,16 @@ fn prune_quotes(quotes: &mut HashMap<Uuid, IssuedQuote>, now: u64) {
 /// before the quote leaves the map, so a request from the wrong peer, or for the wrong direction,
 /// cannot burn the quote its owner is still holding.
 async fn take_valid_quote(
-    quotes: &Mutex<HashMap<Uuid, IssuedQuote>>,
+    quotes: &Mutex<QuoteBook>,
     quote_id: Uuid,
     peer: &str,
     direction: SwapDirection,
 ) -> Result<IssuedQuote> {
     use std::collections::hash_map::Entry;
 
-    let mut quotes = quotes.lock().await;
-    prune_quotes(&mut quotes, now_unix());
-    let Entry::Occupied(entry) = quotes.entry(quote_id) else {
+    let mut book = quotes.lock().await;
+    book.prune(now_unix());
+    let Entry::Occupied(entry) = book.quotes.entry(quote_id) else {
         return Err(anyhow!("unknown or expired quote"));
     };
     if !pubky_transport::same_pubky(&entry.get().peer, peer) {
@@ -431,7 +470,7 @@ struct ExecCtx {
     invoice_expiry_secs: u64,
     max_routing_fee_msat: u64,
     quote_ttl_secs: u64,
-    quotes: Arc<Mutex<HashMap<Uuid, IssuedQuote>>>,
+    quotes: Arc<Mutex<QuoteBook>>,
     store: Arc<dyn SwapStore>,
     risk: Arc<risk::RiskManager>,
     min_onchain_reserve_sat: u64,
@@ -914,7 +953,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         invoice_expiry_secs: config.invoice_expiry_secs,
         max_routing_fee_msat: config.max_routing_fee_msat,
         quote_ttl_secs: config.quote_ttl_secs,
-        quotes: Arc::new(Mutex::new(HashMap::new())),
+        quotes: Arc::new(Mutex::new(QuoteBook::default())),
         store,
         risk,
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
@@ -1453,37 +1492,19 @@ async fn handle_message(
                 valid_until_unix: expires_at_unix,
                 protocol_version: PROTOCOL_VERSION,
             };
-            {
-                let mut quotes = ctx.quotes.lock().await;
-                prune_quotes(&mut quotes, now);
-                // Bound memory under a quote flood: drop the request if we're already at capacity.
-                if quotes.len() >= MAX_TRACKED_QUOTES {
-                    warn!(
-                        "quote cache full ({MAX_TRACKED_QUOTES}); dropping request from {sender}"
-                    );
-                    return reject_request(
-                        &ctx.transport,
-                        sender,
-                        req.request_id,
-                        None,
-                        None,
-                        "provider busy",
-                    )
-                    .await;
-                }
-                quotes.insert(
-                    quote.quote_id,
-                    IssuedQuote {
-                        peer: sender.to_string(),
-                        direction: req.direction,
-                        amount_sat: req.amount_sat,
-                        fee_sat: fee.total_fee_sat,
-                        service_fee_sat: fee.service_fee_sat,
-                        onchain_fee_sat: fee.onchain_fee_sat,
-                        expires_at_unix,
-                    },
-                );
-            }
+            ctx.quotes.lock().await.insert(
+                quote.quote_id,
+                IssuedQuote {
+                    peer: sender.to_string(),
+                    direction: req.direction,
+                    amount_sat: req.amount_sat,
+                    fee_sat: fee.total_fee_sat,
+                    service_fee_sat: fee.service_fee_sat,
+                    onchain_fee_sat: fee.onchain_fee_sat,
+                    expires_at_unix,
+                },
+                now,
+            );
             info!("Sending quote {} to {sender}", quote.quote_id);
             // A failed send may still have been published, so the quote stays redeemable
             // until it expires even though the retry issues another.
@@ -3085,12 +3106,13 @@ mod tests {
     }
 
     /// One quote per direction, issued to peer A.
-    async fn quote_map(direction: SwapDirection) -> (Mutex<HashMap<Uuid, IssuedQuote>>, Uuid) {
+    async fn quote_map(direction: SwapDirection) -> (Mutex<QuoteBook>, Uuid) {
         let id = Uuid::new_v4();
-        let quotes = Mutex::new(HashMap::new());
+        let quotes = Mutex::new(QuoteBook::default());
         quotes.lock().await.insert(
             id,
             issued("peer-a", direction, now_unix().saturating_add(300)),
+            now_unix(),
         );
         (quotes, id)
     }
@@ -3108,7 +3130,7 @@ mod tests {
                 "{direction:?}: another pubky must not redeem peer A's quote"
             );
             assert_eq!(
-                quotes.lock().await.len(),
+                quotes.lock().await.quotes.len(),
                 1,
                 "{direction:?}: the rejected attempt must not consume the quote"
             );
@@ -3120,7 +3142,7 @@ mod tests {
                 });
             assert_eq!(mine.peer, "peer-a");
             assert!(
-                quotes.lock().await.is_empty(),
+                quotes.lock().await.quotes.is_empty(),
                 "{direction:?}: redeeming is single-use"
             );
             assert!(
@@ -3142,7 +3164,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(quotes.lock().await.len(), 1);
+        assert_eq!(quotes.lock().await.quotes.len(), 1);
         assert!(
             take_valid_quote(&quotes, id, "peer-a", SwapDirection::Reverse)
                 .await
@@ -3152,12 +3174,12 @@ mod tests {
 
     #[tokio::test]
     async fn expired_quotes_are_rejected_and_pruned() {
-        let quotes = Mutex::new(HashMap::new());
+        let quotes = Mutex::new(QuoteBook::default());
         let (mine, stale) = (Uuid::new_v4(), Uuid::new_v4());
         {
-            let mut map = quotes.lock().await;
-            map.insert(mine, issued("peer-a", SwapDirection::Reverse, 1));
-            map.insert(stale, issued("peer-b", SwapDirection::Reverse, 1));
+            let mut book = quotes.lock().await;
+            book.insert(mine, issued("peer-a", SwapDirection::Reverse, 1), 0);
+            book.insert(stale, issued("peer-b", SwapDirection::Reverse, 1), 0);
         }
         assert!(
             take_valid_quote(&quotes, mine, "peer-a", SwapDirection::Reverse)
@@ -3166,9 +3188,86 @@ mod tests {
             "a quote past its expiry is not redeemable by its owner either"
         );
         assert!(
-            quotes.lock().await.is_empty(),
+            quotes.lock().await.quotes.is_empty(),
             "every expired quote goes, not just the one asked for"
         );
+    }
+
+    /// A full cache used to refuse every new quote with `provider busy`, so fresh keys asking
+    /// fast enough locked every other client out for as long as they kept asking.
+    #[tokio::test]
+    async fn a_quote_flood_from_many_keys_does_not_lock_out_another_client() {
+        let now = now_unix();
+        let expires = now.saturating_add(300);
+        let flood = |book: &mut QuoteBook, from: usize, count: usize| {
+            for i in from..from + count {
+                let key = format!("throwaway-{i}");
+                book.insert(
+                    Uuid::new_v4(),
+                    issued(&key, SwapDirection::Reverse, expires),
+                    now,
+                );
+            }
+        };
+        let quotes = Mutex::new(QuoteBook::default());
+
+        flood(&mut *quotes.lock().await, 0, 2 * MAX_TRACKED_QUOTES);
+        let mine = Uuid::new_v4();
+        {
+            let mut book = quotes.lock().await;
+            book.insert(mine, issued("honest", SwapDirection::Reverse, expires), now);
+            assert!(book.quotes.contains_key(&mine), "a full cache still issues");
+            // The flood carries on while the honest client prepares its swap request.
+            flood(&mut book, 2 * MAX_TRACKED_QUOTES, MAX_TRACKED_QUOTES - 1);
+            assert_eq!(book.quotes.len(), MAX_TRACKED_QUOTES);
+            assert!(book.order.len() <= 2 * MAX_TRACKED_QUOTES);
+        }
+        take_valid_quote(&quotes, mine, "honest", SwapDirection::Reverse)
+            .await
+            .expect("the honest client's quote survives the flood and is redeemable");
+    }
+
+    /// Eviction follows issuance order, so a quote goes only after a full cache's worth of newer
+    /// ones, however many have been redeemed in between.
+    #[test]
+    fn a_full_quote_cache_evicts_the_oldest_live_quote() {
+        let now = now_unix();
+        let expires = now.saturating_add(300);
+        let mut book = QuoteBook::default();
+        let ids: Vec<Uuid> = (0..MAX_TRACKED_QUOTES).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            book.insert(
+                *id,
+                issued(&format!("peer-{i}"), SwapDirection::Reverse, expires),
+                now,
+            );
+        }
+        // Redeemed quotes leave their ids at the front of the order, and skipping one must not
+        // count as an eviction.
+        book.quotes.remove(&ids[0]);
+        book.quotes.remove(&ids[1]);
+        book.insert(
+            Uuid::new_v4(),
+            issued("x", SwapDirection::Reverse, expires),
+            now,
+        );
+        book.insert(
+            Uuid::new_v4(),
+            issued("y", SwapDirection::Reverse, expires),
+            now,
+        );
+        assert!(
+            book.quotes.contains_key(&ids[2]),
+            "freed slots are reused first"
+        );
+        book.insert(
+            Uuid::new_v4(),
+            issued("z", SwapDirection::Reverse, expires),
+            now,
+        );
+        assert!(!book.quotes.contains_key(&ids[2]));
+        assert!(book.quotes.contains_key(&ids[3]));
+        assert_eq!(book.quotes.len(), MAX_TRACKED_QUOTES);
     }
 
     /// `client_pkarr` is self-declared. Believing it over the sender the message authenticated as
