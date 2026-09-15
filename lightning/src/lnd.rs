@@ -47,6 +47,12 @@ impl LndBackend {
         })
     }
 
+    /// A router client of its own, for calls that stream for as long as a payment lasts. Holding
+    /// the shared guard across such a stream would stall every other call on this backend.
+    async fn router(&self) -> fedimint_tonic_lnd::RouterClient {
+        self.client.lock().await.router().clone()
+    }
+
     /// A fresh on-chain receive address (P2WPKH) from LND's wallet. Returned as a string; the
     /// caller parses it for the node's network.
     pub async fn new_address(&self) -> Result<String> {
@@ -336,10 +342,10 @@ impl LightningBackend for LndBackend {
         max_fee_msat: u64,
         cltv_limit: Option<u32>,
     ) -> Result<PaymentResult> {
-        let mut client = self.client.lock().await;
         // routerrpc.SendPaymentV2 streams payment updates until a terminal status.
-        let mut stream = client
+        let mut stream = self
             .router()
+            .await
             .send_payment_v2(SendPaymentRequest {
                 payment_request: bolt11.to_string(),
                 // Generous: a reverse-swap hold invoice stays in-flight until the on-chain
@@ -400,12 +406,14 @@ impl LightningBackend for LndBackend {
     }
 
     async fn payment_status(&self, payment_hash: [u8; 32]) -> Result<PaymentStatus> {
-        let mut client = self.client.lock().await;
-        let mut stream = match client
+        // In-flight updates are what make the first message arrive promptly: LND sends the
+        // current state straight away, where the terminal-only stream waits out the payment.
+        let mut stream = match self
             .router()
+            .await
             .track_payment_v2(TrackPaymentRequest {
                 payment_hash: payment_hash.to_vec(),
-                no_inflight_updates: true,
+                no_inflight_updates: false,
             })
             .await
         {
@@ -424,7 +432,7 @@ impl LightningBackend for LndBackend {
             Some(p) => p,
             None => return Ok(PaymentStatus::Unknown),
         };
-        // lnrpc.Payment.PaymentStatus: UNKNOWN=0, IN_FLIGHT=1, SUCCEEDED=2, FAILED=3
+        // lnrpc.Payment.PaymentStatus: UNKNOWN=0, IN_FLIGHT=1, SUCCEEDED=2, FAILED=3, INITIATED=4
         Ok(match payment.status {
             2 => {
                 let bytes = hex::decode(&payment.payment_preimage)
@@ -435,7 +443,9 @@ impl LightningBackend for LndBackend {
                 })
             }
             3 => PaymentStatus::Failed(format!("reason {}", payment.failure_reason)),
-            1 => PaymentStatus::InFlight,
+            // INITIATED is a payment LND has recorded but not yet sent an HTLC for. Reporting it
+            // as unknown would let a caller pay a second time.
+            1 | 4 => PaymentStatus::InFlight,
             _ => PaymentStatus::Unknown,
         })
     }
