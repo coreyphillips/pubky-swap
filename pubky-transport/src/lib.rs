@@ -302,6 +302,16 @@ impl Transport {
         idle
     }
 
+    /// Whether `peer` has delivered messages that are not yet acknowledged.
+    pub fn has_pending_messages(&self, peer: &str) -> bool {
+        self.journal.as_ref().is_some_and(|journal| {
+            lock(journal)
+                .pending_peers()
+                .binary_search_by(|p| p.as_str().cmp(peer))
+                .is_ok()
+        })
+    }
+
     /// Stop tracking a peer: drop it from the in-memory poll set and best-effort remove any
     /// follow relationship (so the persistent follow graph does not grow without bound). A
     /// failed `delete_follow` is logged, not propagated, so the peer is always removed from the

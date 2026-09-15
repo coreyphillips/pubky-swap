@@ -2801,7 +2801,8 @@ async fn evict_peer_if_idle(ctx: &ExecCtx, peer: &str) {
             true
         }
     };
-    if still_active {
+    // A request restored from the receive journal may not have been polled yet.
+    if still_active || ctx.transport.has_pending_messages(peer) {
         return;
     }
     ctx.transport.evict_peer(peer).await;

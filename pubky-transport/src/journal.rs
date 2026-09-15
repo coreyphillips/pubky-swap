@@ -163,8 +163,15 @@ impl Journal {
             file.sync_all()?;
         }
         fs::rename(&tmp, &self.path)?;
-        if let Some(dir) = self.path.parent().and_then(|d| fs::File::open(d).ok()) {
-            let _ = dir.sync_all();
+        // Without syncing the directory a machine crash can undo the rename. Windows cannot
+        // open a directory as a file, so this is unix only.
+        #[cfg(unix)]
+        {
+            let dir = match self.path.parent() {
+                Some(d) if !d.as_os_str().is_empty() => d,
+                _ => Path::new("."),
+            };
+            fs::File::open(dir)?.sync_all()?;
         }
         self.dirty = false;
         Ok(())
