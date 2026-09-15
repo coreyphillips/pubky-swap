@@ -311,6 +311,15 @@ pub fn parse_network(s: &str) -> Result<Network> {
 }
 
 pub async fn run(config: ClientConfig) -> Result<()> {
+    // Checked here rather than on the flags because either can come from the config file or the
+    // environment. Each mode skips what the other is for, so honouring both would report a
+    // successful recovery that never ran.
+    if config.quote_only && config.resume_only {
+        return Err(anyhow!(
+            "--quote-only and --resume-only cannot be combined: a quote-only run does not resume \
+             swaps, and a resume-only run does not request a quote"
+        ));
+    }
     let network = parse_network(&config.network)?;
 
     let store = store::open(&config.data_dir)?;
@@ -1132,5 +1141,24 @@ mod tests {
         let result = run(config).await;
         let _ = std::fs::remove_dir_all(&dir);
         result.expect("--resume-only must not require a Pubky identity");
+    }
+
+    #[tokio::test]
+    async fn quote_only_with_resume_only_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("pubky-swap-client-both-{}", Uuid::new_v4()));
+        let config = ClientConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            quote_only: true,
+            resume_only: true,
+            ..ClientConfig::default()
+        };
+
+        let result = run(config).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = result.expect_err("a resume-only run that skips the resume must not succeed");
+        assert!(
+            err.to_string().contains("cannot be combined"),
+            "unexpected error: {err}"
+        );
     }
 }
