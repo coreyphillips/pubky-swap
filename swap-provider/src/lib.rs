@@ -1509,22 +1509,42 @@ async fn handle_message(
             ) {
                 Ok(Some(mut record)) => {
                     if record.pending_hold_invoice.is_some() {
-                        let reservation = Some(reserve_pending_swap(ctx, &record).await?);
-                        record = complete_invoice_intent(
-                            ctx.ln.as_ref(),
-                            ctx.store.as_ref(),
-                            record.swap_id,
-                            true,
-                        )
-                        .await?;
-                        let swap = reverse_swap_from_record(&record, ctx.timelock)?;
-                        spawn_reverse_driver(
-                            ctx,
-                            swap,
-                            record.clone(),
-                            reservation,
-                            Duration::ZERO,
-                        );
+                        let resumed = async {
+                            let reservation = Some(reserve_pending_swap(ctx, &record).await?);
+                            let completed = complete_invoice_intent(
+                                ctx.ln.as_ref(),
+                                ctx.store.as_ref(),
+                                record.swap_id,
+                                true,
+                            )
+                            .await?;
+                            let swap = reverse_swap_from_record(&completed, ctx.timelock)?;
+                            spawn_reverse_driver(
+                                ctx,
+                                swap,
+                                completed.clone(),
+                                reservation,
+                                Duration::ZERO,
+                            );
+                            anyhow::Ok(completed)
+                        }
+                        .await;
+                        record = match resumed {
+                            Ok(completed) => completed,
+                            // Refused like a failed start, so a failed send releases the request
+                            // and the pending intent is tried again on the next poll.
+                            Err(e) => {
+                                warn!("failed to resume reverse swap {}: {e}", record.swap_id);
+                                return reject(
+                                    &ctx.transport,
+                                    sender,
+                                    None,
+                                    Some(req.quote_id),
+                                    &format!("swap start failed: {e}"),
+                                )
+                                .await;
+                            }
+                        };
                     }
                     let accept = record
                         .swap_accept
