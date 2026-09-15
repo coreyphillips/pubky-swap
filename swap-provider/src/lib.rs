@@ -1601,6 +1601,11 @@ async fn handle_message(
                 SwapDirection::Submarine => start_submarine(ctx, sender, req).await,
             };
             if let Err(e) = result {
+                // The swap started and only its acceptance was lost. Refusing it now would
+                // contradict the persisted record the redelivered request replays.
+                if is_reply_not_sent(&e) {
+                    return Err(e);
+                }
                 warn!("failed to start {direction:?} swap: {e}");
                 // A failed send is retried. The retry cannot start a second swap: the quote is
                 // single-use and a persisted start replays. At worst the client is refused
@@ -2029,17 +2034,13 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         .clone()
         .ok_or_else(|| anyhow!("completed reverse swap has no acceptance"))?;
 
-    if let Err(e) = ctx
-        .transport
-        .send(sender, &SwapMessage::SwapAccept(accept))
-        .await
-    {
-        warn!("could not send acceptance for {swap_id}: {e}; keeping its persisted driver active for recovery");
-    }
+    let sent = respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
     info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
 
+    // The driver runs whether or not the acceptance arrived. A failed send releases the request,
+    // and its redelivery replays the persisted acceptance without starting another driver.
     spawn_reverse_driver(ctx, swap, record, Some(reservation), Duration::ZERO);
-    Ok(())
+    sent
 }
 
 /// Spawn the per-swap reverse driver task (shared by fresh starts and restart-resume), persisting
@@ -2239,19 +2240,14 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         return Err(anyhow!("cannot start submarine swap {swap_id}: {e}"));
     }
 
-    if let Err(e) = ctx
-        .transport
-        .send(sender, &SwapMessage::SwapAccept(accept))
-        .await
-    {
-        warn!("could not send acceptance for {swap_id}: {e}; keeping its persisted driver active for recovery");
-    }
+    let sent = respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
     info!(
         "Submarine swap {swap_id} started (fund {} to the HTLC)",
         swap.onchain_amount_sat
     );
+    // As in the reverse direction, a failed send is answered by replay on redelivery.
     spawn_submarine_driver(ctx, swap, record, Some(reservation), Duration::ZERO);
-    Ok(())
+    sent
 }
 
 /// Spawn the per-swap submarine driver task (shared by fresh starts and restart-resume).
