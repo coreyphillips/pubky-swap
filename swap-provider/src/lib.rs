@@ -1475,12 +1475,9 @@ async fn handle_message(
                 );
             }
             info!("Sending quote {} to {sender}", quote.quote_id);
-            let quote_id = quote.quote_id;
-            if let Err(e) = respond(&ctx.transport, sender, &SwapMessage::Quote(quote)).await {
-                // The retry issues a fresh quote, and this one was never seen.
-                ctx.quotes.lock().await.remove(&quote_id);
-                return Err(e);
-            }
+            // A failed send may still have been published, so the quote stays redeemable
+            // until it expires even though the retry issues another.
+            respond(&ctx.transport, sender, &SwapMessage::Quote(quote)).await?;
         }
 
         SwapMessage::SwapRequest(req) => {
