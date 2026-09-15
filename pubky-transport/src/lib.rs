@@ -388,9 +388,18 @@ impl Transport {
     }
 
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
+        let tracked = self.known_peers.polling_from(peer_pkarr).is_some();
+        self.read_conversation(peer_pkarr, tracked).await
+    }
+
+    /// `tracked` is whether the peer was in the poll set when the caller decided to read it.
+    async fn read_conversation<M: DeserializeOwned>(
+        &self,
+        peer_pkarr: &str,
+        tracked: bool,
+    ) -> Result<Vec<M>> {
         let peer = PublicKey::try_from(peer_pkarr)
             .map_err(|e| TransportError::InvalidPubkey(format!("{e}")))?;
-        let tracked = self.known_peers.polling_from(peer_pkarr).is_some();
         let messages = self
             .messenger
             .get_messages(&peer)
@@ -417,7 +426,9 @@ impl Transport {
         let futures = peers.iter().map(|peer| {
             let peer = peer.clone();
             async move {
-                let res = self.receive_from::<M>(&peer).await;
+                // Every peer came from the snapshot, so it counts as tracked even if it is
+                // evicted before this future first runs.
+                let res = self.read_conversation::<M>(&peer, true).await;
                 (peer, res)
             }
         });
