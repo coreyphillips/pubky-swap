@@ -1372,8 +1372,18 @@ async fn handle_message(
         }
 
         SwapMessage::QuoteRequest(req) => {
+            // Refused rather than ignored: the offer refreshes while its predecessor is still
+            // advertised, so a client naming it would otherwise wait out its timeout.
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
-                return Ok(());
+                return reject_request(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    &format!("offer {} is no longer current", req.offer_id),
+                )
+                .await;
             }
             // The cheapest place to find a mismatch: nothing is quoted, nothing reserved, and no
             // key generated. Finding it later means finding it with money already committed.
