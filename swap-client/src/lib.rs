@@ -313,14 +313,6 @@ pub fn parse_network(s: &str) -> Result<Network> {
 pub async fn run(config: ClientConfig) -> Result<()> {
     let network = parse_network(&config.network)?;
 
-    let identity = config.identity()?;
-    let transport = match identity.method {
-        "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
-        _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
-    };
-    let client_pkarr = transport.public_key_string();
-    info!("Client pubky: {client_pkarr}");
-
     let store = store::open(&config.data_dir)?;
     // Before anything new: a swap left in flight has money in it, and starting a second one while
     // the first is unattended is how a client ends up with two.
@@ -337,6 +329,17 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         info!("--resume-only: not starting a new swap");
         return Ok(());
     }
+
+    // Only after `--resume-only` has returned: claiming or refunding a persisted swap needs its
+    // branch key, not the Pubky identity, and an operator who has lost the identity must still be
+    // able to recover their funds.
+    let identity = config.identity()?;
+    let transport = match identity.method {
+        "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
+        _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
+    };
+    let client_pkarr = transport.public_key_string();
+    info!("Client pubky: {client_pkarr}");
     transport.add_known_peer(config.provider_pkarr.clone());
 
     // Everything already in this conversation belongs to an earlier run, and none of it is the
@@ -1106,5 +1109,28 @@ where
             }
         }
         sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resume_only_needs_no_identity() {
+        let dir = std::env::temp_dir().join(format!("pubky-swap-client-resume-{}", Uuid::new_v4()));
+        let config = ClientConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            resume_only: true,
+            ..ClientConfig::default()
+        };
+        assert!(
+            config.identity().is_err(),
+            "the test needs an unset identity"
+        );
+
+        let result = run(config).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        result.expect("--resume-only must not require a Pubky identity");
     }
 }
