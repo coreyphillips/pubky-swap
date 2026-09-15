@@ -1987,7 +1987,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2991,7 +2991,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3034,7 +3034,7 @@ checksum = "4dc50afea61aff926e150a36c31f06094608848e114a3fe667d76ec233163b1c"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -3848,8 +3848,7 @@ dependencies = [
 [[package]]
 name = "pubky-messenger"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b200a985ffe58078c671711ae546c9679f341e95b69ea1634c1a68d83794f6bd"
+source = "git+https://github.com/coreyphillips/pubky-messenger?rev=3dbfad90d4a6f8478d9804208f022ffa23a0ac21#3dbfad90d4a6f8478d9804208f022ffa23a0ac21"
 dependencies = [
  "anyhow",
  "bip39",
@@ -3861,6 +3860,7 @@ dependencies = [
  "pkarr 3.10.0",
  "pubky 0.4.2",
  "pubky-common 0.3.1",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3937,7 +3937,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3975,7 +3975,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
