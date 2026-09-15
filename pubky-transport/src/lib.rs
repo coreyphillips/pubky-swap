@@ -290,8 +290,16 @@ impl Transport {
     }
 
     /// Unpinned peers whose last activity is older than `ttl` (candidates for idle reaping).
+    ///
+    /// Peers with delivered but unacknowledged messages are left out, so a restored request is
+    /// not dropped from the poll set while its homeserver is unreachable.
     pub fn idle_unpinned_peers(&self, ttl: Duration) -> Vec<String> {
-        self.known_peers.idle_unpinned(ttl)
+        let mut idle = self.known_peers.idle_unpinned(ttl);
+        if let Some(journal) = &self.journal {
+            let pending = lock(journal).pending_peers();
+            idle.retain(|peer| pending.binary_search(peer).is_err());
+        }
+        idle
     }
 
     /// Stop tracking a peer: drop it from the in-memory poll set and best-effort remove any
@@ -417,7 +425,10 @@ impl Transport {
 
     pub async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
         let tracked = self.known_peers.polling_from(peer_pkarr).is_some();
-        let delivered = self.read_conversation(peer_pkarr, tracked).await?;
+        let mut delivered = self.read_conversation(peer_pkarr, tracked).await?;
+        if !self.save_delivered(delivered.iter().map(|(receipt, _)| receipt)) {
+            delivered.clear();
+        }
         if let Err(e) = acknowledge(
             self.journal.as_ref(),
             &self.known_peers,
@@ -499,7 +510,23 @@ impl Transport {
                 Err(e) => debug!("failed to receive from {peer}: {e}"),
             }
         }
+        // One save for the whole poll, however many peers had something new.
+        if !self.save_delivered(all.iter().map(|inbound| &inbound.receipt)) {
+            all.clear();
+        }
         Ok(all)
+    }
+
+    /// Record freshly delivered messages as pending before the caller sees them, so a crash
+    /// mid-dispatch leaves the work pending. Unsaved state, from this poll or an earlier failure,
+    /// holds the messages back for a later poll: returns false after releasing them.
+    fn save_delivered<'a>(&self, receipts: impl Iterator<Item = &'a Receipt> + Clone) -> bool {
+        save_delivered(
+            self.journal.as_ref(),
+            &self.known_peers,
+            &self.processed_messages,
+            receipts,
+        )
     }
 
     /// Hand a delivered message back, so the next poll delivers it again.
@@ -717,18 +744,31 @@ fn accept_batch<M: DeserializeOwned>(
             }
         }
     }
-    // Written before the caller sees anything, so a crash mid-dispatch leaves the work pending.
-    // Unsaved state, from this batch or an earlier failure, holds the batch back for a later poll.
-    if let Some(journal) = journal.as_mut().filter(|_| !parsed.is_empty()) {
-        if let Err(e) = save_journal(journal, known_peers) {
-            warn!("could not save the receive journal, holding back {peer_pkarr}'s messages: {e}");
-            for (receipt, _) in &parsed {
-                release(processed_messages, receipt);
-            }
-            return Vec::new();
-        }
-    }
+    // The pending entries are recorded but not saved: the caller saves once per poll with
+    // `save_delivered`, not once per peer.
     parsed
+}
+
+fn save_delivered<'a>(
+    journal: Option<&Mutex<Journal>>,
+    known_peers: &PeerSet,
+    processed_messages: &RwLock<HashSet<String>>,
+    receipts: impl Iterator<Item = &'a Receipt> + Clone,
+) -> bool {
+    let Some(journal) = journal else {
+        return true;
+    };
+    if receipts.clone().next().is_none() {
+        return true;
+    }
+    let Err(e) = save_journal(&mut lock(journal), known_peers) else {
+        return true;
+    };
+    warn!("could not save the receive journal, holding back delivered messages: {e}");
+    for receipt in receipts {
+        release(processed_messages, receipt);
+    }
+    false
 }
 
 /// The messaging surface the swap protocol needs from a transport.
@@ -940,14 +980,23 @@ mod poll_window_tests {
             &self,
             conversation: Vec<pubky_messenger::DecryptedMessage>,
         ) -> Vec<(Receipt, u32)> {
-            accept_batch(
+            let delivered = accept_batch(
                 &self.peers,
                 &self.processed,
                 Some(&self.journal),
                 "peer",
                 true,
                 conversation,
-            )
+            );
+            if !save_delivered(
+                Some(&self.journal),
+                &self.peers,
+                &self.processed,
+                delivered.iter().map(|(receipt, _)| receipt),
+            ) {
+                return Vec::new();
+            }
+            delivered
         }
 
         fn acknowledge(&self, delivered: &[(Receipt, u32)]) {
