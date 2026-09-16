@@ -63,6 +63,7 @@ pub enum RejectReason {
     ExposureExceeded { committed_sat: u64, max_sat: u64 },
     PeerExposureExceeded { committed_sat: u64, max_sat: u64 },
     RateLimited { started: u32, max_per_hour: u32 },
+    AlreadyReserved,
 }
 
 impl std::fmt::Display for RejectReason {
@@ -99,6 +100,9 @@ impl std::fmt::Display for RejectReason {
                 f,
                 "you have started {started} swaps in the last hour; the limit is {max_per_hour}"
             ),
+            Self::AlreadyReserved => {
+                write!(f, "this swap already holds a reservation")
+            }
         }
     }
 }
@@ -141,6 +145,13 @@ pub struct RiskManager {
 pub struct ReservationGuard {
     manager: Arc<RiskManager>,
     swap_id: Uuid,
+}
+
+impl ReservationGuard {
+    /// The swap this reservation belongs to.
+    pub fn swap_id(&self) -> Uuid {
+        self.swap_id
+    }
 }
 
 impl Drop for ReservationGuard {
@@ -253,6 +264,15 @@ impl RiskManager {
         let mut inner = self.locked();
         let now = Instant::now();
         let hour = Duration::from_secs(3600);
+
+        // One swap, one reservation. A second one used to increment the counters and then
+        // overwrite the first entry, so the release that followed decremented once and the other
+        // half of the exposure stayed committed for the life of the process. It also meant two
+        // holders believed they owned the swap, which for a reverse swap is two drivers over one
+        // HTLC. Refused rather than merged: whatever asked twice is racing something.
+        if inner.reservations.contains_key(&swap_id) {
+            return Err(RejectReason::AlreadyReserved);
+        }
 
         {
             let state = inner.peers.entry(peer.to_string()).or_default();
@@ -422,6 +442,31 @@ mod tests {
         drop(second);
         assert_eq!(m.committed_sat(), 0);
         assert_eq!(m.in_flight(), 0);
+    }
+
+    /// A second reservation for a live swap used to increment the counters and then overwrite the
+    /// first entry, so the two releases that followed gave back one swap's worth between them.
+    #[test]
+    fn one_swap_cannot_hold_two_reservations() {
+        let m = RiskManager::new(limits());
+        let swap = Uuid::new_v4();
+        let held = m.reserve("alice", swap, 100_000).unwrap();
+        for again in [
+            m.reserve("alice", swap, 100_000),
+            m.reserve_pending("alice", swap, 100_000),
+            // Not even the resume path, which is otherwise never refused.
+            m.reserve_inner("alice", swap, 100_000, ReservationMode::Funded),
+        ] {
+            assert!(matches!(again, Err(RejectReason::AlreadyReserved)));
+        }
+        assert_eq!(m.committed_sat(), 100_000, "a refusal commits nothing");
+        assert_eq!(m.in_flight(), 1);
+        assert_eq!(m.per_peer()[0].starts_this_hour, 1);
+        drop(held);
+        assert_eq!(m.committed_sat(), 0);
+        assert_eq!(m.in_flight(), 0);
+        // The swap is over, so its id is free to be reserved again.
+        assert!(m.reserve_pending("alice", swap, 100_000).is_ok());
     }
 
     #[test]

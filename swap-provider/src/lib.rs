@@ -473,9 +473,61 @@ struct ExecCtx {
     quotes: Arc<Mutex<QuoteBook>>,
     store: Arc<dyn SwapStore>,
     risk: Arc<risk::RiskManager>,
+    admissions: Arc<AdmissionLocks>,
     min_onchain_reserve_sat: u64,
     /// True when the provider can execute swaps (real LN + chain + wallet present).
     capable: bool,
+}
+
+/// Per-swap exclusion over the step that turns a persisted admission into a running driver.
+///
+/// Session requests are served in their own tasks, so the same redelivered `SwapRequest` can be
+/// in two handlers at once. Both would find the invoice intent pending, both would complete it
+/// against a backend that answers the second lookup with the first one's invoice, and both would
+/// spawn a driver over one record. Each driver starts from its own copy of that record, so
+/// neither sees the other's funding marker and both can fund the same HTLC.
+#[derive(Default)]
+struct AdmissionLocks {
+    locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AdmissionLocks {
+    async fn lock(&self, swap_id: Uuid) -> AdmissionGuard<'_> {
+        let lock = self.locked().entry(swap_id).or_default().clone();
+        let held = lock.lock_owned().await;
+        AdmissionGuard {
+            locks: self,
+            swap_id,
+            held: Some(held),
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct AdmissionGuard<'a> {
+    locks: &'a AdmissionLocks,
+    swap_id: Uuid,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        // Released first, so the only handle left when nobody is waiting is the map's own and the
+        // entry can go. A caller that is waiting holds a clone, which keeps its lock alive.
+        self.held.take();
+        let mut locks = self.locks.locked();
+        if locks
+            .get(&self.swap_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.swap_id);
+        }
+    }
 }
 
 /// A [`ProgressSink`] that records driver progress into the persistent [`SwapStore`], so a
@@ -956,6 +1008,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         quotes: Arc::new(Mutex::new(QuoteBook::default())),
         store,
         risk,
+        admissions: Arc::new(AdmissionLocks::default()),
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
     };
@@ -1531,22 +1584,28 @@ async fn handle_message(
                 Ok(Some(mut record)) => {
                     if record.pending_hold_invoice.is_some() {
                         let resumed = async {
-                            let reservation = Some(reserve_pending_swap(ctx, &record).await?);
-                            let completed = complete_invoice_intent(
-                                ctx.ln.as_ref(),
+                            let (completed, reservation) = recover_pending_admission(
+                                ctx.admissions.as_ref(),
                                 ctx.store.as_ref(),
+                                ctx.ln.as_ref(),
                                 record.swap_id,
-                                true,
+                                |pending: SwapRecord| async move {
+                                    reserve_pending_swap(ctx, &pending).await
+                                },
                             )
                             .await?;
-                            let swap = reverse_swap_from_record(&completed, ctx.timelock)?;
-                            spawn_reverse_driver(
-                                ctx,
-                                swap,
-                                completed.clone(),
-                                reservation,
-                                Duration::ZERO,
-                            );
+                            // No reservation means a concurrent request completed this admission
+                            // and is driving it; this one only replays the acceptance.
+                            if reservation.is_some() {
+                                let swap = reverse_swap_from_record(&completed, ctx.timelock)?;
+                                spawn_reverse_driver(
+                                    ctx,
+                                    swap,
+                                    completed.clone(),
+                                    reservation,
+                                    Duration::ZERO,
+                                );
+                            }
                             anyhow::Ok(completed)
                         }
                         .await;
@@ -1636,6 +1695,39 @@ fn ensure_reverse_hash_available(store: &dyn SwapStore, hash: &PaymentHash) -> R
         }
     }
     Ok(())
+}
+
+/// Recover a persisted admission whose invoice creation never finished, once.
+///
+/// Returns the record as it now stands, and a reservation only for the caller that completed the
+/// admission -- that caller, and only that caller, owns the swap and starts its driver. A caller
+/// that finds the intent already completed gets the finished record to reply with and nothing to
+/// drive, which is what a replay of an admitted swap does anyway.
+///
+/// The record is re-read under the lock rather than trusted from the caller: the request that
+/// held the lock before may have completed this very intent, and the copy in hand still says
+/// pending. That stale copy is the whole race. See [`AdmissionLocks`].
+async fn recover_pending_admission<Reserve, Reserved>(
+    admissions: &AdmissionLocks,
+    store: &dyn SwapStore,
+    ln: &dyn LightningBackend,
+    swap_id: Uuid,
+    reserve: Reserve,
+) -> Result<(SwapRecord, Option<risk::ReservationGuard>)>
+where
+    Reserve: FnOnce(SwapRecord) -> Reserved,
+    Reserved: std::future::Future<Output = Result<risk::ReservationGuard>>,
+{
+    let _admission = admissions.lock(swap_id).await;
+    let record = store
+        .get(swap_id)?
+        .ok_or_else(|| anyhow!("the persisted admission is no longer in the store"))?;
+    if record.pending_hold_invoice.is_none() {
+        return Ok((record, None));
+    }
+    let reservation = reserve(record).await?;
+    let completed = complete_invoice_intent(ln, store, swap_id, true).await?;
+    Ok((completed, Some(reservation)))
 }
 
 /// Finish only the invoice associated with a previously persisted admission.
@@ -2580,12 +2672,14 @@ async fn resume_swaps(ctx: &ExecCtx) {
         .filter(|record| record.pending_hold_invoice.is_none())
         .cloned()
         .collect();
-    let mut guards: std::collections::HashMap<Uuid, risk::ReservationGuard> = ctx
+    // Keyed off each guard rather than zipped with the records it was built from: `restore` skips
+    // any record it cannot reserve, and a zip would then hand every later swap the guard of a
+    // different one.
+    let mut guards: HashMap<Uuid, risk::ReservationGuard> = ctx
         .risk
         .restore(&accepted_records)
         .into_iter()
-        .zip(accepted_records.iter().map(|r| r.swap_id))
-        .map(|(g, id)| (id, g))
+        .map(|guard| (guard.swap_id(), guard))
         .collect();
     info!("Resuming {} persisted swap(s)", records.len());
     let needing_recovery = records.iter().filter(|r| needs_recovery(r)).count();
