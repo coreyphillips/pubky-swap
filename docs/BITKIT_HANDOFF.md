@@ -1,8 +1,8 @@
 # Downstream handoff for reliable Pubky swap delivery
 
-Status: upstream implementation handoff, based on code and downstream inspection on 2026-09-28. Use the exact revisions in the implementation PR and lockfile; run the downstream checks before opening dependent PRs. The wrapper, core and Android worktrees already contain unrelated uncommitted work. Preserve that work and coordinate commits with their owners.
+Status: upstream implementation handoff, based on code and downstream inspection on 2026-09-28. Use the exact revisions in [PR 86](https://github.com/coreyphillips/pubky-swap/pull/86) and the lockfile; run the downstream checks before opening dependent PRs. The wrapper, core and Android worktrees already contain unrelated uncommitted work. Preserve that work and coordinate commits with their owners.
 
-The messenger prepared-message change is merged in [PR 19](https://github.com/coreyphillips/pubky-messenger/pull/19), following cleanup [PR 18](https://github.com/coreyphillips/pubky-messenger/pull/18). The swap lockfile pins messenger `4fff0ce2183f7273c0418801c262ed291a0a145a` (package 0.4.0), with no local override. Pin every pubky-swap crate to implementation revision `30c6a0ab0d553094644fd258708c04b2fa482456`. The following documentation commit does not change its code. Merge and CI status are linked from [the upstream tracker](https://github.com/coreyphillips/pubky-swap/issues/85).
+The messenger prepared-message change is merged in [PR 19](https://github.com/coreyphillips/pubky-messenger/pull/19), following cleanup [PR 18](https://github.com/coreyphillips/pubky-messenger/pull/18). The swap lockfile pins messenger `4fff0ce2183f7273c0418801c262ed291a0a145a` (package 0.4.0), with no local override. Pin every pubky-swap crate to implementation revision `ca3d5f375da4f1248023a33d7e5c060083e5fc72`. The following documentation commit does not change its code. Merge and CI status are linked from [the upstream tracker](https://github.com/coreyphillips/pubky-swap/issues/85).
 
 The dependency order is pubky-messenger, pubky-swap, pubky-swap-boltz, bitkit-core, then bitkit-android. A dependency update alone will not enable the new delivery lifecycle in all callers. The wrapper currently makes individual rendezvous and exchange calls, and core has its own reconciliation loop.
 
@@ -67,12 +67,14 @@ Use this shared dependency source for `pubky-transport`, `swap-common`, `swap-co
 other workspace crate consumed downstream:
 
 ```toml
-pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "30c6a0ab0d553094644fd258708c04b2fa482456" }
+pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "ca3d5f375da4f1248023a33d7e5c060083e5fc72" }
 ```
 
 Preserve each caller's required features. The implementation was checked with locked workspace
-tests and doctests, full-feature client tests, strict all-target client/provider Clippy, iroh
-transport/provider tests, targeted journal/outbox tests and local homeserver lifecycle tests.
+tests and doctests, full-feature client tests, strict workspace Clippy with all targets and
+features, iroh transport/provider tests, targeted journal/outbox tests and local homeserver
+lifecycle tests. Final focused runs passed 78 transport tests, 57 client tests and 102 common
+tests, including the added failure, notification and pruning cases.
 The local read/poll fixture and cold/warm iroh measurements are recorded in
 [transport-performance.md](transport-performance.md). CI and the funded regtest must pass on
 the final PR head before merge; use the tracker links to verify that result before downstream
