@@ -27,6 +27,7 @@ pubky-transport.workspace = true
 swap-common.workspace = true
 swap-config.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 lightning-backend.workspace = true
 beignet-backend = { workspace = true, optional = true }
 bitcoin.workspace = true
@@ -40,6 +41,7 @@ hex.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # The scriptable ChainWatcher used by the unit tests.
 swap-common = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true

@@ -21,7 +21,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use swap_common::chain::ChainWatcher;
-use swap_common::store::{JsonFileSwapStore, SwapRecord};
+use swap_common::store::{JsonFileSwapStore, Resume, SwapRecord};
 use swap_common::wallet::OnchainWallet;
 use swap_common::{SwapDirection, SwapState};
 use tracing::{error, info, warn};
@@ -54,6 +54,13 @@ pub async fn resume_unfinished(
     );
 
     for rec in records {
+        if !store::execution_ready(&rec) {
+            warn!(
+                "swap {} still needs negotiation recovery; leaving it pending",
+                rec.swap_id
+            );
+            continue;
+        }
         let swap_id = rec.swap_id;
         info!(
             "Resuming swap {swap_id} ({:?} with {}): state {:?}, timeout height {}",
@@ -128,11 +135,20 @@ async fn resume_reverse(
         max_routing_fee_msat,
         rec.required_confirmations,
         POLL,
-        &rec.resume(),
+        &reverse_resume(rec),
         &sink,
     )
     .await
     .map(|_| SwapState::Claimed)
+}
+
+/// Legacy records predate the payment marker, so absence cannot prove no submission happened.
+fn reverse_resume(record: &SwapRecord) -> Resume {
+    let mut resume = record.resume();
+    if record.swap_request.is_none() && resume.invoice_pay_started_at_unix.is_none() {
+        resume.invoice_pay_started_at_unix = Some(0);
+    }
+    resume
 }
 
 /// Rebuild the submarine state from what was written down.
@@ -187,4 +203,42 @@ fn secret_key(rec: &SwapRecord) -> Result<SecretKey> {
 #[allow(dead_code)]
 fn txid(s: &str) -> Result<bitcoin::Txid> {
     bitcoin::Txid::from_str(s).context("decode a txid")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swap_common::messages::{SwapRequest, SwapScript};
+    use uuid::Uuid;
+
+    #[test]
+    fn legacy_reverse_records_preserve_uncertainty_without_losing_saved_progress() {
+        let mut record = SwapRecord::new_progress();
+        assert!(record.resume().is_fresh());
+        assert_eq!(reverse_resume(&record).invoice_pay_started_at_unix, Some(0));
+        record.swap_request = Some(SwapRequest {
+            script_type: SwapScript::P2wsh,
+            quote_id: Uuid::new_v4(),
+            client_pkarr: "client".into(),
+            direction: SwapDirection::Reverse,
+            payment_hash_hex: "00".repeat(32),
+            client_claim_pubkey_hex: None,
+            client_refund_pubkey_hex: None,
+            invoice: None,
+        });
+        assert!(
+            reverse_resume(&record).is_fresh(),
+            "a new complete intent without a marker has not submitted payment"
+        );
+        record.invoice_pay_started_at_unix = Some(42);
+        assert_eq!(
+            reverse_resume(&record).invoice_pay_started_at_unix,
+            Some(42)
+        );
+        record.swap_request = None;
+        assert_eq!(
+            reverse_resume(&record).invoice_pay_started_at_unix,
+            Some(42)
+        );
+    }
 }

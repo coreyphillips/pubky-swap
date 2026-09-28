@@ -2,9 +2,11 @@
 //! the on-chain/Lightning side.
 //!
 //! Negotiation (request a quote → commit → receive the provider's HTLC details) is in this
-//! module's [`run`]. Reverse-swap *execution* (pay the hold invoice, watch the HTLC, claim
-//! with the preimage) lives in [`reverse`].
+//! module's [`run`], over the transports in [`negotiate`]. Reverse-swap *execution* (pay the hold
+//! invoice, watch the HTLC, claim with the preimage) lives in [`reverse`].
 
+pub mod negotiate;
+mod negotiation_recovery;
 pub mod resume;
 pub mod reverse;
 pub mod store;
@@ -14,10 +16,9 @@ use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, Network, PublicKey, ScriptBuf};
 use lightning_backend::{LightningBackend, LndConfig};
-use pubky_transport::Transport;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use swap_common::chain::ChainWatcher;
 use swap_common::htlc::{build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash};
 use swap_common::store::{JsonFileSwapStore, Resume};
@@ -25,10 +26,10 @@ use swap_common::timelock::TimelockParams;
 use swap_common::validate::{self, ClientPolicy, DecodedHoldInvoice};
 use swap_common::wallet::OnchainWallet;
 use swap_common::{messages::*, SwapDirection, SwapState};
-use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::negotiate::{Channel, Negotiation, Negotiator};
 use crate::reverse::{execute_reverse_swap, ReverseClaim};
 use crate::submarine::{execute_submarine_swap, SubmarineFunding};
 
@@ -80,15 +81,18 @@ pub struct ClientConfig {
     pub max_routing_fee_msat: u64,
     /// Only request a quote (to check a provider's availability/rates) and exit without swapping.
     pub quote_only: bool,
-    /// Ring the provider's iroh P2P rendezvous (doorbell) before negotiating, so a provider that
+    /// Ring the provider's iroh P2P rendezvous (doorbell) before the first DM, so a provider that
     /// isn't already following us starts polling us for the swap DM. Requires the `iroh` feature,
-    /// which `full` includes.
+    /// which `full` includes. Requests over iroh do not need it.
     ///
     /// On by default and best effort: a provider that already follows us does not need it, and one
     /// that is not listening costs us a failed connection and a log line. Off, a provider who has
     /// never heard of us cannot find our quote request at all, because there is no way for it to
     /// know it should look.
     pub rendezvous_iroh: bool,
+    /// Transport for offer, quote, creation and status requests: `auto` (iroh when the provider
+    /// supports it, Pubky DMs otherwise), `iroh`, or `dm`. See [`negotiate`].
+    pub negotiation: Negotiation,
     /// Confirmations this client requires before acting, whatever the provider quotes. `0` means
     /// "use the network default" (2 on mainnet, 1 elsewhere).
     ///
@@ -144,6 +148,7 @@ impl Default for ClientConfig {
             max_routing_fee_msat: 10_000,
             quote_only: false,
             rendezvous_iroh: true,
+            negotiation: Negotiation::Auto,
             min_confirmations: 0,
             max_fee_bps: 500,
             max_total_sat: 0,
@@ -214,6 +219,10 @@ impl crate::submarine::FundingSink for RecordProgress<'_> {
 }
 
 impl crate::reverse::ClaimSink for RecordProgress<'_> {
+    fn payment_started(&self) -> Result<()> {
+        store::record_payment_started(self.store, self.swap_id)
+    }
+
     fn spend_broadcast(&self, txid: bitcoin::Txid) {
         if let Err(e) = store::record_our_spend(self.store, self.swap_id, txid) {
             error!("FAILED TO PERSIST our own claim {txid}: {e}");
@@ -332,40 +341,46 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // drive, which can be hours if it is waiting on confirmations, and a caller that bounded the
     // quote on a timeout would kill the resume partway through.
     if !config.quote_only {
+        let recovery = negotiation_recovery::recover_pending(&store, &config, network).await;
         resume_unfinished_swaps(&store, &config, network).await;
+        negotiation_recovery::maintain_completed(&store, &config).await;
+        recovery?;
+        if !store::unfinished(&store)?.is_empty() {
+            return Err(anyhow!(
+                "unfinished swaps remain; resolve them before starting another swap"
+            ));
+        }
     }
     if config.resume_only {
         info!("--resume-only: not starting a new swap");
         return Ok(());
     }
-
-    // Only after `--resume-only` has returned: claiming or refunding a persisted swap needs its
-    // branch key, not the Pubky identity, and an operator who has lost the identity must still be
-    // able to recover their funds.
     let identity = config.identity()?;
-    let transport = match identity.method {
-        "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
-        _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
-    };
-    let client_pkarr = transport.public_key_string();
+    let (negotiator, client_pkarr) = negotiate::connect_durable(
+        &identity,
+        &config.provider_pkarr,
+        config.negotiation,
+        config.rendezvous_iroh,
+        std::path::Path::new(&config.data_dir),
+    )
+    .await?;
     info!("Client pubky: {client_pkarr}");
-    transport.add_known_peer(config.provider_pkarr.clone());
 
-    // Everything already in this conversation belongs to an earlier run, and none of it is the
-    // answer to a question this one has not asked yet. Without this, a second run against the same
-    // provider reads the previous run's quote out of the conversation history and refuses it as
-    // expired, having never looked at the reply to the request it actually sent.
-    if let Err(e) = transport
-        .mark_conversation_seen(&config.provider_pkarr)
-        .await
-    {
-        warn!("could not read the existing conversation with the provider ({e}); a reply from an earlier run may be picked up instead of this one's");
-    }
+    let result = tokio::select! {
+        result = run_negotiation(&config, network, &store, &negotiator, &client_pkarr) => result,
+        () = negotiator.maintenance() => unreachable!("maintenance runs until canceled"),
+    };
+    negotiator.close().await;
+    result
+}
 
-    // Optionally ring the provider's iroh doorbell so a provider that isn't already following us
-    // starts polling us for the swap DM below.
-    maybe_ring_provider(&config).await;
-
+async fn run_negotiation<P: Channel, F: Channel>(
+    config: &ClientConfig,
+    network: Network,
+    store: &JsonFileSwapStore,
+    negotiator: &Negotiator<P, F>,
+    client_pkarr: &str,
+) -> Result<()> {
     // For reverse swaps the client owns the preimage and the on-chain claim key.
     let secp = Secp256k1::new();
     let (claim_sk, claim_pk) = swap_common::random_keypair(&secp);
@@ -375,31 +390,21 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // 1) Request a quote (offer_id nil = the provider's current offer; a real client would
     //    first discover the Offer via the follow graph).
     let qreq = QuoteRequest {
-        request_id: None,
+        request_id: Some(Uuid::new_v4()),
         offer_id: Uuid::nil(),
-        client_pkarr: client_pkarr.clone(),
+        client_pkarr: client_pkarr.to_string(),
         direction: config.direction,
         amount_sat: config.amount_sat,
         protocol_version: swap_common::messages::PROTOCOL_VERSION,
         features: Vec::new(),
     };
-    transport
-        .send(
-            &config.provider_pkarr,
-            &SwapMessage::QuoteRequest(qreq.clone()),
-        )
-        .await?;
     info!(
-        "Requested {:?} quote for {} sat",
+        "Requesting {:?} quote for {} sat",
         config.direction, config.amount_sat
     );
 
     // 2) Await the quote.
-    let quote = await_message(&transport, &config.provider_pkarr, 30, |m| match m {
-        SwapMessage::Quote(q) => Some(q),
-        _ => None,
-    })
-    .await?;
+    let quote = negotiator.quote(&qreq).await?;
     info!(
         "Quote {}: amount {} sat, fee {} sat, total {} sat, timeout {} blocks",
         quote.quote_id, quote.amount_sat, quote.fee_sat, quote.total_sat, quote.htlc_timeout_blocks
@@ -409,7 +414,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // derive anything. In particular this is where a provider quoting zero confirmations is
     // refused: acting on a mempool-only funding would let it read our preimage and then replace
     // the funding transaction out from under us.
-    let policy = client_policy(&config, network);
+    let policy = client_policy(config, network);
     if let Err(e) = validate::validate_quote(&quote, &qreq, now_unix(), &policy) {
         return Err(anyhow!("refusing the provider's quote: {e}"));
     }
@@ -448,13 +453,13 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 
     if config.direction == SwapDirection::Submarine {
         return run_submarine(
-            &config,
-            &transport,
+            config,
+            negotiator,
             network,
             &quote,
-            &client_pkarr,
+            client_pkarr,
             &policy,
-            &store,
+            store,
         )
         .await;
     }
@@ -466,9 +471,19 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     // paying for coins it can no longer claim, and being made whole only if the provider
     // correctly refunds and cancels. Relying on a counterparty's correctness for your own safety
     // is not a design, so it goes on disk first.
+    let sreq = SwapRequest {
+        script_type: Default::default(),
+        quote_id: quote.quote_id,
+        client_pkarr: client_pkarr.to_string(),
+        direction: config.direction,
+        payment_hash_hex: hex::encode(ph),
+        client_claim_pubkey_hex: Some(hex::encode(claim_pk.to_bytes())),
+        client_refund_pubkey_hex: None,
+        invoice: None,
+    };
     let client_swap_id = Uuid::new_v4();
-    store::record_intent(
-        &store,
+    store::record_negotiation_intent(
+        store,
         &store::NewClientSwap {
             swap_id: client_swap_id,
             direction: SwapDirection::Reverse,
@@ -482,40 +497,36 @@ pub async fn run(config: ClientConfig) -> Result<()> {
             required_confirmations,
             fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
         },
+        &quote,
+        &sreq,
     )?;
 
     // 3) Commit to the swap (reverse).
-    let sreq = SwapRequest {
-        script_type: Default::default(),
-        quote_id: quote.quote_id,
-        client_pkarr: client_pkarr.clone(),
-        direction: config.direction,
-        payment_hash_hex: hex::encode(ph),
-        client_claim_pubkey_hex: Some(hex::encode(claim_pk.to_bytes())),
-        client_refund_pubkey_hex: None,
-        invoice: None,
-    };
-    transport
-        .send(&config.provider_pkarr, &SwapMessage::SwapRequest(sreq))
-        .await?;
-    info!("Sent swap request for quote {}", quote.quote_id);
 
-    // 4) Await the provider's HTLC details.
-    let accept = await_message(&transport, &config.provider_pkarr, 30, |m| match m {
-        SwapMessage::SwapAccept(a) => Some(a),
-        _ => None,
-    })
-    .await?;
+    info!("Sending swap request for quote {}", quote.quote_id);
+
+    // 4) Await the provider's HTLC details. A lost reply is recovered as this same swap.
+    let chain_for_checks = if config.electrum_url.is_empty() {
+        None
+    } else {
+        Some(build_chain(config)?)
+    };
+    let creation_tip = chain_for_checks
+        .as_ref()
+        .map(|chain| swap_common::chain::run_blocking(|| chain.tip_height()))
+        .transpose()
+        .map_err(|error| anyhow!("creation tip height: {error}"))?;
+    store::record_creation_started(store, client_swap_id, creation_tip)?;
+    let accept = negotiator.create(&sreq).await?;
+    store::record_creation_reply(store, client_swap_id, &accept)?;
+    negotiator.acknowledge(&SwapMessage::SwapRequest(sreq.clone()))?;
     info!("Provider locked HTLC at {}", accept.htlc_address);
 
     // 5a) Check the numbers the provider chose against the quote we agreed to. The script check
     //     below binds the payment hash, both pubkeys, and the timeout height, but it cannot bind
     //     *value*: a well-formed script can pay out far less than was quoted. Amounts are checked
     //     here, and the height-relative checks run once we have a chain tip (5c).
-    let chain_for_checks = build_chain(&config).ok();
-    let tip = chain_for_checks
-        .as_ref()
-        .and_then(|c| swap_common::chain::run_blocking(|| c.tip_height()).ok());
+    let tip = creation_tip;
     if let Err(e) = validate::validate_accept(&accept, &quote, tip, &policy) {
         return Err(anyhow!("refusing the provider's swap acceptance: {e}"));
     }
@@ -545,7 +556,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 
     // 6) Execute, if the client is configured to (own LND + Electrum + a claim destination — either
     //    an explicit --claim-address or `--wallet lnd`, which sweeps into LND's own wallet).
-    let self_sufficient = wallet_is_self_sufficient(&config);
+    let self_sufficient = wallet_is_self_sufficient(config);
     if config.electrum_url.is_empty() || (config.claim_address.is_empty() && !self_sufficient) {
         warn!(
             "Reverse swap negotiated and HTLC verified, but execution config is missing. To pay \
@@ -561,12 +572,13 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("provider did not include a hold invoice"))?;
     let dest_spk = if self_sufficient {
-        build_wallet(&config, network).await?.receive_destination()
+        build_wallet(config, network).await?.receive_destination()
     } else {
         parse_address_spk(&config.claim_address, network)?
     };
-    let ln = make_backend(&config).await?;
-    let chain = build_chain(&config)?;
+    let ln = make_backend(config).await?;
+    let chain =
+        chain_for_checks.ok_or_else(|| anyhow!("chain access is required before payment"))?;
 
     // 5c) The hold invoice is the client's entire exposure in a reverse swap, and until now it
     //     was paid unread. Decode it and bind every field to the quote: our payment hash, the
@@ -594,12 +606,27 @@ pub async fn run(config: ClientConfig) -> Result<()> {
         decoded.amount_msat / 1000
     );
 
+    let current_tip = swap_common::chain::run_blocking(|| chain.tip_height())
+        .map_err(|error| anyhow!("execution tip height: {error}"))?;
+    let mut timelock = policy.timelock;
+    timelock.required_confirmations = policy.effective_confirmations(quote.required_confirmations);
+    match config.direction {
+        SwapDirection::Reverse => swap_common::timelock::check_client_reverse_accept(
+            current_tip,
+            accept.timeout_block_height,
+            &timelock,
+        ),
+        SwapDirection::Submarine => swap_common::timelock::check_client_submarine_accept(
+            current_tip,
+            accept.timeout_block_height,
+            &timelock,
+        ),
+    }
+    .map_err(|error| anyhow!("insufficient time to start this swap: {error}"))?;
     store::record_accept(
-        &store,
+        store,
         client_swap_id,
-        hex::encode(expected_script.as_bytes()),
-        accept.timeout_block_height,
-        quote.amount_sat,
+        &accept,
         hex::encode(dest_spk.as_bytes()),
     )?;
 
@@ -617,7 +644,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     };
     info!("Paying the hold invoice and waiting to claim the on-chain HTLC...");
     let sink = RecordProgress {
-        store: &store,
+        store,
         swap_id: client_swap_id,
     };
     let txid = execute_reverse_swap(
@@ -634,7 +661,7 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     match &txid {
         Ok(id) => {
             info!("Reverse swap complete; claim broadcast as {id}");
-            if let Err(e) = store::record_terminal(&store, client_swap_id, SwapState::Claimed) {
+            if let Err(e) = store::record_terminal(store, client_swap_id, SwapState::Claimed) {
                 warn!("could not record the swap outcome: {e}");
             }
         }
@@ -651,9 +678,9 @@ pub async fn run(config: ClientConfig) -> Result<()> {
 
 /// Execute a submarine swap (on-chain → Lightning): issue an invoice the provider pays, fund the
 /// HTLC the provider claims, and refund on-chain if the provider never pays.
-async fn run_submarine(
+async fn run_submarine<P: Channel, F: Channel>(
     config: &ClientConfig,
-    transport: &Transport,
+    negotiator: &Negotiator<P, F>,
     network: Network,
     quote: &Quote,
     client_pkarr: &str,
@@ -693,8 +720,18 @@ async fn run_submarine(
     // we are about to fund. It is generated here and exists nowhere else in the world. Writing it
     // after the counterparty replies would leave a window in which a crash loses it, and losing
     // it does not fail the swap: it makes the output unspendable by anyone, forever.
+    let sreq = SwapRequest {
+        script_type: Default::default(),
+        quote_id: quote.quote_id,
+        client_pkarr: client_pkarr.to_string(),
+        direction: SwapDirection::Submarine,
+        payment_hash_hex: hex::encode(ph),
+        client_claim_pubkey_hex: None,
+        client_refund_pubkey_hex: Some(hex::encode(refund_pk.to_bytes())),
+        invoice: Some(invoice.bolt11.clone()),
+    };
     let client_swap_id = Uuid::new_v4();
-    store::record_intent(
+    store::record_negotiation_intent(
         store,
         &store::NewClientSwap {
             swap_id: client_swap_id,
@@ -709,38 +746,30 @@ async fn run_submarine(
             required_confirmations: policy.effective_confirmations(quote.required_confirmations),
             fee_rate_sat_vb: config.onchain_fee_rate_sat_vb,
         },
+        quote,
+        &sreq,
     )?;
 
     // 3) Commit to the swap, carrying our invoice + refund pubkey.
-    let sreq = SwapRequest {
-        script_type: Default::default(),
-        quote_id: quote.quote_id,
-        client_pkarr: client_pkarr.to_string(),
-        direction: SwapDirection::Submarine,
-        payment_hash_hex: hex::encode(ph),
-        client_claim_pubkey_hex: None,
-        client_refund_pubkey_hex: Some(hex::encode(refund_pk.to_bytes())),
-        invoice: Some(invoice.bolt11.clone()),
-    };
-    transport
-        .send(&config.provider_pkarr, &SwapMessage::SwapRequest(sreq))
-        .await?;
-    info!("Sent submarine swap request for quote {}", quote.quote_id);
 
-    // 4) Await the provider's HTLC details.
-    let accept = await_message(transport, &config.provider_pkarr, 30, |m| match m {
-        SwapMessage::SwapAccept(a) => Some(a),
-        _ => None,
-    })
-    .await?;
+    info!(
+        "Sending submarine swap request for quote {}",
+        quote.quote_id
+    );
+
+    // 4) Await the provider's HTLC details. A lost reply is recovered as this same swap.
+    let chain = build_chain(config)?;
+    let tip = swap_common::chain::run_blocking(|| chain.tip_height())
+        .map_err(|error| anyhow!("tip height: {error}"))?;
+    store::record_creation_started(store, client_swap_id, Some(tip))?;
+    let accept = negotiator.create(&sreq).await?;
+    store::record_creation_reply(store, client_swap_id, &accept)?;
+    negotiator.acknowledge(&SwapMessage::SwapRequest(sreq.clone()))?;
 
     // 5a) Check the numbers against the quote before anything is funded. This is the direction
     //     where the client locks the coins, so an inflated `onchain_amount_sat` is a direct
     //     transfer of the client's money: a provider could quote 100k sat and then ask for 10M.
     //     The script check below cannot see it, because the script would be perfectly valid.
-    let chain = build_chain(config)?;
-    let tip = swap_common::chain::run_blocking(|| chain.tip_height())
-        .map_err(|e| anyhow!("tip height: {e}"))?;
     if let Err(e) = validate::validate_accept(&accept, quote, Some(tip), policy) {
         return Err(anyhow!("refusing the provider's swap acceptance: {e}"));
     }
@@ -774,15 +803,29 @@ async fn run_submarine(
     // 6) Fund the HTLC and wait for settlement (or refund at timeout).
     let wallet = build_wallet(config, network).await?;
     let dest_spk = wallet.receive_destination();
+    let current_tip = swap_common::chain::run_blocking(|| chain.tip_height())
+        .map_err(|error| anyhow!("execution tip height: {error}"))?;
+    let mut timelock = policy.timelock;
+    timelock.required_confirmations = policy.effective_confirmations(quote.required_confirmations);
+    match config.direction {
+        SwapDirection::Reverse => swap_common::timelock::check_client_reverse_accept(
+            current_tip,
+            accept.timeout_block_height,
+            &timelock,
+        ),
+        SwapDirection::Submarine => swap_common::timelock::check_client_submarine_accept(
+            current_tip,
+            accept.timeout_block_height,
+            &timelock,
+        ),
+    }
+    .map_err(|error| anyhow!("insufficient time to start this swap: {error}"))?;
     store::record_accept(
         store,
         client_swap_id,
-        hex::encode(expected_script.as_bytes()),
-        accept.timeout_block_height,
-        quote.total_sat,
+        &accept,
         hex::encode(dest_spk.as_bytes()),
     )?;
-    let _ = tip;
     let funding = SubmarineFunding {
         htlc_script: expected_script,
         htlc_spk: htlc_address.script_pubkey(),
@@ -813,45 +856,6 @@ async fn run_submarine(
         warn!("could not record the swap outcome: {e}");
     }
     Ok(())
-}
-
-/// Ring the provider's iroh rendezvous (doorbell) so it starts polling us, when enabled and built
-/// with the `iroh` feature. Best-effort: a failure just falls back to relying on the provider
-/// already following us.
-#[cfg(feature = "iroh")]
-async fn maybe_ring_provider(config: &ClientConfig) {
-    if !config.rendezvous_iroh {
-        return;
-    }
-    let identity = match config.identity() {
-        Ok(i) => i,
-        Err(e) => {
-            warn!("iroh rendezvous disabled: {e}");
-            return;
-        }
-    };
-    let secret = match pubky_transport::identity::secret_from_recovery(
-        identity.method,
-        &identity.value,
-        &identity.passphrase,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("iroh rendezvous disabled: {e}");
-            return;
-        }
-    };
-    match pubky_transport::p2p::ring_provider(secret, &config.provider_pkarr).await {
-        Ok(()) => info!("Rang provider iroh doorbell; it should start polling us"),
-        Err(e) => warn!("iroh rendezvous ring failed ({e}); relying on the provider following us"),
-    }
-}
-
-#[cfg(not(feature = "iroh"))]
-async fn maybe_ring_provider(config: &ClientConfig) {
-    if config.rendezvous_iroh {
-        warn!("--rendezvous-iroh set but this build lacks the `iroh` feature; ignoring");
-    }
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {
@@ -1088,39 +1092,6 @@ fn build_chain(_config: &ClientConfig) -> Result<Arc<dyn ChainWatcher>> {
         "client built without the `chain` feature; rebuild with --features full to watch/claim the HTLC"
     ))
 }
-
-/// Poll the provider for messages until `extract` yields a value or we time out. A
-/// [`SwapMessage::Reject`] aborts with its reason.
-async fn await_message<F, T>(
-    transport: &Transport,
-    provider: &str,
-    timeout_secs: u64,
-    mut extract: F,
-) -> Result<T>
-where
-    F: FnMut(SwapMessage) -> Option<T>,
-{
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    loop {
-        if Instant::now() > deadline {
-            return Err(anyhow!("timed out waiting for provider response"));
-        }
-        let msgs = transport
-            .receive_from::<SwapMessage>(provider)
-            .await
-            .unwrap_or_default();
-        for m in msgs {
-            if let SwapMessage::Reject(r) = &m {
-                return Err(anyhow!("provider rejected: {}", r.reason));
-            }
-            if let Some(t) = extract(m) {
-                return Ok(t);
-            }
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -18,6 +18,8 @@ compile_error!(
      reached by pubkys it already follows."
 );
 
+mod delivery;
+mod dispatch;
 pub mod preflight;
 pub mod pricing;
 pub(crate) mod recovery;
@@ -157,7 +159,7 @@ pub struct ProviderConfig {
     ///
     /// On by default, because off is a provider nobody new can reach. Pubky's private messages
     /// live at a path derived from an ECDH shared secret between the two parties: unlinkable by
-    /// design, and therefore not enumerable, so `receive_all` can only poll pubkys already in the
+    /// design, and therefore not enumerable, so the receiver can only poll pubkys already in the
     /// peer set. That set comes from the follow graph. Someone handed only our pubky, which is
     /// exactly what the docs tell them to ask for, writes into a conversation nothing will ever
     /// look in. The doorbell is how they say "look at me" first.
@@ -488,6 +490,9 @@ struct ExecCtx {
 /// neither sees the other's funding marker and both can fund the same HTLC.
 #[derive(Default)]
 struct AdmissionLocks {
+    // Initial admission reads shared records before writing a contract. All transports share
+    // this exclusion, while independent quote and status handlers remain concurrent.
+    creation: tokio::sync::Mutex<()>,
     locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -841,10 +846,17 @@ fn spawn_offer_refresher(
 
 /// Sweep terminal swap records that are old enough to drop.
 fn spawn_record_pruner(ctx: &ExecCtx) {
-    let store = ctx.store.clone();
+    let ctx = ctx.clone();
     tokio::spawn(async move {
         loop {
-            match store.prune_terminal(TERMINAL_RECORD_RETENTION) {
+            // A long downtime may make records immediately eligible. Persist their message
+            // cleanup scopes before removing the only local mapping to those resources.
+            if !delivery::refresh_retention(&ctx, now_unix()).await {
+                warn!("retaining terminal records until message cleanup ownership is saved");
+                sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+            match ctx.store.prune_terminal(TERMINAL_RECORD_RETENTION) {
                 Ok(n) if n > 0 => info!("pruned {n} terminal swap record(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("pruning terminal swap records failed: {e}"),
@@ -869,6 +881,11 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
         _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
     };
+    let transport = transport
+        .with_receive_journal(std::path::Path::new(&config.data_dir).join("receive-journal.json"))
+        .context("open receive journal")?
+        .with_outbox(std::path::Path::new(&config.data_dir).join("message-outbox.json"))
+        .context("open message outbox")?;
     let provider_pkarr = transport.public_key_string();
     info!("Provider pubky: {provider_pkarr}");
 
@@ -1022,6 +1039,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     // Sweep terminal swap records once they are old enough to drop. Records are retained
     // rather than deleted on completion, so a driver failure can never take one with it.
     spawn_record_pruner(&ctx);
+    delivery::spawn(&ctx);
     // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
     spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
 
@@ -1080,31 +1098,63 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     }
 
     info!("Provider running; waiting for quote/swap requests...");
+    let mut inbox = transport.receiver::<SwapMessage>(pubky_transport::PollConfig::default());
+    let mut dispatcher = dispatch::Dispatcher::new(
+        16,
+        32,
+        512,
+        |inbound: &pubky_transport::Inbound<SwapMessage>| {
+            matches!(inbound.message, SwapMessage::SwapRequest(_))
+        },
+        message_handler(&ctx, &offer),
+    );
+    let mut last_stats = std::time::Instant::now();
     loop {
-        let messages = transport
-            .receive_all_with_receipts::<SwapMessage>()
-            .await
-            .unwrap_or_default();
-        for inbound in messages {
-            // No offer yet means the daemon is still working out what it can serve. Nothing to
-            // quote against, so nothing to answer; the message goes back and comes round again
-            // on the next poll.
+        let batch = inbox.recv().await;
+        dispatcher.dispatch(batch.peer, batch.messages);
+        if last_stats.elapsed() >= Duration::from_secs(60) {
+            debug!(
+                queued_messages = dispatcher.queued(),
+                busy_peers = dispatcher.busy_peers(),
+                "message dispatch"
+            );
+            last_stats = std::time::Instant::now();
+        }
+    }
+}
+
+fn message_handler(
+    ctx: &ExecCtx,
+    offer: &SharedOffer,
+) -> dispatch::Handler<pubky_transport::Inbound<SwapMessage>> {
+    let ctx = ctx.clone();
+    let offer = offer.clone();
+    Arc::new(move |sender, inbound| {
+        let ctx = ctx.clone();
+        let offer = offer.clone();
+        Box::pin(async move {
+            // Every early return drops the receipt, leaving the durable request pending.
             let Some(current) = offer.read().await.clone() else {
-                transport.release(&inbound.receipt);
-                continue;
+                return;
             };
-            let sender = &inbound.peer;
-            if let Err(e) = handle_message(&ctx, &current, sender, inbound.message).await {
-                if is_reply_not_sent(&e) {
-                    warn!("could not reply to {sender}, will retry: {e}");
-                    transport.release(&inbound.receipt);
-                } else {
-                    warn!("error handling message from {sender}: {e}");
+            match handle_message(&ctx, &current, &sender, inbound.message).await {
+                Ok(()) => {
+                    if ctx.transport.acknowledge(&inbound.receipt).is_err() {
+                        warn!("could not persist message acknowledgment; request remains pending");
+                    }
+                }
+                Err(error) => {
+                    // Application rejections are successful replies. An error is unfinished
+                    // work, including an acceptance the homeserver may not have stored.
+                    if is_reply_not_sent(&error) {
+                        warn!("reply delivery failed; request remains pending");
+                    } else {
+                        warn!("message handler failed; request remains pending");
+                    }
                 }
             }
-        }
-        sleep(Duration::from_millis(200)).await;
-    }
+        })
+    })
 }
 
 /// A shared HTTP client for the configured beignet daemon.
@@ -1405,9 +1455,14 @@ fn build_offer(
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
         features: if capable {
-            let mut features = vec!["boltz-taproot-v1".into(), "swap-status-v1".into()];
+            let mut features = vec![
+                "boltz-taproot-v1".into(),
+                "swap-status-v1".into(),
+                "dm-retention-v1".into(),
+            ];
             if cfg!(feature = "iroh") && config.rendezvous_iroh {
                 features.push("session-rpc-v1".into());
+                features.push("direct-rpc-v1".into());
             }
             features
         } else {
@@ -1422,6 +1477,11 @@ async fn handle_message(
     sender: &str,
     msg: SwapMessage,
 ) -> Result<()> {
+    let _creation = if matches!(msg, SwapMessage::SwapRequest(_)) {
+        Some(ctx.admissions.creation.lock().await)
+    } else {
+        None
+    };
     match msg {
         SwapMessage::OfferRequest(req) => {
             let mut current = offer.clone();
@@ -2798,7 +2858,20 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: Sh
                 while let Some(event) = server.next_event().await {
                     match event {
                         pubky_transport::p2p::RendezvousEvent::Peer(pubky) => {
-                            ctx.transport.add_known_peer(pubky)
+                            if ctx.transport.register_peer(&pubky, false).is_err() {
+                                warn!("could not persist rendezvous peer; registration will need retry");
+                            }
+                        }
+                        pubky_transport::p2p::RendezvousEvent::Direct(request) => {
+                            let ctx = ctx.clone();
+                            let offer = offer.clone();
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(60),
+                                    handle_direct_request(ctx, offer, request),
+                                )
+                                .await;
+                            });
                         }
                         pubky_transport::p2p::RendezvousEvent::Session(request) => {
                             let Some(verifier) = verifier.clone() else {
@@ -2834,19 +2907,9 @@ async fn handle_session_request(
         Ok(owner) => owner,
         Err(_) => return,
     };
-    let Ok(message) = serde_json::from_value::<SwapMessage>(request.request.message) else {
+    let Some(message) = customer_request(request.request.message) else {
         return;
     };
-    // Only customer requests are accepted over this protocol.
-    if !matches!(
-        message,
-        SwapMessage::OfferRequest(_)
-            | SwapMessage::QuoteRequest(_)
-            | SwapMessage::SwapRequest(_)
-            | SwapMessage::SwapStatusRequest(_)
-    ) {
-        return;
-    }
     let Some(current) = offer.read().await.clone() else {
         return;
     };
@@ -2862,6 +2925,43 @@ async fn handle_session_request(
     }
 }
 
+/// Answer a request from the root key that authenticated the connection. No homeserver lookup is
+/// needed, and the sender owns exactly what the same key owns over DMs.
+#[cfg(feature = "iroh")]
+async fn handle_direct_request(
+    mut ctx: ExecCtx,
+    offer: SharedOffer,
+    request: pubky_transport::p2p::DirectRpc,
+) {
+    let Some(message) = customer_request(request.message) else {
+        return;
+    };
+    let Some(current) = offer.read().await.clone() else {
+        return;
+    };
+    ctx.transport = Arc::new(ctx.transport.root_key(request.reply));
+    if handle_message(&ctx, &current, &request.remote_key, message)
+        .await
+        .is_err()
+    {
+        warn!("could not handle direct swap request");
+    }
+}
+
+/// Only customer requests are accepted over the request/reply protocols.
+#[cfg(feature = "iroh")]
+fn customer_request(message: serde_json::Value) -> Option<SwapMessage> {
+    let message = serde_json::from_value::<SwapMessage>(message).ok()?;
+    matches!(
+        message,
+        SwapMessage::OfferRequest(_)
+            | SwapMessage::QuoteRequest(_)
+            | SwapMessage::SwapRequest(_)
+            | SwapMessage::SwapStatusRequest(_)
+    )
+    .then_some(message)
+}
+
 #[cfg(not(feature = "iroh"))]
 fn maybe_spawn_iroh_rendezvous(_ctx: &ExecCtx, config: &ProviderConfig, _offer: SharedOffer) {
     if config.rendezvous_iroh {
@@ -2874,6 +2974,9 @@ fn maybe_spawn_iroh_rendezvous(_ctx: &ExecCtx, config: &ProviderConfig, _offer: 
 /// This keeps the poll set and the persistent follow graph bounded. A returning client must be
 /// re-discovered (e.g. via DHT rendezvous) to be polled again.
 async fn evict_peer_if_idle(ctx: &ExecCtx, peer: &str) {
+    if ctx.transport.has_pending_messages(peer) {
+        return;
+    }
     let still_active = match ctx.store.load_active() {
         Ok(recs) => recs.iter().any(|r| r.peer == peer),
         // On a store error, keep the peer rather than risk evicting one mid-swap.
@@ -2919,15 +3022,24 @@ async fn notify_terminal_peer(
     swap_id: Uuid,
     state: SwapState,
 ) {
-    if progress.snapshot().peer_account.is_some() {
+    let record = progress.snapshot();
+    if record.peer_account.is_some() {
         return;
+    }
+    match delivery::has_dm_history(&ctx.transport, &record) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            warn!("final swap notification remains pending until message history can be read");
+            return;
+        }
     }
     send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
     evict_peer_if_idle(ctx, peer).await;
 }
 
 async fn send_final_status(
-    transport: &ReplyTransport,
+    transport: &Transport,
     peer: &str,
     swap_id: Uuid,
     result: Result<SwapState>,
@@ -2939,8 +3051,9 @@ async fn send_final_status(
         state,
         reference: None,
     };
+    let message = SwapMessage::SwapStatusUpdate(update);
     if let Err(e) = transport
-        .send(peer, &SwapMessage::SwapStatusUpdate(update))
+        .send_with_scope(peer, &message.delivery_scope(), &message)
         .await
     {
         warn!("failed to send final status for swap {swap_id}: {e}");
@@ -3144,7 +3257,7 @@ mod tests {
     /// follows, which is nobody on a fresh install.
     ///
     /// Pubky's private messages live at a path derived from an ECDH shared secret, so they are
-    /// unlinkable and therefore not enumerable: `receive_all` can only poll pubkys already in the
+    /// unlinkable and therefore not enumerable: the receiver can only poll pubkys already in the
     /// peer set, and that set comes from the follow graph. Everything the project tells a user to
     /// do, "share the pubky it prints", depends on the rendezvous being on. It was off, and the
     /// feature that implements it was not in `full`.

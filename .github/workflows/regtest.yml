@@ -6,9 +6,12 @@ on:
   pull_request:
     paths:
       - 'swap-common/**'
+      - 'pubky-transport/**'
+      - 'swap-config/**'
       - 'swap-provider/**'
       - 'swap-client/**'
       - 'lightning/**'
+      - 'beignet-backend/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'docker-compose.regtest.yml'
@@ -17,6 +20,10 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

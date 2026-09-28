@@ -1,11 +1,11 @@
 //! Request-local replies keep session traffic separate from root-key encrypted DMs.
 
 use pubky_transport::Transport;
-use serde::Serialize;
 use std::{
     ops::Deref,
     sync::{Arc, Mutex},
 };
+use swap_common::messages::SwapMessage;
 use tokio::sync::oneshot;
 
 pub(crate) struct ReplyTransport {
@@ -16,6 +16,13 @@ pub(crate) struct ReplyTransport {
 }
 
 impl ReplyTransport {
+    pub(crate) fn receiver<M: serde::de::DeserializeOwned + 'static>(
+        &self,
+        config: pubky_transport::PollConfig,
+    ) -> pubky_transport::PeerInbox<pubky_transport::Inbound<M>> {
+        self.inner.receiver(config)
+    }
+
     pub(crate) fn account(&self) -> Option<&str> {
         self.account.as_deref()
     }
@@ -48,13 +55,28 @@ impl ReplyTransport {
         }
     }
 
-    pub(crate) async fn send<T: Serialize>(
+    /// Reply on the request's stream as the root key that sent it. With no account or scope,
+    /// ownership checks treat the sender exactly as they treat the same key over DMs.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn root_key(&self, reply: oneshot::Sender<Vec<u8>>) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            reply: Some(Mutex::new(Some(reply))),
+            account: None,
+            scope: None,
+        }
+    }
+
+    pub(crate) async fn send(
         &self,
         peer: &str,
-        message: &T,
+        message: &SwapMessage,
     ) -> pubky_transport::Result<()> {
         let Some(reply) = &self.reply else {
-            return self.inner.send(peer, message).await;
+            return self
+                .inner
+                .send_with_scope(peer, &message.delivery_scope(), message)
+                .await;
         };
         let bytes = serde_json::to_vec(message)?;
         if let Some(sender) = reply
@@ -64,7 +86,8 @@ impl ReplyTransport {
         {
             let _ = sender.send(bytes);
         }
-        // Session clients poll durable status; background updates do not become root-key DMs.
+        // Stream clients poll durable status. Background updates from a driver spawned by this
+        // request land here too and are dropped rather than sent as DMs.
         Ok(())
     }
 }

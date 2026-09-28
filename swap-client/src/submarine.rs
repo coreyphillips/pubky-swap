@@ -666,6 +666,7 @@ mod tests {
                 funding_intent_at_height: Some(TIMEOUT - 100),
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
+                invoice_pay_started_at_unix: None,
             },
             &(),
         )
@@ -709,6 +710,7 @@ mod tests {
                 funding_intent_at_height: Some(TIMEOUT - 100),
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
+                invoice_pay_started_at_unix: None,
             },
             &(),
         )
@@ -847,6 +849,7 @@ mod tests {
                 funding_intent_at_height: None,
                 our_spends: vec![our_txid],
                 reorg_seen_at_height: None,
+                invoice_pay_started_at_unix: None,
             },
             &(),
         )

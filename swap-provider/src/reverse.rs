@@ -1653,6 +1653,7 @@ mod tests {
                 funding_intent_at_height: Some(MOCK_TIP),
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
+                invoice_pay_started_at_unix: None,
             },
             &(),
         )
@@ -1750,6 +1751,7 @@ mod tests {
                     funding_intent_at_height: Some(MOCK_TIP),
                     our_spends: Vec::new(),
                     reorg_seen_at_height: Some(MOCK_TIP - 2),
+                    invoice_pay_started_at_unix: None,
                 },
                 &(),
             ),
@@ -1792,6 +1794,7 @@ mod tests {
                 funding_intent_at_height: None,
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
+                invoice_pay_started_at_unix: None,
             },
             &(),
         )
@@ -1903,6 +1906,7 @@ mod tests {
                 funding_intent_at_height: Some(MOCK_TIP),
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
+                invoice_pay_started_at_unix: None,
             },
             &(),
         )

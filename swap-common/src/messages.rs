@@ -44,6 +44,55 @@ pub enum SwapMessage {
     Reject(Reject),
 }
 
+impl SwapMessage {
+    /// Group transport resources by the operation that controls their retention.
+    ///
+    /// Creation requests and acceptances share the quote scope. Read-only traffic uses an
+    /// ephemeral scope so expiring a quote or status reply cannot complete a creation. Transport
+    /// resource identity and application idempotency remain separate from this grouping.
+    pub fn delivery_scope(&self) -> String {
+        match self {
+            Self::SwapRequest(request) => format!("quote:{}", request.quote_id),
+            Self::SwapAccept(accept) => format!("quote:{}", accept.quote_id),
+            Self::SwapStatusUpdate(update) => format!("swap:{}", update.swap_id),
+            Self::CoopSignature(signature) => format!("swap:{}", signature.swap_id),
+            Self::Offer(offer) => ephemeral("offer", offer.request_id.unwrap_or(offer.offer_id)),
+            Self::OfferRequest(request) => {
+                ephemeral("offer-request", request.request_id.unwrap_or_default())
+            }
+            Self::QuoteRequest(request) => ephemeral(
+                "quote-request",
+                request.request_id.unwrap_or(request.offer_id),
+            ),
+            Self::Quote(quote) => ephemeral("quote", quote.request_id.unwrap_or(quote.quote_id)),
+            Self::SwapStatusRequest(request) => ephemeral(
+                "status-request",
+                request
+                    .request_id
+                    .or(request.swap_id)
+                    .or(request.quote_id)
+                    .unwrap_or_default(),
+            ),
+            Self::SwapStatusSnapshot(snapshot) => ephemeral(
+                "status-snapshot",
+                snapshot.request_id.unwrap_or(snapshot.accept.swap_id),
+            ),
+            Self::Reject(rejection) => ephemeral(
+                "reject",
+                rejection
+                    .request_id
+                    .or(rejection.quote_id)
+                    .or(rejection.swap_id)
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+}
+
+fn ephemeral(kind: &str, id: Uuid) -> String {
+    format!("ephemeral:{kind}:{id}")
+}
+
 /// The wire protocol this build speaks.
 ///
 /// Bumped when a change would make one side act on a message the other meant differently. Adding
@@ -473,5 +522,107 @@ mod tests {
             SwapMessage::Offer(o) => assert_eq!(o.base_fee_sat, 500),
             _ => panic!("wrong variant"),
         }
+    }
+
+    fn accepted_swap() -> SwapAccept {
+        SwapAccept {
+            script_type: Default::default(),
+            swap_tree: None,
+            quote_id: Uuid::new_v4(),
+            swap_id: Uuid::new_v4(),
+            direction: SwapDirection::Reverse,
+            htlc_script_hex: String::new(),
+            htlc_address: String::new(),
+            onchain_amount_sat: 100_000,
+            timeout_block_height: 1000,
+            provider_pubkey_hex: String::new(),
+            invoice: None,
+        }
+    }
+
+    #[test]
+    fn creation_messages_share_retention_without_using_read_only_reply_scopes() {
+        let accept = accepted_swap();
+        let request = SwapRequest {
+            script_type: Default::default(),
+            quote_id: accept.quote_id,
+            client_pkarr: "client".into(),
+            direction: SwapDirection::Reverse,
+            payment_hash_hex: "00".repeat(32),
+            client_claim_pubkey_hex: None,
+            client_refund_pubkey_hex: None,
+            invoice: None,
+        };
+        let creation = SwapMessage::SwapAccept(accept.clone()).delivery_scope();
+        assert_eq!(creation, SwapMessage::SwapRequest(request).delivery_scope());
+        let status = SwapMessage::SwapStatusSnapshot(SwapStatusSnapshot {
+            request_id: Some(Uuid::new_v4()),
+            accept: accept.clone(),
+            network: NetworkSpec::Regtest,
+            state: SwapState::Created,
+            funding_txid_hex: None,
+            funding_vout: None,
+            spend_txid_hex: None,
+            required_confirmations: 1,
+            updated_at_unix: 1,
+            observed_at_unix: 1,
+        });
+        assert!(status
+            .delivery_scope()
+            .starts_with("ephemeral:status-snapshot:"));
+        assert_ne!(creation, status.delivery_scope());
+        let query = SwapMessage::SwapStatusRequest(SwapStatusRequest {
+            request_id: None,
+            swap_id: None,
+            quote_id: Some(accept.quote_id),
+        });
+        assert_ne!(creation, query.delivery_scope());
+    }
+
+    #[test]
+    fn lifecycle_retention_isolated_by_swap_identity() {
+        let first = accepted_swap();
+        let second = accepted_swap();
+        let status = |swap_id| {
+            SwapMessage::SwapStatusUpdate(SwapStatusUpdate {
+                swap_id,
+                state: SwapState::Claimed,
+                reference: None,
+            })
+            .delivery_scope()
+        };
+        assert_ne!(status(first.swap_id), status(second.swap_id));
+        assert_ne!(
+            status(first.swap_id),
+            SwapMessage::SwapAccept(first.clone()).delivery_scope()
+        );
+        assert_eq!(
+            status(first.swap_id),
+            SwapMessage::CoopSignature(CoopSignature {
+                swap_id: first.swap_id,
+                data_hex: String::new(),
+            })
+            .delivery_scope()
+        );
+    }
+
+    #[test]
+    fn rejection_does_not_complete_a_creation_or_lifecycle_scope() {
+        let accept = accepted_swap();
+        let rejection = SwapMessage::Reject(Reject {
+            code: None,
+            request_id: None,
+            swap_id: Some(accept.swap_id),
+            quote_id: Some(accept.quote_id),
+            reason: "retry status".into(),
+        });
+        assert!(rejection.delivery_scope().starts_with("ephemeral:reject:"));
+        assert_ne!(
+            rejection.delivery_scope(),
+            SwapMessage::SwapAccept(accept).delivery_scope()
+        );
+        let encoded = serde_json::to_vec(&rejection).unwrap();
+        let restored: SwapMessage = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(rejection.delivery_scope(), restored.delivery_scope());
     }
 }

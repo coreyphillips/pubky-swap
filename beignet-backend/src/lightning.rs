@@ -321,7 +321,7 @@ impl LightningBackend for BeignetLightningBackend {
             .await
         {
             Ok(p) => p,
-            Err(e) if e.code() == Some("NOT_FOUND") => return Ok(PaymentStatus::Unknown),
+            Err(e) if e.code() == Some("NOT_FOUND") => return Ok(PaymentStatus::NotFound),
             Err(e) => return Err(conv(e)),
         };
         Ok(match payment.status.as_str() {

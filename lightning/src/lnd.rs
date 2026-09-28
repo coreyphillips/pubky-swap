@@ -420,7 +420,7 @@ impl LightningBackend for LndBackend {
             Ok(s) => s.into_inner(),
             // LND answers NotFound when it has never seen the hash.
             Err(s) if s.code() == fedimint_tonic_lnd::tonic::Code::NotFound => {
-                return Ok(PaymentStatus::Unknown)
+                return Ok(PaymentStatus::NotFound)
             }
             Err(s) => return Err(LightningError::Backend(s.to_string())),
         };

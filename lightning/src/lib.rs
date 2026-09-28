@@ -70,8 +70,10 @@ pub enum InvoiceState {
 /// actions.
 #[derive(Debug, Clone)]
 pub enum PaymentStatus {
-    /// The node has no record of this payment hash.
+    /// The backend cannot establish whether the payment exists or what state it is in.
     Unknown,
+    /// The authoritative node lookup confirms no payment exists for this hash.
+    NotFound,
     /// An attempt is in flight.
     InFlight,
     /// Settled, with the preimage.
