@@ -123,6 +123,24 @@ publication. Repeating the same scope and payload reuses its resource ID and byt
 ambiguous PUT. `enqueue_with_scope` performs only that durable preparation. Applications schedule
 `process_outbox` to retry saved work; constructing a transport starts no implicit worker.
 
+Publication and cleanup persist independent `DeliveryFailure` categories. HTTP 408, 429 and 5xx,
+including responses from authentication endpoints, retry with bounded exponential backoff.
+Transport unavailability and timeouts also retry. Persistent authentication denials, other HTTP
+errors and invalid requests pause the affected operation. A failure never discards its resource,
+changes its encrypted bytes or removes application recovery records.
+
+`TransportError::Delivery { operation, failure }` reports an attempted operation's sanitized
+failure. `outbox_status()` exposes all saved resources, their retry schedules, historical last
+failures and current pause flags without message bodies or credentials. A historical failure can
+remain after successful publication; `published` and the pause flags describe current state.
+After addressing a paused failure, call `retry_outbox(id, DeliveryOperation::Publication)` or
+`retry_outbox(id, DeliveryOperation::Cleanup)` to schedule that exact resource again. This call
+performs no network I/O and preserves failure history. Publication retry needs a new confirmation
+and cannot bypass an elapsed cleanup deadline; cleanup retry cannot authorize an active scope.
+Ordinary maintenance, repeated sends and scope reopening do not silently unpause failures.
+Existing version-1 outbox journals load the new optional failure fields with empty defaults while
+preserving resource IDs, bytes, publication outcomes, schedules and completion eligibility.
+
 `poll_from` and `receiver` return an `Inbound` carrying a leased `Receipt`. A handler acknowledges
 only after persisting its outcome. Dropping a receipt, cancellation, an absent offer, queue overflow
 or a failed handler leaves the delivery pending. The durable body can be processed after restart
@@ -170,12 +188,15 @@ Executable providers advertise `dm-retention-v1`:
   the conversation or remove another swap's traffic. A successful PUT is not peer acknowledgment.
 - Final notifications can disappear after that explicit recovery window even if unread. The
   authenticated status API and original acceptance remain available under the independent local
-  record retention policy, currently 30 days after terminal completion. Offline clients must use
-  that recovery API and keep their own keys, contracts and chain evidence.
+  record retention policy. Safely settled records are eligible after 30 days without another
+  file update. Failed outcomes, pending invoice work, missing terminal timestamps and expiry with
+  committed funds remain retained. The pruner shares the mutation lock with writes and reorg
+  changes. Offline clients must use the recovery API and keep their own keys, contracts and chain
+  evidence.
 
-The provider continuously retries publication and cleanup. The CLI performs bounded maintenance
+The provider continuously processes eligible publication and cleanup work. The CLI performs bounded maintenance
 when a used DM channel closes and on later recovery runs. A stopped application cannot clean its
-homeserver until it runs again. Partial failures remain in the journal, with persisted backoff;
+homeserver until it runs again. Partial failures remain in the journal, with persisted backoff or an explicit pause;
 cleanup receives only a limited share of request capacity. Each maintenance pass checks saved
 outcomes and uses `reopen_scope` to revoke deferred deletion after reorg or uncertainty. Deletion
 already sent to a homeserver cannot be recalled; local recovery records remain authoritative.
@@ -192,8 +213,10 @@ Acknowledged receive identities are deliberately retained independently of remot
 resource can be republished, so absence or a timestamp alone does not permit forgetting its
 identity. The current JSON journal rewrites on mutation and its acknowledged history can grow.
 A future segmented exact-identity store can reduce that cost without reviving handled work.
-Whole-conversation clear and auto-ack helpers remain compatibility APIs; new production delivery
-uses explicit receipts and scopes. They must not be used to finish an individual swap.
+The transport exposes explicit receipts and scoped cleanup. Auto-acknowledging reads,
+whole-conversation clear helpers and the unused `SwapTransport` compatibility trait have been
+removed. Callers use `poll_from` or `receiver`, persist the handled outcome, and acknowledge its
+receipt. Completion schedules cleanup through `complete_scope` and `process_outbox`.
 
 ## Operational limits
 

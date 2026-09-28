@@ -538,8 +538,8 @@ pub trait SwapStore: Send + Sync {
     }
     /// Record a swap's terminal state. Keeps the record for audit rather than deleting it.
     fn mark_terminal(&self, rec: &SwapRecord) -> Result<()>;
-    /// Delete terminal records older than `retain`, returning how many were removed. Called only
-    /// by a background sweeper, never by a driver.
+    /// Delete safely settled records older than `retain`, returning how many were removed.
+    /// Uncertain outcomes and pending recovery work remain. Called only by a background sweeper.
     fn prune_terminal(&self, retain: Duration) -> Result<usize>;
 
     /// Read-modify-write one record, atomically with respect to other writers.
@@ -558,7 +558,7 @@ pub trait SwapStore: Send + Sync {
 /// A directory-of-JSON-files [`SwapStore`]: one `<dir>/<swap_id>.json` per swap.
 pub struct JsonFileSwapStore {
     dir: PathBuf,
-    /// Serializes read-modify-write against other writers in this process.
+    /// Serializes mutations, whole-record writes and pruning in this process.
     ///
     /// It does not make the store safe against a second process, which nothing here needs: one
     /// daemon owns its data directory. What it does is make [`SwapStore::mutate`] mean what it
@@ -602,28 +602,14 @@ impl JsonFileSwapStore {
         self.dir
             .join(format!("{swap_id}.{}.{n}.tmp", std::process::id()))
     }
-}
 
-impl SwapStore for JsonFileSwapStore {
-    fn mutate(&self, swap_id: Uuid, f: &mut dyn FnMut(&mut SwapRecord)) -> Result<bool> {
-        // Held across the read and the write, so a concurrent `mutate` cannot read the same
-        // record and write back over this one's change.
-        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(mut rec) = self.get(swap_id)? else {
-            return Ok(false);
-        };
-        f(&mut rec);
-        self.put(&rec)?;
-        Ok(true)
-    }
-
-    fn put(&self, rec: &SwapRecord) -> Result<()> {
+    /// Caller holds `write_lock` through every read and write of this record.
+    fn persist_record(&self, rec: &SwapRecord) -> Result<()> {
         let path = self.path_for(rec.swap_id);
         let tmp = self.tmp_path_for(rec.swap_id);
 
-        // Stamped here rather than at each call site: `put` is the only way a record reaches the
-        // disk, so this is the one place that can be sure it happens exactly once, on the write
-        // that creates the file. Every later write carries the value already in the record.
+        // Stamp creation time at the shared persistence boundary. Later writes preserve the
+        // existing value even when the caller's snapshot predates its first persisted record.
         let stamped;
         let rec = if rec.created_at_unix == 0 {
             let existing = self.get(rec.swap_id).ok().flatten();
@@ -669,6 +655,25 @@ impl SwapStore for JsonFileSwapStore {
         }
         Ok(())
     }
+}
+
+impl SwapStore for JsonFileSwapStore {
+    fn mutate(&self, swap_id: Uuid, f: &mut dyn FnMut(&mut SwapRecord)) -> Result<bool> {
+        // Held across the read and the write, so a concurrent `mutate` cannot read the same
+        // record and write back over this one's change.
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut rec) = self.get(swap_id)? else {
+            return Ok(false);
+        };
+        f(&mut rec);
+        self.persist_record(&rec)?;
+        Ok(true)
+    }
+
+    fn put(&self, rec: &SwapRecord) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_record(rec)
+    }
 
     fn get(&self, swap_id: Uuid) -> Result<Option<SwapRecord>> {
         let path = self.path_for(swap_id);
@@ -693,13 +698,15 @@ impl SwapStore for JsonFileSwapStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            // Serialize eligibility and deletion with a reorg or driver saving fresh state.
+            let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
             let Ok(bytes) = fs::read(&path) else { continue };
             let Ok(rec) = serde_json::from_slice::<SwapRecord>(&bytes) else {
                 // Unparsable records are never pruned: a record we cannot read may still be a
                 // live swap, and deleting it would strand whatever it was watching.
                 continue;
             };
-            if !rec.state.is_terminal() {
+            if !safe_to_prune(&rec) {
                 continue;
             }
             let age = fs::metadata(&path)
@@ -757,6 +764,17 @@ impl SwapStore for JsonFileSwapStore {
             );
         }
         Ok(records)
+    }
+}
+
+fn safe_to_prune(record: &SwapRecord) -> bool {
+    if record.updated_at_unix == 0 || record.pending_hold_invoice.is_some() {
+        return false;
+    }
+    match record.state {
+        SwapState::Claimed | SwapState::Refunded => true,
+        SwapState::Expired => !record.funds_at_risk(),
+        _ => false,
     }
 }
 
@@ -995,6 +1013,7 @@ mod tests {
         // Terminal records are not returned as active, but are retained.
         let mut done = rec.clone();
         done.state = SwapState::Claimed;
+        done.updated_at_unix = now_unix();
         store.mark_terminal(&done).unwrap();
         assert!(store.load_active().unwrap().is_empty());
         assert!(store.get(rec.swap_id).unwrap().is_some());
@@ -1024,6 +1043,160 @@ mod tests {
         assert_eq!(store.prune_terminal(Duration::ZERO).unwrap(), 0);
         assert_eq!(store.load_active().unwrap().len(), 1);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn put_old_record(store: &JsonFileSwapStore, record: &SwapRecord) {
+        store.put(record).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(store.path_for(record.swap_id))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+            .unwrap();
+    }
+
+    #[test]
+    fn pruning_preserves_old_terminal_records_with_uncertain_recovery() {
+        let directory = temp_dir();
+        let store = JsonFileSwapStore::new(&directory).unwrap();
+        let base = || SwapRecord {
+            swap_id: Uuid::new_v4(),
+            updated_at_unix: 1,
+            state: SwapState::Expired,
+            ..SwapRecord::new_progress()
+        };
+        let failed = SwapRecord {
+            state: SwapState::Failed("backend unavailable".into()),
+            ..base()
+        };
+        let funding = SwapRecord {
+            funding_intent_at_height: Some(1),
+            ..base()
+        };
+        let funded = SwapRecord {
+            funding_txid_hex: Some(txid(1).to_string()),
+            funding_vout: Some(0),
+            ..base()
+        };
+        let paid = SwapRecord {
+            role: SwapRole::Client,
+            direction: SwapDirection::Reverse,
+            invoice_pay_started_at_unix: Some(1),
+            ..base()
+        };
+        let pending_invoice = SwapRecord {
+            state: SwapState::Claimed,
+            pending_hold_invoice: Some(PendingHoldInvoice {
+                amount_msat: 1000,
+                expiry_secs: 600,
+                cltv_expiry_delta: 40,
+                memo: "pending recovery".into(),
+            }),
+            ..base()
+        };
+        let unknown_time = SwapRecord {
+            state: SwapState::Refunded,
+            updated_at_unix: 0,
+            ..base()
+        };
+        let records = [failed, funding, funded, paid, pending_invoice, unknown_time];
+        for record in &records {
+            put_old_record(&store, record);
+        }
+        assert_eq!(
+            store
+                .prune_terminal(Duration::from_secs(30 * 86400))
+                .unwrap(),
+            0
+        );
+        for record in records {
+            assert!(store.get(record.swap_id).unwrap().is_some());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pruning_removes_old_settled_records_with_historical_funding_markers() {
+        let directory = temp_dir();
+        let store = JsonFileSwapStore::new(&directory).unwrap();
+        for state in [SwapState::Claimed, SwapState::Refunded] {
+            let record = SwapRecord {
+                swap_id: Uuid::new_v4(),
+                state,
+                updated_at_unix: 1,
+                funding_intent_at_height: Some(1),
+                spend_txid_hex: Some(txid(1).to_string()),
+                ..SwapRecord::new_progress()
+            };
+            assert!(record.funds_at_risk());
+            put_old_record(&store, &record);
+        }
+        let unfunded = SwapRecord {
+            swap_id: Uuid::new_v4(),
+            state: SwapState::Expired,
+            updated_at_unix: 1,
+            ..SwapRecord::new_progress()
+        };
+        put_old_record(&store, &unfunded);
+        assert_eq!(
+            store
+                .prune_terminal(Duration::from_secs(30 * 86400))
+                .unwrap(),
+            3
+        );
+        assert!(store.load_all_checked().unwrap().is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn pruning_waits_for_a_reorg_mutation_before_checking_eligibility() {
+        use std::sync::mpsc;
+        use std::sync::Arc;
+
+        let directory = temp_dir();
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let record = SwapRecord {
+            swap_id: Uuid::new_v4(),
+            state: SwapState::Claimed,
+            updated_at_unix: 1,
+            ..SwapRecord::new_progress()
+        };
+        put_old_record(&store, &record);
+        let (entered, read_started) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        let updater = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.mutate(record.swap_id, &mut |record| {
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                    record.state = SwapState::LockupConfirmed;
+                })
+            })
+        };
+        read_started.recv().unwrap();
+        let (done, completed) = mpsc::channel();
+        let pruner = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let result = store.prune_terminal(Duration::ZERO);
+                done.send(()).unwrap();
+                result
+            })
+        };
+        let blocked = matches!(
+            completed.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        release.send(()).unwrap();
+        assert!(updater.join().unwrap().unwrap());
+        assert_eq!(pruner.join().unwrap().unwrap(), 0);
+        assert!(blocked, "pruning must wait for the in-flight mutation");
+        assert_eq!(
+            store.get(record.swap_id).unwrap().unwrap().state,
+            SwapState::LockupConfirmed
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     /// The record carries a branch secret key, so it must not be world-readable.

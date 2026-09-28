@@ -308,13 +308,17 @@ async fn local_homeserver_read_poll_benchmark() {
         let incremental = Transport::wrap(restored(&testnet, baseline.keypair().clone()))
             .with_receive_journal(&journal)
             .unwrap();
-        let peer = peer.to_string();
         // Fixture history is known to have been handled. Listing acknowledgment avoids
         // including initial migration and body downloads in a warm incremental measurement.
         assert_eq!(
-            incremental.mark_conversation_seen(&peer).await.unwrap(),
+            incremental
+                .inboxes
+                .acknowledge_listed(&incremental.messenger, &peer)
+                .await
+                .unwrap(),
             history
         );
+        let peer = peer.to_string();
         assert!(incremental
             .poll_from::<Value>(&peer)
             .await

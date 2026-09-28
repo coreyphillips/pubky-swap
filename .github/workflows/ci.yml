@@ -60,3 +60,4 @@ jobs:
           cargo test --all
           cargo test -p pubky-transport --features iroh --lib
           cargo test -p swap-provider --features full --lib
+          cargo test -p swap-client --features full --lib

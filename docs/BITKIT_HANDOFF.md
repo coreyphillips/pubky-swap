@@ -17,11 +17,19 @@ before updating callers. The implementation keeps existing settlement primitives
   authentication and identity-bound, exclusive journals. Storage must also be isolated by network.
 - `send_with_scope(peer, &message.delivery_scope(), &message)` and synchronous
   `enqueue_with_scope` reserve stable encrypted bytes. A worker runs `process_outbox(now, limit)`.
+- The transport removes `SwapTransport`, `receive_from`, `receive_all`,
+  `receive_all_with_receipts`, `mark_conversation_seen`, `clear_messages_with_peer` and
+  `clear_all_messages`. Replace them with explicit receipt handling and exact scoped cleanup.
 - `poll_from` and `receiver` return `Inbound<SwapMessage>`. Persist the handled outcome before
   calling `inbound.receipt.acknowledge()`. Drop releases a lease for retry, including cancellation.
 - `complete_scope` schedules exact owned resources after a safe terminal state. `reopen_scope`
   revokes cleanup after a reorg and schedules byte-identical republication if deletion may have
   overlapped. Recheck the current domain state before every cleanup batch.
+- `outbox_status()` exposes sanitized `DeliveryFailure` categories and independent publication
+  and cleanup pause flags. Temporary failures retry automatically. Authentication denials and
+  permanent errors retain the resource and require explicit `retry_outbox(id, operation)` after
+  correction. Historical failure details remain after a retry or success; inspect the pause flags
+  to decide whether attention is currently required.
 - `request_stats()` counts actual message-storage attempts and body bytes, retries, timeouts and
   queue wait. SDK account, profile and follow calls are excluded.
 - `SwapRecord` stores `client_quote`, `client_creation_started`, `client_creation_tip`, and
@@ -41,10 +49,12 @@ has been cancelled.
 
 Retention is ten minutes for read-only exchanges and 24 hours after safe persisted completion
 for creation/final DM resources. Status and acceptance recovery remain under the separate
-30-day record policy. A successful PUT is not peer consumption. Never clear the whole peer
-conversation to finish one swap. Outgoing capacity is 1,024 entries, at most 768 read-only,
-with backpressure; the 16 MiB byte budget remains shared. Receive pending capacity is 32 per peer and 1,024 total. Exact acknowledged
-identities remain retained and the JSON journal can grow; do not invent TTL pruning.
+30-day policy based on the last file update for safely settled records. The local pruner preserves generic failure,
+pending invoice work, missing terminal timestamps and expiry with committed funds; pruning shares
+the same mutation lock as writes and reorg changes. A successful PUT is not peer consumption.
+Never clear the whole peer conversation to finish one swap. Outgoing capacity is 1,024 entries, at most 768 read-only,
+with backpressure; the 16 MiB byte budget remains shared. Receive pending capacity is 32 per peer
+and 1,024 total. Exact acknowledged identities remain retained and the JSON journal can grow; do not invent TTL pruning.
 
 The receive journal format is version 2 and the outbox format is version 1. Corrupt, mismatched
 or unsupported journals fail visibly. Preserve pending data when designing migration. The
@@ -75,10 +85,15 @@ Repository: `/Users/coreyphillips/Documents/testing/pubky-swap-boltz`.
 - `Cargo.toml:44` pins pubky-transport, swap-common and swap-config to swap revision `0867de2ce94b8a2932a64372de4cd14aaa70040d`. Local patches start at line 69. Pin the merged swap revision consistently and remove development patches from published dependency resolution.
 - `Cargo.toml:30` defines the rendezvous feature; `mobile` includes rendezvous, JNI and platform certificate verification. Keep the same dependency feature set in desktop and mobile validation.
 - `src/provider.rs:163` admits requests through a queue of eight and carries request deadlines and cancellation. `run_inbox` at line 222 skips cancelled or expired requests, respects a closed response receiver, and discards a failed transport. Preserve these properties when replacing the exchange implementation.
+- `src/provider.rs:216` calls the removed `mark_conversation_seen`. Remove this startup blanket
+  acknowledgment. Restore the durable receive journal and handle its pending deliveries before
+  new work; historical transport records are not permission to skip unfinished creation.
 - `src/provider.rs:271` performs rendezvous for each exchange, sends once through the transport and polls every 500 ms. Reuse the transport's durable outbox and acknowledged inbox. Keep one request ID through timeouts and reconnects. Retain peer connections or multiplexed sessions across exchanges rather than performing new rendezvous for every read-only request.
 - `src/provider/session.rs:74` performs authorization and invokes the one-shot `p2p::session_request` at line 86. Integrate the persistent session API where appropriate and preserve authorization, network binding, deadlines and cancellation. A connection failure after transmission must remain an ambiguous outcome, never an automatic new logical request.
 - Persist accepted quotes and creation intent before publication. On restart, resume the saved IDs and status lookup before allocating another swap. Only complete a quote or swap cleanup scope after its domain terminal record is durable. Read-only ephemeral scopes may expire independently.
-- Add wrapper tests for cancellation before send, cancellation after possible send, reconnection using the same request ID, server restart, ambiguous acceptance followed by status recovery, and two concurrent swaps with the same provider. Keep pending requests when the bounded queue is full.
+- Add wrapper tests for cancellation before send, cancellation after possible send, reconnection using the same request ID, server restart, ambiguous acceptance followed by status recovery, and two concurrent swaps with the same provider. Surface paused delivery failures without
+  discarding the original operation; provide deliberate retry after correcting authentication
+  or permanent errors. Keep pending requests when the bounded queue is full.
 
 Acceptance: desktop and mobile features compile against the same merged swap revision; lost replies recover without another accepted swap; process restart preserves pending work and independent swaps remain unaffected by cleanup.
 
@@ -136,7 +151,7 @@ Acceptance: all four ABI artifacts and bindings match; initialization and reconn
 
 The tracked regtest item is [pubky-swap issue 40](https://github.com/coreyphillips/pubky-swap/issues/40). Its older description should be reconciled with the workflow now present.
 
-- The inspected `.github/workflows/regtest.yml` supports pull requests, manual dispatch and weekly runs. Its PR path filter now includes `pubky-transport/**` and `swap-config/**`, plus dependency files. Superseded runs are cancelled so the final head receives the validation.
+- The inspected `.github/workflows/regtest.yml` supports pull requests, manual dispatch and weekly runs. Its PR path filter now includes `pubky-transport/**`, `swap-config/**` and `beignet-backend/**`, plus dependency files. Superseded runs are cancelled so the final head receives the validation.
 - The required job should be the real `full regtest integration tests` job, including HTLC behavior, spend history, reorg handling, wallet behavior and reverse, submarine and taproot flows using LND. Main branch protection was absent and repository rulesets were empty during inspection. Require the final commit's successful run in the merge process; do not treat an older green commit as validation of the merged work. Repository branch protection was not changed by this implementation.
 - The last observed successful reference run was [35600418780](https://github.com/coreyphillips/pubky-swap/actions/runs/35600418780), for commit `51493f872961a2123ce2651613d67b1278e8e046`. This is a historical reference only.
 - Docker 29.5.3 and its daemon were available. Existing `bitcoin`, `electrum` and `lnd` containers were live, with names or ports overlapping the repository stack. Do not run fixed-name compose teardown or regtest setup against them. Use CI or a separately named stack with distinct ports and data directories.

@@ -2,7 +2,7 @@
 
 use crate::{Result, TransportError};
 use fs2::FileExt;
-use pubky_messenger::PreparedMessage;
+use pubky_messenger::{FailureReason, PreparedMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +18,80 @@ const MAX_BATCH: usize = 64;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PAYLOAD: usize = 128 * 1024;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Sanitized cause of a publication or cleanup failure. No URL, payload or credential is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryFailure {
+    #[error("temporary HTTP status {0}")]
+    TemporaryHttp(u16),
+    #[error("message storage is unavailable")]
+    TransportUnavailable,
+    #[error("message storage request timed out")]
+    TimedOut,
+    #[error("authentication requires attention (HTTP {0})")]
+    Authentication(u16),
+    #[error("permanent HTTP status {0}")]
+    PermanentHttp(u16),
+    #[error("invalid message storage request or response")]
+    InvalidRequest,
+}
+
+impl DeliveryFailure {
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::TemporaryHttp(_) | Self::TransportUnavailable | Self::TimedOut
+        )
+    }
+
+    pub(crate) fn from_reason(reason: &FailureReason) -> Self {
+        match reason {
+            FailureReason::Status(status) | FailureReason::Authentication(status)
+                if matches!(status, 408 | 429 | 500..=599) =>
+            {
+                Self::TemporaryHttp(*status)
+            }
+            FailureReason::Authentication(status) => Self::Authentication(*status),
+            FailureReason::Status(status @ (401 | 403)) => Self::Authentication(*status),
+            FailureReason::Status(status) => Self::PermanentHttp(*status),
+            FailureReason::TimedOut => Self::TimedOut,
+            FailureReason::Transport(_) => Self::TransportUnavailable,
+            FailureReason::ListingStalled
+            | FailureReason::ListingTooLong
+            | FailureReason::OutsideConversation => Self::InvalidRequest,
+        }
+    }
+}
+
+/// The independently scheduled operation whose state is being inspected or resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryOperation {
+    #[error("publication")]
+    Publication,
+    #[error("cleanup")]
+    Cleanup,
+}
+
+/// One durable resource's delivery state, without its encrypted or decrypted body.
+/// Last failures are historical; the pause flags describe whether attention is required now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxStatus {
+    pub id: String,
+    pub peer: String,
+    pub scope: String,
+    pub published: bool,
+    pub attempts: u32,
+    pub next_retry_at: u64,
+    pub publication_failure: Option<DeliveryFailure>,
+    pub publication_paused: bool,
+    pub cleanup_after: Option<u64>,
+    pub cleanup_attempts: u32,
+    pub next_cleanup_at: u64,
+    pub cleanup_failure: Option<DeliveryFailure>,
+    pub cleanup_paused: bool,
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,6 +114,14 @@ struct Entry {
     cleanup_after: Option<u64>,
     cleanup_attempts: u32,
     next_cleanup_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication_failure: Option<DeliveryFailure>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    publication_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_failure: Option<DeliveryFailure>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    cleanup_paused: bool,
 }
 
 struct State {
@@ -226,10 +308,14 @@ impl Outbox {
                 cleanup_after: eligible_after,
                 cleanup_attempts: 0,
                 next_cleanup_at: 0,
+                publication_failure: None,
+                publication_paused: false,
+                cleanup_failure: None,
+                cleanup_paused: false,
             });
             validate(journal)?;
             // Leave room for timestamps and counters in later recovery/cleanup updates.
-            if serde_json::to_vec(journal)?.len() as u64 + journal.entries.len() as u64 * 96
+            if serde_json::to_vec(journal)?.len() as u64 + journal.entries.len() as u64 * 512
                 > MAX_BYTES
             {
                 return Err(invalid(
@@ -244,8 +330,9 @@ impl Outbox {
     pub fn mark_published(&self, id: &str) -> Result<()> {
         self.update(|journal| {
             let entry = find_entry(journal, id)?;
-            let changed = !entry.published;
+            let changed = !entry.published || entry.publication_paused;
             entry.published = true;
+            entry.publication_paused = false;
             Ok(((), changed))
         })
     }
@@ -262,23 +349,42 @@ impl Outbox {
                 "message delivery state could not be saved; restart the transport to recover",
             ));
         }
-        Ok(state
+        let Some(entry) = state
             .journal
             .entries
             .iter()
-            .any(|entry| entry.prepared.id() == id && !cleanup_due(entry, now)))
+            .find(|entry| entry.prepared.id() == id)
+        else {
+            return Ok(false);
+        };
+        if entry.publication_paused {
+            return Err(TransportError::Delivery {
+                operation: DeliveryOperation::Publication,
+                failure: entry
+                    .publication_failure
+                    .unwrap_or(DeliveryFailure::InvalidRequest),
+            });
+        }
+        Ok(!cleanup_due(entry, now))
     }
 
-    /// Record an attempted publication failure with exponential delay capped at five minutes.
-    /// Future retries, completed publication and expired scopes do not consume attempts.
-    pub fn mark_failed(&self, id: &str, now: u64) -> Result<()> {
+    /// Persist the last failure. Only temporary failures are retried automatically.
+    /// A later failure never reverses an already confirmed publication.
+    pub fn mark_failed(&self, id: &str, now: u64, failure: DeliveryFailure) -> Result<()> {
         self.update(|journal| {
             let entry = find_entry(journal, id)?;
-            if entry.published || entry.next_retry_at > now || cleanup_due(entry, now) {
+            if cleanup_due(entry, now) {
                 return Ok(((), false));
             }
-            retry(&mut entry.attempts, &mut entry.next_retry_at, now);
-            Ok(((), true))
+            let mut changed = entry.publication_failure != Some(failure)
+                || entry.publication_paused == failure.is_retryable();
+            entry.publication_failure = Some(failure);
+            entry.publication_paused = !failure.is_retryable();
+            if !entry.published && entry.next_retry_at <= now {
+                retry(&mut entry.attempts, &mut entry.next_retry_at, now);
+                changed = true;
+            }
+            Ok(((), changed))
         })
     }
 
@@ -286,7 +392,12 @@ impl Outbox {
     pub fn due_pending(&self, now: u64, limit: usize) -> Result<Vec<PreparedMessage>> {
         self.select(
             limit,
-            |entry| !entry.published && entry.next_retry_at <= now && !cleanup_due(entry, now),
+            |entry| {
+                !entry.published
+                    && !entry.publication_paused
+                    && entry.next_retry_at <= now
+                    && !cleanup_due(entry, now)
+            },
             |entry| entry.next_retry_at,
         )
     }
@@ -332,7 +443,9 @@ impl Outbox {
     pub fn eligible_cleanup(&self, now: u64, limit: usize) -> Result<Vec<PreparedMessage>> {
         self.select(
             limit,
-            |entry| cleanup_due(entry, now) && entry.next_cleanup_at <= now,
+            |entry| {
+                cleanup_due(entry, now) && !entry.cleanup_paused && entry.next_cleanup_at <= now
+            },
             |entry| {
                 entry
                     .next_cleanup_at
@@ -353,18 +466,89 @@ impl Outbox {
             ));
         }
         Ok(state.journal.entries.iter().any(|entry| {
-            entry.prepared.id() == id && cleanup_due(entry, now) && entry.next_cleanup_at <= now
+            entry.prepared.id() == id
+                && cleanup_due(entry, now)
+                && !entry.cleanup_paused
+                && entry.next_cleanup_at <= now
         }))
     }
 
-    /// Persist a cleanup retry without changing publication success or its retry schedule.
-    pub fn mark_cleanup_failed(&self, id: &str, now: u64) -> Result<()> {
+    /// Persist a cleanup failure independently of publication state and its retry schedule.
+    pub fn mark_cleanup_failed(&self, id: &str, now: u64, failure: DeliveryFailure) -> Result<()> {
         self.update(|journal| {
             let entry = find_entry(journal, id)?;
-            if !cleanup_due(entry, now) || entry.next_cleanup_at > now {
+            if !cleanup_due(entry, now) {
                 return Ok(((), false));
             }
-            retry(&mut entry.cleanup_attempts, &mut entry.next_cleanup_at, now);
+            let mut changed = entry.cleanup_failure != Some(failure)
+                || entry.cleanup_paused == failure.is_retryable();
+            entry.cleanup_failure = Some(failure);
+            entry.cleanup_paused = !failure.is_retryable();
+            if entry.next_cleanup_at <= now {
+                retry(&mut entry.cleanup_attempts, &mut entry.next_cleanup_at, now);
+                changed = true;
+            }
+            Ok(((), changed))
+        })
+    }
+
+    /// Inspect bounded durable state. Failure details never include URLs or message bodies.
+    pub fn status(&self) -> Result<Vec<OutboxStatus>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| invalid("outbox lock poisoned"))?;
+        if state.write_failed {
+            return Err(invalid(
+                "message delivery state could not be saved; restart to recover",
+            ));
+        }
+        Ok(state
+            .journal
+            .entries
+            .iter()
+            .map(|entry| OutboxStatus {
+                id: entry.prepared.id().to_owned(),
+                peer: entry.peer.clone(),
+                scope: entry.scope.clone(),
+                published: entry.published,
+                attempts: entry.attempts,
+                next_retry_at: entry.next_retry_at,
+                publication_failure: entry.publication_failure,
+                publication_paused: entry.publication_paused,
+                cleanup_after: entry.cleanup_after,
+                cleanup_attempts: entry.cleanup_attempts,
+                next_cleanup_at: entry.next_cleanup_at,
+                cleanup_failure: entry.cleanup_failure,
+                cleanup_paused: entry.cleanup_paused,
+            })
+            .collect())
+    }
+
+    /// Deliberately resume one operation after addressing its failure. Performs no network I/O.
+    /// Retains exact bytes, completion eligibility, attempt history and the last failure category.
+    pub fn retry(&self, id: &str, operation: DeliveryOperation, now: u64) -> Result<()> {
+        self.update(|journal| {
+            let entry = find_entry(journal, id)?;
+            match operation {
+                DeliveryOperation::Publication => {
+                    if cleanup_due(entry, now) {
+                        return Err(invalid(
+                            "cannot retry a publication after cleanup eligibility",
+                        ));
+                    }
+                    entry.publication_paused = false;
+                    entry.published = false;
+                    entry.next_retry_at = now;
+                }
+                DeliveryOperation::Cleanup => {
+                    if entry.cleanup_after.is_none() {
+                        return Err(invalid("cannot retry cleanup before scope completion"));
+                    }
+                    entry.cleanup_paused = false;
+                    entry.next_cleanup_at = now;
+                }
+            }
             Ok(((), true))
         })
     }
@@ -442,6 +626,10 @@ impl Outbox {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 fn invalid(message: &str) -> TransportError {
     TransportError::Messenger(message.to_owned())
 }
@@ -493,6 +681,14 @@ fn validate(journal: &Journal) -> Result<()> {
     let mut reservations = HashSet::new();
     for entry in &journal.entries {
         validate_scope(&entry.peer, &entry.scope)?;
+        for (paused, failure) in [
+            (entry.publication_paused, entry.publication_failure),
+            (entry.cleanup_paused, entry.cleanup_failure),
+        ] {
+            if paused && failure.is_none_or(DeliveryFailure::is_retryable) {
+                return Err(invalid("invalid paused outbox failure"));
+            }
+        }
         let prepared = &entry.prepared;
         prepared
             .validate()
@@ -629,6 +825,311 @@ mod tests {
     }
 
     #[test]
+    fn failure_categories_preserve_retry_policy_without_sensitive_details() {
+        use pubky_messenger::{FailureReason as Reason, FetchFailure};
+        for status in [408, 429, 500, 503, 599] {
+            for reason in [Reason::Status(status), Reason::Authentication(status)] {
+                let failure = DeliveryFailure::from_reason(&reason);
+                assert_eq!(failure, DeliveryFailure::TemporaryHttp(status));
+                assert!(failure.is_retryable());
+            }
+        }
+        for status in [401, 403] {
+            assert_eq!(
+                DeliveryFailure::from_reason(&Reason::Status(status)),
+                DeliveryFailure::Authentication(status)
+            );
+            assert!(!DeliveryFailure::from_reason(&Reason::Authentication(status)).is_retryable());
+        }
+        for status in [400, 404, 409, 413] {
+            assert_eq!(
+                DeliveryFailure::from_reason(&Reason::Status(status)),
+                DeliveryFailure::PermanentHttp(status)
+            );
+        }
+        assert!(DeliveryFailure::from_reason(&Reason::TimedOut).is_retryable());
+        let fetch = FetchFailure {
+            url: "pubky://private-resource".to_owned(),
+            attempts: 3,
+            reason: Reason::Transport("private-credential".to_owned()),
+        };
+        assert_eq!(
+            crate::storage_failure(&fetch),
+            DeliveryFailure::TransportUnavailable
+        );
+        #[derive(Debug, thiserror::Error)]
+        #[error("wrapped storage error")]
+        struct Wrapped(#[source] FetchFailure);
+        assert_eq!(
+            crate::storage_failure(&Wrapped(fetch)),
+            DeliveryFailure::TransportUnavailable
+        );
+        let error = TransportError::Delivery {
+            operation: DeliveryOperation::Publication,
+            failure: DeliveryFailure::TransportUnavailable,
+        };
+        assert!(!format!("{error:?}: {error}").contains("private-"));
+        assert_eq!(
+            crate::storage_failure(&std::io::Error::other("private-credential")),
+            DeliveryFailure::InvalidRequest
+        );
+        for reason in [
+            Reason::ListingStalled,
+            Reason::ListingTooLong,
+            Reason::OutsideConversation,
+        ] {
+            assert_eq!(
+                DeliveryFailure::from_reason(&reason),
+                DeliveryFailure::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn permanent_publication_failures_survive_restart_until_deliberately_resumed() {
+        for failure in [
+            DeliveryFailure::Authentication(401),
+            DeliveryFailure::PermanentHttp(413),
+            DeliveryFailure::InvalidRequest,
+        ] {
+            let fixture = Fixture::new();
+            let outbox = fixture.open();
+            let original = fixture.reserve(&outbox, "swap:funded", "acceptance");
+            outbox.mark_failed(original.id(), 100, failure).unwrap();
+            drop(outbox);
+            let outbox = fixture.open();
+            assert!(outbox.due_pending(u64::MAX, 64).unwrap().is_empty());
+            assert!(
+                matches!(outbox.can_publish(original.id(), 200), Err(TransportError::Delivery { operation: DeliveryOperation::Publication, failure: observed }) if observed == failure)
+            );
+            let retry = fixture.reserve(&outbox, "swap:funded", "acceptance");
+            assert_eq!(retry.id(), original.id());
+            assert_eq!(retry.payload(), original.payload());
+            assert!(outbox.status().unwrap()[0].publication_paused);
+            outbox
+                .retry(original.id(), DeliveryOperation::Publication, 200)
+                .unwrap();
+            drop(outbox);
+            let outbox = fixture.open();
+            let status = &outbox.status().unwrap()[0];
+            assert!(!status.publication_paused);
+            assert_eq!(status.publication_failure, Some(failure));
+            assert_eq!(status.attempts, 1);
+            let resumed = outbox.due_pending(200, 1).unwrap();
+            assert_eq!(resumed[0].id(), original.id());
+            assert_eq!(resumed[0].payload(), original.payload());
+            outbox.mark_published(original.id()).unwrap();
+            let status = &outbox.status().unwrap()[0];
+            assert!(status.published);
+            assert!(!status.publication_paused);
+            assert_eq!(status.publication_failure, Some(failure));
+        }
+    }
+
+    #[test]
+    fn temporary_failures_restore_automatic_retry_and_preserve_last_category() {
+        for failure in [
+            DeliveryFailure::TemporaryHttp(429),
+            DeliveryFailure::TemporaryHttp(503),
+            DeliveryFailure::TransportUnavailable,
+            DeliveryFailure::TimedOut,
+        ] {
+            let fixture = Fixture::new();
+            let outbox = fixture.open();
+            let original = fixture.reserve(&outbox, "swap:pending", "request");
+            outbox.mark_failed(original.id(), 100, failure).unwrap();
+            drop(outbox);
+            let outbox = fixture.open();
+            let status = &outbox.status().unwrap()[0];
+            assert!(!status.publication_paused);
+            assert_eq!(status.publication_failure, Some(failure));
+            assert!(outbox.due_pending(100, 1).unwrap().is_empty());
+            assert_eq!(outbox.due_pending(101, 1).unwrap()[0].id(), original.id());
+        }
+    }
+
+    #[test]
+    fn paused_cleanup_is_independent_and_requires_its_own_explicit_retry() {
+        let fixture = Fixture::new();
+        let outbox = fixture.open();
+        let original = fixture.reserve(&outbox, "swap:complete", "acceptance");
+        outbox.mark_published(original.id()).unwrap();
+        outbox
+            .complete_scope(&fixture.peer.to_string(), "swap:complete", 100)
+            .unwrap();
+        outbox
+            .mark_cleanup_failed(original.id(), 100, DeliveryFailure::Authentication(403))
+            .unwrap();
+        drop(outbox);
+        let outbox = fixture.open();
+        let status = &outbox.status().unwrap()[0];
+        assert!(status.published);
+        assert!(status.cleanup_paused);
+        assert!(!status.publication_paused);
+        assert_eq!(
+            status.cleanup_failure,
+            Some(DeliveryFailure::Authentication(403))
+        );
+        assert!(outbox.eligible_cleanup(u64::MAX, 1).unwrap().is_empty());
+        assert!(!outbox.can_cleanup(original.id(), 200).unwrap());
+        assert!(outbox
+            .retry(original.id(), DeliveryOperation::Publication, 200)
+            .is_err());
+        outbox
+            .retry(original.id(), DeliveryOperation::Cleanup, 200)
+            .unwrap();
+        drop(outbox);
+        let outbox = fixture.open();
+        assert_eq!(
+            outbox.eligible_cleanup(200, 1).unwrap()[0].id(),
+            original.id()
+        );
+        outbox
+            .mark_cleanup_failed(original.id(), 200, DeliveryFailure::TemporaryHttp(429))
+            .unwrap();
+        drop(outbox);
+        let outbox = fixture.open();
+        let status = &outbox.status().unwrap()[0];
+        assert!(status.published);
+        assert!(!status.cleanup_paused);
+        assert_eq!(status.cleanup_attempts, 2);
+        assert_eq!(
+            status.cleanup_failure,
+            Some(DeliveryFailure::TemporaryHttp(429))
+        );
+        assert!(outbox.eligible_cleanup(201, 1).unwrap().is_empty());
+        assert_eq!(
+            outbox.eligible_cleanup(202, 1).unwrap()[0].id(),
+            original.id()
+        );
+    }
+
+    #[test]
+    fn a_failed_replay_keeps_confirmed_publication_and_reopening_keeps_pauses() {
+        let fixture = Fixture::new();
+        let outbox = fixture.open();
+        let original = fixture.reserve(&outbox, "swap:funded", "acceptance");
+        outbox.mark_published(original.id()).unwrap();
+        outbox
+            .mark_failed(original.id(), 100, DeliveryFailure::Authentication(401))
+            .unwrap();
+        let status = &outbox.status().unwrap()[0];
+        assert!(status.published);
+        assert!(status.publication_paused);
+        assert_eq!(
+            status.publication_failure,
+            Some(DeliveryFailure::Authentication(401))
+        );
+        outbox
+            .complete_scope(&fixture.peer.to_string(), "swap:funded", 200)
+            .unwrap();
+        outbox
+            .reopen_scope(&fixture.peer.to_string(), "swap:funded")
+            .unwrap();
+        assert!(outbox.due_pending(300, 1).unwrap().is_empty());
+        outbox
+            .retry(original.id(), DeliveryOperation::Publication, 300)
+            .unwrap();
+        let resumed = outbox.due_pending(300, 1).unwrap();
+        assert_eq!(resumed[0].id(), original.id());
+        assert_eq!(resumed[0].payload(), original.payload());
+    }
+
+    #[test]
+    fn version_one_without_failure_fields_keeps_all_existing_delivery_state() {
+        let fixture = Fixture::new();
+        let outbox = fixture.open();
+        let original = fixture.reserve(&outbox, "swap:accepted", "acceptance");
+        outbox.mark_published(original.id()).unwrap();
+        outbox
+            .complete_scope(&fixture.peer.to_string(), "swap:accepted", 1000)
+            .unwrap();
+        drop(outbox);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.path()).unwrap()).unwrap();
+        let entry = saved["entries"][0].as_object_mut().unwrap();
+        for field in [
+            "publication_failure",
+            "publication_paused",
+            "cleanup_failure",
+            "cleanup_paused",
+        ] {
+            entry.remove(field);
+        }
+        entry.insert("attempts".into(), 7.into());
+        entry.insert("next_retry_at".into(), 123.into());
+        entry.insert("cleanup_attempts".into(), 3.into());
+        entry.insert("next_cleanup_at".into(), 1001.into());
+        fs::write(fixture.path(), serde_json::to_vec(&saved).unwrap()).unwrap();
+        let outbox = fixture.open();
+        let status = &outbox.status().unwrap()[0];
+        assert!(status.published);
+        assert_eq!((status.attempts, status.next_retry_at), (7, 123));
+        assert_eq!((status.cleanup_attempts, status.next_cleanup_at), (3, 1001));
+        assert_eq!(status.cleanup_after, Some(1000));
+        assert_eq!(status.publication_failure, None);
+        assert_eq!(status.cleanup_failure, None);
+        assert!(!status.publication_paused && !status.cleanup_paused);
+        outbox
+            .mark_cleanup_failed(original.id(), 1001, DeliveryFailure::PermanentHttp(405))
+            .unwrap();
+        drop(outbox);
+        let outbox = fixture.open();
+        let restored = fixture.reserve(&outbox, "swap:accepted", "acceptance");
+        assert_eq!(restored.id(), original.id());
+        assert_eq!(restored.payload(), original.payload());
+        let status = &outbox.status().unwrap()[0];
+        assert_eq!((status.attempts, status.next_retry_at), (7, 123));
+        assert!(status.published && status.cleanup_paused);
+        assert_eq!(
+            status.cleanup_failure,
+            Some(DeliveryFailure::PermanentHttp(405))
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_transport_work_and_direct_replays_make_no_storage_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let peer = Keypair::from_secret_key(&[9; 32]).public_key().to_string();
+        let transport = crate::Transport::unsigned([8; 32])
+            .unwrap()
+            .with_outbox(directory.path().join("outbox.json"))
+            .unwrap();
+        transport
+            .enqueue_with_scope(&peer, "swap:funded", &7_u32)
+            .unwrap();
+        transport
+            .enqueue_with_scope(&peer, "swap:complete", &8_u32)
+            .unwrap();
+        let outbox = transport.outbox.as_ref().unwrap();
+        let entries = outbox.status().unwrap();
+        outbox
+            .mark_failed(&entries[0].id, 100, DeliveryFailure::PermanentHttp(413))
+            .unwrap();
+        outbox.complete_scope(&peer, "swap:complete", 100).unwrap();
+        outbox
+            .mark_cleanup_failed(&entries[1].id, 100, DeliveryFailure::Authentication(401))
+            .unwrap();
+        transport.process_outbox(200, 64).await.unwrap();
+        assert!(matches!(
+            transport
+                .send_with_scope(&peer, "swap:funded", &7_u32)
+                .await,
+            Err(TransportError::Delivery {
+                operation: DeliveryOperation::Publication,
+                failure: DeliveryFailure::PermanentHttp(413)
+            })
+        ));
+        assert_eq!(transport.homeserver_requests(), 0);
+        assert_eq!(transport.outbox_status().unwrap().len(), 2);
+        transport
+            .retry_outbox(&entries[0].id, DeliveryOperation::Publication)
+            .unwrap();
+        assert!(!transport.outbox_status().unwrap()[0].publication_paused);
+        assert!(transport.outbox_status().unwrap()[1].cleanup_paused);
+    }
+
+    #[test]
     fn ephemeral_reservation_persists_its_first_expiry_with_the_resource() {
         let fixture = Fixture::new();
         let outbox = fixture.open();
@@ -723,7 +1224,9 @@ mod tests {
         assert_eq!(original.payload(), retry.payload());
         assert_eq!(outbox.due_pending(0, 10).unwrap().len(), 1);
         outbox.mark_published(original.id()).unwrap();
-        outbox.mark_failed(original.id(), 20).unwrap();
+        outbox
+            .mark_failed(original.id(), 20, DeliveryFailure::TransportUnavailable)
+            .unwrap();
         drop(outbox);
         let outbox = fixture.open();
         assert!(outbox.due_pending(100, 10).unwrap().is_empty());
@@ -738,13 +1241,19 @@ mod tests {
         let fixture = Fixture::new();
         let outbox = fixture.open();
         let prepared = fixture.reserve(&outbox, "swap-a", "request");
-        outbox.mark_failed(prepared.id(), 100).unwrap();
-        outbox.mark_failed(prepared.id(), 100).unwrap();
+        outbox
+            .mark_failed(prepared.id(), 100, DeliveryFailure::TransportUnavailable)
+            .unwrap();
+        outbox
+            .mark_failed(prepared.id(), 100, DeliveryFailure::TransportUnavailable)
+            .unwrap();
         drop(outbox);
         let outbox = fixture.open();
         assert!(outbox.due_pending(100, 1).unwrap().is_empty());
         assert_eq!(outbox.due_pending(101, 1).unwrap()[0].id(), prepared.id());
-        outbox.mark_failed(prepared.id(), 101).unwrap();
+        outbox
+            .mark_failed(prepared.id(), 101, DeliveryFailure::TransportUnavailable)
+            .unwrap();
         assert!(outbox.due_pending(102, 1).unwrap().is_empty());
         assert_eq!(outbox.due_pending(103, 1).unwrap().len(), 1);
         let entry = &outbox.state.lock().unwrap().journal.entries[0];
@@ -776,7 +1285,9 @@ mod tests {
             .remove_deleted(&[first.id().to_owned()], 100)
             .unwrap();
         assert!(!outbox.can_publish(first.id(), 99).unwrap());
-        outbox.mark_cleanup_failed(second.id(), 100).unwrap();
+        outbox
+            .mark_cleanup_failed(second.id(), 100, DeliveryFailure::TransportUnavailable)
+            .unwrap();
         drop(outbox);
         let outbox = fixture.open();
         assert!(outbox.eligible_cleanup(100, 10).unwrap().is_empty());
@@ -832,7 +1343,9 @@ mod tests {
             let fixture = Fixture::new();
             let outbox = fixture.open();
             let original = fixture.reserve(&outbox, "quote:a", "acceptance");
-            outbox.mark_failed(original.id(), 90).unwrap();
+            outbox
+                .mark_failed(original.id(), 90, DeliveryFailure::TransportUnavailable)
+                .unwrap();
             outbox.mark_published(original.id()).unwrap();
             outbox
                 .complete_scope(&fixture.peer.to_string(), "quote:a", 100)
@@ -848,7 +1361,9 @@ mod tests {
                     .remove_deleted(&[original.id().to_owned()], 100)
                     .is_err());
             } else {
-                outbox.mark_cleanup_failed(original.id(), 100).unwrap();
+                outbox
+                    .mark_cleanup_failed(original.id(), 100, DeliveryFailure::TransportUnavailable)
+                    .unwrap();
             }
             drop(outbox);
 

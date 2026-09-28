@@ -21,6 +21,7 @@ mod delivery_tests;
 mod inbox;
 mod journal;
 pub mod outbox;
+pub use outbox::{DeliveryFailure, DeliveryOperation, OutboxStatus};
 pub mod poll;
 pub use poll::{PeerInbox, PollConfig, PollStats};
 
@@ -37,6 +38,12 @@ pub mod identity;
 pub enum TransportError {
     #[error("transport error: {0}")]
     Messenger(String),
+    /// A sanitized, persisted publication or cleanup failure. Inspect outbox status for pause state.
+    #[error("message {operation} failed: {failure}")]
+    Delivery {
+        operation: DeliveryOperation,
+        failure: DeliveryFailure,
+    },
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("invalid pkarr public key: {0}")]
@@ -52,6 +59,19 @@ pub enum TransportError {
 }
 
 pub type Result<T> = std::result::Result<T, TransportError>;
+
+fn storage_failure(error: &(dyn std::error::Error + 'static)) -> DeliveryFailure {
+    let mut current = Some(error);
+    while let Some(cause) = current {
+        if let Some(failure) = cause.downcast_ref::<pubky_messenger::FetchFailure>() {
+            return DeliveryFailure::from_reason(&failure.reason);
+        }
+        current = cause.source();
+    }
+    // Prepared message validation and request construction fail before a typed network failure.
+    // Unknown errors require attention rather than an unbounded automatic retry loop.
+    DeliveryFailure::InvalidRequest
+}
 
 fn unix_time() -> u64 {
     std::time::SystemTime::now()
@@ -381,6 +401,26 @@ impl Transport {
         Ok(())
     }
 
+    /// Inspect saved delivery failures and current pause state without message bodies or I/O.
+    pub fn outbox_status(&self) -> Result<Vec<OutboxStatus>> {
+        let Some(outbox) = &self.outbox else {
+            return Ok(Vec::new());
+        };
+        outbox.check_owner(&self.public_key_string())?;
+        outbox.status()
+    }
+
+    /// Resume an exact saved resource after addressing its failure. Performs no network I/O.
+    /// A subsequent worker pass retries it; saved bytes and historical failure details remain.
+    pub fn retry_outbox(&self, id: &str, operation: DeliveryOperation) -> Result<()> {
+        let outbox = self
+            .outbox
+            .as_ref()
+            .ok_or_else(|| TransportError::Messenger("outbox is not configured".into()))?;
+        outbox.check_owner(&self.public_key_string())?;
+        outbox.retry(id, operation, unix_time())
+    }
+
     /// Run a bounded batch of durable retries and exact-resource cleanup. Errors retain work.
     /// Each operation has a total deadline in addition to the messenger's attempt deadlines.
     pub async fn process_outbox(&self, now: u64, limit: usize) -> Result<()> {
@@ -407,20 +447,29 @@ impl Transport {
             }
             let peer = PublicKey::try_from(prepared.recipient())
                 .map_err(|error| TransportError::InvalidPubkey(error.to_string()))?;
+            let ids = [prepared.id().to_owned()];
             let result = tokio::time::timeout(
                 Duration::from_secs(20),
-                self.messenger.delete_message(prepared.id(), &peer),
+                self.messenger.delete_messages_with_report(&ids, &peer),
             )
             .await;
-            match result {
-                Ok(Ok(())) => outbox.remove_deleted(&[prepared.id().to_owned()], now),
-                _ => {
-                    outbox.mark_cleanup_failed(prepared.id(), now)?;
-                    Err(TransportError::Messenger(
-                        "message cleanup will retry".into(),
-                    ))
+            let failure = match result {
+                Ok(Ok(report)) if report.failures.is_empty() && report.deleted.len() == 1 => {
+                    return outbox.remove_deleted(&ids, now);
                 }
-            }
+                Ok(Ok(report)) => report
+                    .failures
+                    .first()
+                    .map(|failure| DeliveryFailure::from_reason(&failure.reason))
+                    .unwrap_or(DeliveryFailure::InvalidRequest),
+                Ok(Err(error)) => storage_failure(error.as_ref()),
+                Err(_) => DeliveryFailure::TimedOut,
+            };
+            outbox.mark_cleanup_failed(prepared.id(), now, failure)?;
+            Err(TransportError::Delivery {
+                operation: DeliveryOperation::Cleanup,
+                failure,
+            })
         }))
         .buffer_unordered(4)
         .collect::<Vec<_>>();
@@ -471,15 +520,16 @@ impl Transport {
             self.messenger.publish_message(prepared),
         )
         .await;
-        match result {
-            Ok(Ok(_)) => outbox.mark_published(prepared.id()),
-            _ => {
-                outbox.mark_failed(prepared.id(), unix_time())?;
-                Err(TransportError::Messenger(
-                    "message publication will retry".into(),
-                ))
-            }
-        }
+        let failure = match result {
+            Ok(Ok(_)) => return outbox.mark_published(prepared.id()),
+            Ok(Err(error)) => storage_failure(error.as_ref()),
+            Err(_) => DeliveryFailure::TimedOut,
+        };
+        outbox.mark_failed(prepared.id(), unix_time(), failure)?;
+        Err(TransportError::Delivery {
+            operation: DeliveryOperation::Publication,
+            failure,
+        })
     }
 
     /// Persist peer registration before scheduling its first poll.
@@ -496,7 +546,7 @@ impl Transport {
         self.messenger.public_key_string()
     }
 
-    /// Track a peer so it is polled by [`receive_all`], and refresh its last-seen time.
+    /// Track a peer for [`receiver`](Self::receiver), and refresh its last-seen time.
     ///
     /// If the peer is already tracked its pinned status is preserved; this only bumps last-seen
     /// (so re-adding a pinned peer does not unpin it).
@@ -607,16 +657,6 @@ impl Transport {
         Ok(())
     }
 
-    /// List and acknowledge old replies before a new legacy request. New protocols should use
-    /// request correlation and explicit receipts instead of clearing a conversation boundary.
-    pub async fn mark_conversation_seen(&self, peer_pkarr: &str) -> Result<usize> {
-        let peer = PublicKey::try_from(peer_pkarr)
-            .map_err(|e| TransportError::InvalidPubkey(e.to_string()))?;
-        self.inboxes
-            .acknowledge_listed(&self.messenger, &peer)
-            .await
-    }
-
     /// Receive leased messages. Drop or release a receipt to retry; acknowledge after handling.
     pub async fn poll_from<M: DeserializeOwned>(
         &self,
@@ -630,38 +670,6 @@ impl Transport {
             self.known_peers.touch(&peer.to_string());
         }
         Ok(result)
-    }
-
-    /// Compatibility helper that acknowledges each message on delivery.
-    pub async fn receive_from<M: DeserializeOwned>(&self, peer: &str) -> Result<Vec<M>> {
-        let messages = self.poll_from(peer).await?;
-        for inbound in &messages {
-            self.acknowledge(&inbound.receipt)?;
-        }
-        Ok(messages
-            .into_iter()
-            .map(|inbound| inbound.message)
-            .collect())
-    }
-
-    pub async fn receive_all_with_receipts<M: DeserializeOwned>(&self) -> Result<Vec<Inbound<M>>> {
-        let mut messages = Vec::new();
-        for peer in self.get_known_peers() {
-            messages.extend(self.poll_from(&peer).await?);
-        }
-        Ok(messages)
-    }
-
-    /// Compatibility helper. Providers should use the independent peer scheduler instead.
-    pub async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
-        let messages = self.receive_all_with_receipts().await?;
-        for inbound in &messages {
-            self.acknowledge(&inbound.receipt)?;
-        }
-        Ok(messages
-            .into_iter()
-            .map(|inbound| (inbound.peer, inbound.message))
-            .collect())
     }
 
     /// Independently schedule bounded polls, delivering one peer as soon as its read completes.
@@ -706,23 +714,6 @@ impl Transport {
     }
     pub fn has_pending_messages(&self, peer: &str) -> bool {
         self.inboxes.has_pending(peer)
-    }
-
-    /// Delete locally published conversation messages. Receive acknowledgments are retained.
-    pub async fn clear_messages_with_peer(&self, peer_pkarr: &str) -> Result<()> {
-        let peer = PublicKey::try_from(peer_pkarr)
-            .map_err(|e| TransportError::InvalidPubkey(e.to_string()))?;
-        self.messenger
-            .clear_messages(&peer)
-            .await
-            .map_err(|e| TransportError::Messenger(format!("clear messages: {e}")))
-    }
-
-    pub async fn clear_all_messages(&self) -> Result<()> {
-        for peer in self.get_known_peers() {
-            self.clear_messages_with_peer(&peer).await?;
-        }
-        Ok(())
     }
 }
 
@@ -775,58 +766,6 @@ impl Drop for Receipt {
         if leases.get(&self.id) == Some(&self.lease) {
             leases.remove(&self.id);
         }
-    }
-}
-
-/// The messaging surface the swap protocol needs from a transport.
-///
-/// [`Transport`] (encrypted Pubky DMs) is the implementation used today. Naming the surface as a
-/// trait is the seam that lets the same `swap-provider` / `swap-client` protocol run over an
-/// alternative transport later, e.g. the authenticated, holepunched iroh QUIC stream in the
-/// [`p2p`] module, without touching the swap state machine, HTLC scripting, or persisted store.
-///
-/// Discovery and execution have different needs: discovery wants to be real-time (a client
-/// walking up to a listening provider), while execution spans blocks/hours and must survive
-/// disconnects and restarts. A holepunched stream suits the former; the durable
-/// store-and-forward DMs modelled here remain the safer choice for the latter, so a deployment
-/// may use both.
-///
-/// The trait is intentionally not object-safe (the message type is generic per call, matching
-/// [`Transport`]); it is a static seam for generic code, not a `dyn` boundary.
-#[allow(async_fn_in_trait)]
-pub trait SwapTransport {
-    /// This transport's own public key (pkarr) string.
-    fn public_key_string(&self) -> String;
-    /// Track a peer so it is polled by [`receive_all`](Self::receive_all).
-    fn add_known_peer(&self, peer_pkarr: String);
-    /// Snapshot of currently known peers.
-    fn get_known_peers(&self) -> Vec<String>;
-    /// Send a serializable message to a peer.
-    async fn send<M: Serialize>(&self, peer_pkarr: &str, msg: &M) -> Result<()>;
-    /// Receive new (non-duplicate) messages from a specific peer.
-    async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>>;
-    /// Receive new messages from all known peers.
-    async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>>;
-}
-
-impl SwapTransport for Transport {
-    fn public_key_string(&self) -> String {
-        Transport::public_key_string(self)
-    }
-    fn add_known_peer(&self, peer_pkarr: String) {
-        Transport::add_known_peer(self, peer_pkarr)
-    }
-    fn get_known_peers(&self) -> Vec<String> {
-        Transport::get_known_peers(self)
-    }
-    async fn send<M: Serialize>(&self, peer_pkarr: &str, msg: &M) -> Result<()> {
-        Transport::send(self, peer_pkarr, msg).await
-    }
-    async fn receive_from<M: DeserializeOwned>(&self, peer_pkarr: &str) -> Result<Vec<M>> {
-        Transport::receive_from(self, peer_pkarr).await
-    }
-    async fn receive_all<M: DeserializeOwned>(&self) -> Result<Vec<(String, M)>> {
-        Transport::receive_all(self).await
     }
 }
 
@@ -922,12 +861,11 @@ mod tests {
         ));
         let peer = pkarr::Keypair::random().public_key().to_string();
 
-        let read = transport.receive_from::<serde_json::Value>(&peer).await;
+        let read = transport.poll_from::<serde_json::Value>(&peer).await;
         assert!(
             matches!(read, Err(TransportError::Messenger(_))),
             "expected a messenger error, got {read:?}"
         );
-        assert!(transport.mark_conversation_seen(&peer).await.is_err());
     }
 
     #[test]

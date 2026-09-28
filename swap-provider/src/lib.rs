@@ -159,7 +159,7 @@ pub struct ProviderConfig {
     ///
     /// On by default, because off is a provider nobody new can reach. Pubky's private messages
     /// live at a path derived from an ECDH shared secret between the two parties: unlinkable by
-    /// design, and therefore not enumerable, so `receive_all` can only poll pubkys already in the
+    /// design, and therefore not enumerable, so the receiver can only poll pubkys already in the
     /// peer set. That set comes from the follow graph. Someone handed only our pubky, which is
     /// exactly what the docs tell them to ask for, writes into a conversation nothing will ever
     /// look in. The doorbell is how they say "look at me" first.
@@ -3257,7 +3257,7 @@ mod tests {
     /// follows, which is nobody on a fresh install.
     ///
     /// Pubky's private messages live at a path derived from an ECDH shared secret, so they are
-    /// unlinkable and therefore not enumerable: `receive_all` can only poll pubkys already in the
+    /// unlinkable and therefore not enumerable: the receiver can only poll pubkys already in the
     /// peer set, and that set comes from the follow graph. Everything the project tells a user to
     /// do, "share the pubky it prints", depends on the rendezvous being on. It was off, and the
     /// feature that implements it was not in `full`.

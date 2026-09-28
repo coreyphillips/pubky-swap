@@ -169,7 +169,7 @@ impl Channel for IrohChannel {
 pub struct DmChannel {
     transport: Transport,
     provider: String,
-    /// Rung before the first request, so a provider that does not follow us starts polling.
+    /// Notify the provider while a DM request is pending so it starts polling this peer.
     doorbell: Option<[u8; 32]>,
     ready: OnceCell<()>,
     reply_timeout: Duration,
@@ -256,12 +256,11 @@ impl DmChannel {
         }
     }
 
-    /// Register the peer and ring the doorbell once. Pending replies survive process restarts.
+    /// Register the peer once. Pending replies survive process restarts.
     async fn prepare(&self) -> Result<()> {
         self.ready
             .get_or_try_init(|| async {
                 self.transport.register_peer(&self.provider, true)?;
-                ring_doorbell(self.doorbell, &self.provider).await;
                 Ok::<_, Error>(())
             })
             .await
@@ -306,79 +305,84 @@ impl Channel for DmChannel {
         let exchange = async {
             let _guard = self.exchanges.lock().await;
             self.prepare().await.map_err(ExchangeError::NotSent)?;
-            self.transport
-                .send_with_scope(&self.provider, &request_scope(request), request)
-                .await
-                .map_err(|error| ExchangeError::Uncertain(error.into()))?;
-            loop {
-                let messages = self
-                    .transport
-                    .poll_from::<SwapMessage>(&self.provider)
+            let delivery = async {
+                self.transport
+                    .send_with_scope(&self.provider, &request_scope(request), request)
                     .await
                     .map_err(|error| ExchangeError::Uncertain(error.into()))?;
-                let mut matched = None;
-                let mut matched_receipts = Vec::new();
-                let mut unresolved = false;
-                for inbound in messages {
-                    // An earlier status reply can recover this exact creation after a crash.
-                    let reply = match (request, inbound.message) {
-                        (
-                            SwapMessage::SwapRequest(request),
-                            SwapMessage::SwapStatusSnapshot(snapshot),
-                        ) if snapshot.accept.quote_id == request.quote_id => {
-                            SwapMessage::SwapAccept(snapshot.accept)
-                        }
-                        (_, reply) => reply,
-                    };
-                    if reply_matches(request, &reply)
-                        && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
-                    {
-                        if let Some(previous) = &matched {
-                            if acceptance_conflicts(previous, &reply) {
-                                return Err(ExchangeError::Uncertain(anyhow!(
-                                    "provider sent conflicting correlated replies"
-                                )));
+                loop {
+                    let messages = self
+                        .transport
+                        .poll_from::<SwapMessage>(&self.provider)
+                        .await
+                        .map_err(|error| ExchangeError::Uncertain(error.into()))?;
+                    let mut matched = None;
+                    let mut matched_receipts = Vec::new();
+                    let mut unresolved = false;
+                    for inbound in messages {
+                        // An earlier status reply can recover this exact creation after a crash.
+                        let reply = match (request, inbound.message) {
+                            (
+                                SwapMessage::SwapRequest(request),
+                                SwapMessage::SwapStatusSnapshot(snapshot),
+                            ) if snapshot.accept.quote_id == request.quote_id => {
+                                SwapMessage::SwapAccept(snapshot.accept)
                             }
-                        }
-                        if read_only_reply(&reply) {
+                            (_, reply) => reply,
+                        };
+                        if reply_matches(request, &reply)
+                            && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
+                        {
+                            if let Some(previous) = &matched {
+                                if acceptance_conflicts(previous, &reply) {
+                                    return Err(ExchangeError::Uncertain(anyhow!(
+                                        "provider sent conflicting correlated replies"
+                                    )));
+                                }
+                            }
+                            if read_only_reply(&reply) {
+                                inbound
+                                    .receipt
+                                    .acknowledge()
+                                    .map_err(|error| ExchangeError::Uncertain(error.into()))?;
+                            } else {
+                                matched_receipts.push(inbound.receipt);
+                            }
+                            if matched.is_none() || !matches!(reply, SwapMessage::Reject(_)) {
+                                matched = Some(reply);
+                            }
+                        } else if read_only_reply(&reply)
+                            || self
+                                .recorded_acceptance(&reply)
+                                .map_err(ExchangeError::Uncertain)?
+                        {
                             inbound
                                 .receipt
                                 .acknowledge()
                                 .map_err(|error| ExchangeError::Uncertain(error.into()))?;
                         } else {
-                            matched_receipts.push(inbound.receipt);
+                            // Never discard a creation reply just to advance the bounded inbox.
+                            unresolved = true;
                         }
-                        if matched.is_none() || !matches!(reply, SwapMessage::Reject(_)) {
-                            matched = Some(reply);
-                        }
-                    } else if read_only_reply(&reply)
-                        || self
-                            .recorded_acceptance(&reply)
-                            .map_err(ExchangeError::Uncertain)?
-                    {
-                        inbound
-                            .receipt
-                            .acknowledge()
-                            .map_err(|error| ExchangeError::Uncertain(error.into()))?;
-                    } else {
-                        // Never discard a creation reply just to advance the bounded inbox.
-                        unresolved = true;
                     }
+                    if let Some(reply) = matched {
+                        self.receipts
+                            .lock()
+                            .map_err(|_| {
+                                ExchangeError::Uncertain(anyhow!("reply receipts poisoned"))
+                            })?
+                            .entry(request_key(request))
+                            .or_default()
+                            .extend(matched_receipts);
+                        return Ok(reply);
+                    }
+                    if unresolved {
+                        return Err(ExchangeError::Uncertain(anyhow!("an unrecorded creation reply is pending; recover the earlier swap before negotiating another")));
+                    }
+                    sleep(Duration::from_millis(200)).await;
                 }
-                if let Some(reply) = matched {
-                    self.receipts
-                        .lock()
-                        .map_err(|_| ExchangeError::Uncertain(anyhow!("reply receipts poisoned")))?
-                        .entry(request_key(request))
-                        .or_default()
-                        .extend(matched_receipts);
-                    return Ok(reply);
-                }
-                if unresolved {
-                    return Err(ExchangeError::Uncertain(anyhow!("an unrecorded creation reply is pending; recover the earlier swap before negotiating another")));
-                }
-                sleep(Duration::from_millis(200)).await;
-            }
+            };
+            with_doorbell_retry(delivery, || ring_doorbell(self.doorbell, &self.provider)).await
         };
         match tokio::time::timeout_at(deadline, exchange).await {
             Ok(result) => result,
@@ -457,17 +461,55 @@ pub fn reply_matches(request: &SwapMessage, reply: &SwapMessage) -> bool {
     }
 }
 
-#[cfg(feature = "iroh")]
-async fn ring_doorbell(secret: Option<[u8; 32]>, provider: &str) {
-    let Some(secret) = secret else { return };
-    match pubky_transport::p2p::ring_provider(secret, provider).await {
-        Ok(()) => info!("Rang provider iroh doorbell; it should start polling us"),
-        Err(e) => warn!("iroh rendezvous ring failed ({e}); relying on the provider following us"),
+const DOORBELL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+const DOORBELL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DOORBELL_MAX_BACKOFF: Duration = Duration::from_secs(8);
+
+/// Notification belongs to this exchange, so a reply, cancellation or its deadline drops retries.
+async fn with_doorbell_retry<T, F, R>(
+    delivery: impl std::future::Future<Output = T>,
+    mut ring: F,
+) -> T
+where
+    F: FnMut() -> R,
+    R: std::future::Future<Output = Result<()>>,
+{
+    let notification = async {
+        let mut backoff = DOORBELL_INITIAL_BACKOFF;
+        loop {
+            if matches!(
+                tokio::time::timeout(DOORBELL_ATTEMPT_TIMEOUT, ring()).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+            warn!(
+                "provider notification remains pending; retrying while the DM exchange is active"
+            );
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(DOORBELL_MAX_BACKOFF);
+        }
+    };
+    tokio::pin!(delivery);
+    tokio::select! {
+        biased;
+        reply = &mut delivery => reply,
+        () = notification => delivery.await,
     }
 }
 
+#[cfg(feature = "iroh")]
+async fn ring_doorbell(secret: Option<[u8; 32]>, provider: &str) -> Result<()> {
+    let Some(secret) = secret else { return Ok(()) };
+    pubky_transport::p2p::ring_provider(secret, provider).await?;
+    info!("Rang provider iroh doorbell; it should start polling us");
+    Ok(())
+}
+
 #[cfg(not(feature = "iroh"))]
-async fn ring_doorbell(_: Option<[u8; 32]>, _: &str) {}
+async fn ring_doorbell(_: Option<[u8; 32]>, _: &str) -> Result<()> {
+    Ok(())
+}
 
 /// A reply and whether any attempt before it may have reached the provider without answering.
 struct Exchanged {
@@ -1485,6 +1527,122 @@ mod tests {
                 .canceled
                 .load(Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_doorbells_retry_until_success_without_delaying_the_reply() {
+        let started = Instant::now();
+        let attempts = Mutex::new(Vec::new());
+        let delivery = async {
+            sleep(Duration::from_secs(20)).await;
+            42
+        };
+        let reply = with_doorbell_retry(delivery, || {
+            let attempt = {
+                let mut attempts = attempts.lock().unwrap();
+                attempts.push(started.elapsed());
+                attempts.len()
+            };
+            async move {
+                if attempt < 3 {
+                    Err(anyhow!("provider unavailable"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert_eq!(reply, 42);
+        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [0, 1, 3].map(Duration::from_secs)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_doorbell_attempt_is_canceled_before_retry() {
+        let started = Instant::now();
+        let attempts = AtomicUsize::new(0);
+        let canceled = AtomicUsize::new(0);
+        let delivery = async {
+            sleep(Duration::from_secs(10)).await;
+        };
+        with_doorbell_retry(delivery, || async {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                let _guard = DropCount(&canceled);
+                std::future::pending::<Result<()>>().await
+            } else {
+                assert_eq!(started.elapsed(), Duration::from_secs(6));
+                Ok(())
+            }
+        })
+        .await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(canceled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dm_reply_cancels_an_inflight_doorbell() {
+        let attempts = AtomicUsize::new(0);
+        let canceled = AtomicUsize::new(0);
+        let reply = with_doorbell_retry(
+            async {
+                sleep(Duration::from_millis(500)).await;
+                42
+            },
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropCount(&canceled);
+                std::future::pending::<Result<()>>().await
+            },
+        )
+        .await;
+        tokio::time::advance(RECOVERY_WINDOW).await;
+        assert_eq!(reply, 42);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(canceled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn canceling_a_dm_exchange_drops_its_doorbell_without_detached_retries() {
+        let attempts = AtomicUsize::new(0);
+        let canceled = AtomicUsize::new(0);
+        let mut exchange = Box::pin(with_doorbell_retry(
+            std::future::pending::<()>(),
+            || async {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropCount(&canceled);
+                std::future::pending::<Result<()>>().await
+            },
+        ));
+        tokio::select! {
+            biased;
+            () = &mut exchange => panic!("exchange must remain pending"),
+            () = sleep(Duration::from_millis(500)) => {}
+        }
+        drop(exchange);
+        tokio::time::advance(RECOVERY_WINDOW).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(canceled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn doorbell_backoff_is_capped_within_the_original_negotiation_deadline() {
+        let started = Instant::now();
+        let attempts = Mutex::new(Vec::new());
+        let exchange = with_doorbell_retry(std::future::pending::<Result<()>>(), || {
+            attempts.lock().unwrap().push(started.elapsed());
+            async { Err(anyhow!("provider unavailable")) }
+        });
+        assert!(negotiation_deadline(exchange).await.is_err());
+        assert_eq!(started.elapsed(), RECOVERY_WINDOW);
+        tokio::time::advance(RECOVERY_WINDOW).await;
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            [0, 1, 3, 7, 15, 23, 31, 39, 47, 55].map(Duration::from_secs)
         );
     }
 

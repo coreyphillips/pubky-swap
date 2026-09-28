@@ -235,7 +235,8 @@ impl Inboxes {
         Ok(delivered)
     }
 
-    pub async fn acknowledge_listed<B: Mailbox>(
+    #[cfg(test)]
+    pub(super) async fn acknowledge_listed<B: Mailbox>(
         &self,
         mailbox: &B,
         peer: &PublicKey,

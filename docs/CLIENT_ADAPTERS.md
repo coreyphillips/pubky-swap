@@ -98,6 +98,14 @@ For DMs, initialize `with_receive_journal` and `with_outbox`, send using
 the corresponding outcome. `enqueue_with_scope` reserves a stable encrypted publication before
 network I/O; a bounded application worker calls `process_outbox` to publish or clean it later.
 
+Handle `TransportError::Delivery` by its `DeliveryOperation` and `DeliveryFailure`, and inspect
+`outbox_status()` after startup or maintenance to surface paused work. Temporary HTTP failures,
+transport outages and timeouts retry automatically; persistent authentication or invalid-request
+failures require attention. After resolving the cause, `retry_outbox(id, operation)` durably
+resumes the same saved resource without immediate network I/O. Last failure categories are
+historical, so use the separate pause flags to determine whether work currently needs attention.
+Never replace or delete a funded swap's resource merely to clear an error.
+
 The transport resource ID is separate from the business operation ID. Exact PUT replay avoids
 duplicate files, while the authenticated owner and saved creation request prevent a second
 contract. Persist complete acceptance data, validate the contract and invoice independently,

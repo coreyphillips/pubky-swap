@@ -11,6 +11,7 @@ on:
       - 'swap-provider/**'
       - 'swap-client/**'
       - 'lightning/**'
+      - 'beignet-backend/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'docker-compose.regtest.yml'
