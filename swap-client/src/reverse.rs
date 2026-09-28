@@ -63,6 +63,11 @@ impl ReverseClaim {
 
 /// Notified as the client's reverse swap progresses, so what it did reaches disk.
 pub trait ClaimSink: Send + Sync {
+    /// Persist possible submission before the payment RPC. Failure must stop publication.
+    fn payment_started(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// A claim we are about to put on the wire, reported *before* the broadcast so a later run
     /// knows the transaction is its own rather than reading it as the provider's refund.
     fn spend_broadcast(&self, _txid: Txid) {}
@@ -88,35 +93,35 @@ pub async fn execute_reverse_swap(
 ) -> Result<Txid> {
     // 1. Start paying the hold invoice, unless a previous run already did.
     //
-    // Asking the node first is the whole of the resume story on this side: a payment that is
-    // in flight or already settled must not be started again, and the node is the only thing
-    // that knows. The invoice is held either way until the provider settles it, which only
+    // The saved payment-start marker and a node lookup distinguish a first attempt from an
+    // ambiguous prior submission. An in-flight or settled payment must not be started again. The invoice is held either way until the provider settles it, which only
     // happens after we claim on-chain and reveal the preimage.
-    let already_paying = if resume.is_fresh() {
-        false
-    } else {
-        match ln.payment_status(claim.payment_hash()).await {
-            Ok(PaymentStatus::Succeeded { .. }) => {
-                info!("Client: the hold invoice was already paid by an earlier run");
-                true
-            }
-            Ok(PaymentStatus::InFlight) => {
-                info!("Client: a payment for this invoice is still in flight");
-                true
-            }
-            Ok(PaymentStatus::Failed(_)) | Ok(PaymentStatus::Unknown) => false,
-            Err(e) => {
-                // Not knowing is not a reason to pay again: the on-chain HTLC is what this run
-                // is here for, and paying twice is the one mistake with no way back.
-                warn!("Client: could not read the payment's status ({e}); not paying again");
-                true
-            }
+    // A restart before funding or spending leaves a default Resume even if payment began.
+    let already_paying = match ln.payment_status(claim.payment_hash()).await {
+        Ok(PaymentStatus::Succeeded { .. }) => {
+            info!("Client: the hold invoice was already paid by an earlier run");
+            true
+        }
+        Ok(PaymentStatus::InFlight) => {
+            info!("Client: a payment for this invoice is still in flight");
+            true
+        }
+        Ok(PaymentStatus::NotFound) | Ok(PaymentStatus::Failed(_)) => false,
+        Ok(PaymentStatus::Unknown) if resume.is_fresh() => false,
+        Ok(PaymentStatus::Unknown) => {
+            warn!("Client: a prior payment may exist and its status is unknown; not paying again");
+            true
+        }
+        Err(error) => {
+            warn!("Client: could not read the payment's status ({error}); not paying again");
+            true
         }
     };
 
     let pay_task = if already_paying {
         None
     } else {
+        progress.payment_started()?;
         let pay_ln = ln.clone();
         let invoice = claim.invoice.clone();
         Some(tokio::spawn(async move {
@@ -127,6 +132,12 @@ pub async fn execute_reverse_swap(
                 .await
         }))
     };
+
+    // Dropping a driver must also stop its local RPC watcher. A payment already admitted by
+    // the node is recovered through payment_status on the next run.
+    let _payment_abort = pay_task
+        .as_ref()
+        .map(|task| AbortPayment(task.abort_handle()));
 
     // 2. Wait for the provider to fund + confirm the on-chain HTLC.
     //
@@ -305,6 +316,13 @@ pub async fn execute_reverse_swap(
     Ok(txid)
 }
 
+struct AbortPayment(tokio::task::AbortHandle);
+impl Drop for AbortPayment {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +349,11 @@ mod tests {
         /// make one.
         status: lightning_backend::PaymentStatus,
         pay_calls: std::sync::Mutex<u32>,
+        status_error: bool,
+        hold_payment: bool,
+        payment_started: tokio::sync::Notify,
+        payment_canceled: std::sync::atomic::AtomicBool,
+        submission_record: Option<(Arc<swap_common::store::JsonFileSwapStore>, uuid::Uuid)>,
     }
 
     impl MockLn {
@@ -339,6 +362,11 @@ mod tests {
                 preimage,
                 status: lightning_backend::PaymentStatus::Unknown,
                 pay_calls: std::sync::Mutex::new(0),
+                status_error: false,
+                hold_payment: false,
+                payment_started: tokio::sync::Notify::new(),
+                payment_canceled: std::sync::atomic::AtomicBool::new(false),
+                submission_record: None,
             }
         }
         fn with_status(mut self, status: lightning_backend::PaymentStatus) -> Self {
@@ -383,7 +411,21 @@ mod tests {
             _: u64,
             _: Option<u32>,
         ) -> lightning_backend::Result<PaymentResult> {
+            if let Some((store, id)) = &self.submission_record {
+                let saved = swap_common::store::SwapStore::get(&**store, *id)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    saved.invoice_pay_started_at_unix.is_some(),
+                    "submission requires a durable marker"
+                );
+            }
             *self.pay_calls.lock().unwrap() += 1;
+            if self.hold_payment {
+                let _cancellation = PaymentCanceled(&self.payment_canceled);
+                self.payment_started.notify_one();
+                std::future::pending::<()>().await;
+            }
             // Simulate the hold invoice eventually settling.
             Ok(PaymentResult {
                 preimage: self.preimage,
@@ -394,10 +436,22 @@ mod tests {
             &self,
             _ph: [u8; 32],
         ) -> lightning_backend::Result<lightning_backend::PaymentStatus> {
+            if self.status_error {
+                return Err(LightningError::NotImplemented(
+                    "payment lookup unavailable".into(),
+                ));
+            }
             Ok(self.status.clone())
         }
         async fn decode_invoice(&self, _: &str) -> lightning_backend::Result<DecodedInvoice> {
             Err(LightningError::NotImplemented("mock".into()))
+        }
+    }
+
+    struct PaymentCanceled<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for PaymentCanceled<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -665,6 +719,7 @@ mod tests {
             1,
             Duration::from_millis(0),
             &Resume {
+                invoice_pay_started_at_unix: None,
                 funding: Some(outpoint),
                 funding_intent_at_height: None,
                 our_spends: Vec::new(),
@@ -744,5 +799,339 @@ mod tests {
             "got: {err}"
         );
         assert!(mc.broadcasts().is_empty(), "nothing was claimed");
+    }
+
+    fn recovery_claim() -> (ReverseClaim, OutPoint) {
+        let secp = Secp256k1::new();
+        let (claim_key, claim_public) = random_keypair(&secp);
+        let (_, refund_public) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let script = build_htlc_script(
+            &payment_hash(&preimage),
+            &claim_public,
+            &refund_public,
+            TIMEOUT,
+        );
+        let claim = ReverseClaim {
+            htlc_spk: htlc_p2wsh_address(&script, Network::Regtest).script_pubkey(),
+            htlc_script: script,
+            onchain_amount_sat: AMOUNT,
+            timeout_height: TIMEOUT,
+            invoice: "saved-invoice".into(),
+            preimage,
+            claim_key,
+            dest_spk: ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap(),
+            fee_rate_sat_vb: 5,
+        };
+        (
+            claim,
+            OutPoint {
+                txid: BTxid::from_str(&"33".repeat(32)).unwrap(),
+                vout: 0,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn default_resume_queries_existing_or_uncertain_payment_before_any_new_payment() {
+        for scenario in 0..3 {
+            let (claim, outpoint) = recovery_claim();
+            let mut backend = MockLn::new(claim.preimage);
+            match scenario {
+                0 => backend.status = PaymentStatus::InFlight,
+                1 => {
+                    backend.status = PaymentStatus::Succeeded(PaymentResult {
+                        preimage: claim.preimage,
+                        fee_msat: 0,
+                    })
+                }
+                _ => backend.status_error = true,
+            }
+            let ln = Arc::new(backend);
+            let chain = Arc::new(
+                MockChain::new()
+                    .with_funding(FundingUtxo {
+                        outpoint,
+                        value_sat: AMOUNT,
+                        confirmations: 2,
+                    })
+                    .always_final(),
+            );
+            execute_reverse_swap(
+                ln.clone(),
+                chain.clone(),
+                claim,
+                10_000,
+                1,
+                Duration::ZERO,
+                &Resume::default(),
+                &(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                *ln.pay_calls.lock().unwrap(),
+                0,
+                "scenario {scenario} must not pay again"
+            );
+            assert_eq!(chain.broadcasts().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn canceling_the_driver_also_drops_its_payment_rpc_watcher() {
+        let (claim, _) = recovery_claim();
+        let mut backend = MockLn::new(claim.preimage);
+        backend.hold_payment = true;
+        let ln = Arc::new(backend);
+        let chain = Arc::new(MockChain::new());
+        let resume = Resume::default();
+        {
+            let driver = execute_reverse_swap(
+                ln.clone(),
+                chain,
+                claim,
+                10_000,
+                1,
+                Duration::from_secs(1),
+                &resume,
+                &(),
+            );
+            tokio::pin!(driver);
+            tokio::select! {
+                result = &mut driver => panic!("driver unexpectedly completed: {result:?}"),
+                () = ln.payment_started.notified() => {},
+            }
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(*ln.pay_calls.lock().unwrap(), 1);
+        assert!(ln
+            .payment_canceled
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    fn payment_record(
+        claim: &ReverseClaim,
+    ) -> (
+        std::path::PathBuf,
+        Arc<swap_common::store::JsonFileSwapStore>,
+        uuid::Uuid,
+    ) {
+        use swap_common::store::{JsonFileSwapStore, SwapRecord, SwapRole, SwapStore};
+        let dir = std::env::temp_dir().join(format!("client-payment-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+        let id = uuid::Uuid::new_v4();
+        store
+            .put(&SwapRecord {
+                swap_id: id,
+                role: SwapRole::Client,
+                direction: swap_common::SwapDirection::Reverse,
+                invoice: claim.invoice.clone(),
+                payment_hash_hex: hex::encode(claim.payment_hash()),
+                preimage_hex: Some(hex::encode(claim.preimage)),
+                secret_key_hex: hex::encode(claim.claim_key.secret_bytes()),
+                ..SwapRecord::new_progress()
+            })
+            .unwrap();
+        (dir, store, id)
+    }
+
+    #[tokio::test]
+    async fn payment_marker_survives_restart_and_unknown_does_not_submit_again() {
+        use swap_common::store::{JsonFileSwapStore, SwapStore};
+        let (claim, outpoint) = recovery_claim();
+        let (dir, store, id) = payment_record(&claim);
+        crate::store::record_payment_started(&*store, id).unwrap();
+        drop(store);
+        let store = JsonFileSwapStore::new(&dir).unwrap();
+        let saved = store.get(id).unwrap().unwrap();
+        assert!(saved.invoice_pay_started_at_unix.is_some());
+        assert!(saved.funds_at_risk());
+        assert!(!saved.resume().is_fresh());
+        let ln = Arc::new(MockLn::new(claim.preimage));
+        let chain = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        execute_reverse_swap(
+            ln.clone(),
+            chain.clone(),
+            claim,
+            10_000,
+            1,
+            Duration::ZERO,
+            &saved.resume(),
+            &crate::RecordProgress {
+                store: &store,
+                swap_id: id,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+        assert_eq!(chain.broadcasts().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn authoritative_absence_or_failure_retries_a_marked_payment() {
+        use swap_common::store::SwapStore;
+        for status in [
+            PaymentStatus::NotFound,
+            PaymentStatus::Failed("previous attempt failed".into()),
+        ] {
+            let (claim, outpoint) = recovery_claim();
+            let (dir, store, id) = payment_record(&claim);
+            crate::store::record_payment_started(&*store, id).unwrap();
+            let saved = store.get(id).unwrap().unwrap();
+            let mut backend = MockLn::new(claim.preimage).with_status(status);
+            backend.submission_record = Some((store.clone(), id));
+            let ln = Arc::new(backend);
+            let chain = Arc::new(
+                MockChain::new()
+                    .with_funding(FundingUtxo {
+                        outpoint,
+                        value_sat: AMOUNT,
+                        confirmations: 2,
+                    })
+                    .always_final(),
+            );
+            execute_reverse_swap(
+                ln.clone(),
+                chain,
+                claim,
+                10_000,
+                1,
+                Duration::ZERO,
+                &saved.resume(),
+                &crate::RecordProgress {
+                    store: &store,
+                    swap_id: id,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(*ln.pay_calls.lock().unwrap(), 1);
+            assert_eq!(
+                store.get(id).unwrap().unwrap().invoice_pay_started_at_unix,
+                saved.invoice_pay_started_at_unix
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_unknown_payment_is_marked_before_submission() {
+        use swap_common::store::SwapStore;
+        let (claim, outpoint) = recovery_claim();
+        let (dir, store, id) = payment_record(&claim);
+        let mut backend = MockLn::new(claim.preimage);
+        backend.submission_record = Some((store.clone(), id));
+        let ln = Arc::new(backend);
+        let chain = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        execute_reverse_swap(
+            ln.clone(),
+            chain,
+            claim,
+            10_000,
+            1,
+            Duration::ZERO,
+            &Resume::default(),
+            &crate::RecordProgress {
+                store: &store,
+                swap_id: id,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ln.pay_calls.lock().unwrap(), 1);
+        assert!(store
+            .get(id)
+            .unwrap()
+            .unwrap()
+            .invoice_pay_started_at_unix
+            .is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct FailedPaymentMarker;
+    impl ClaimSink for FailedPaymentMarker {
+        fn payment_started(&self) -> Result<()> {
+            Err(anyhow!("payment marker could not be persisted"))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_payment_marker_blocks_submission() {
+        let (claim, outpoint) = recovery_claim();
+        let ln = Arc::new(MockLn::new(claim.preimage).with_status(PaymentStatus::NotFound));
+        let chain = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        assert!(execute_reverse_swap(
+            ln.clone(),
+            chain.clone(),
+            claim,
+            10_000,
+            1,
+            Duration::ZERO,
+            &Resume::default(),
+            &FailedPaymentMarker
+        )
+        .await
+        .is_err());
+        assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+        assert!(chain.broadcasts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_progress_with_unknown_payment_is_not_treated_as_definite_absence() {
+        let (claim, outpoint) = recovery_claim();
+        let ln = Arc::new(MockLn::new(claim.preimage));
+        let chain = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        let resume = Resume {
+            funding: Some(outpoint),
+            ..Resume::default()
+        };
+        execute_reverse_swap(
+            ln.clone(),
+            chain,
+            claim,
+            10_000,
+            1,
+            Duration::ZERO,
+            &resume,
+            &(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
     }
 }

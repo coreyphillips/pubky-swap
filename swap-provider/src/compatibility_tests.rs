@@ -63,6 +63,9 @@ impl LightningBackend for IntentLightning {
         &self,
         request: &HoldInvoiceRequest,
     ) -> lightning_backend::Result<Option<HoldInvoice>> {
+        // A real lookup is an RPC, so anything else waiting on this swap is polled while it is in
+        // flight. That window is where a concurrent replay used to slip through.
+        tokio::task::yield_now().await;
         if self.fail_lookup.load(Ordering::SeqCst) {
             return Err(LightningError::Backend("node unreachable".into()));
         }
@@ -218,6 +221,78 @@ async fn invoice_recovery_requires_definite_absence_before_creating() {
         .await
         .unwrap();
     assert_eq!(ln.create_calls.load(Ordering::SeqCst), 1);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// Two sessions replaying one `SwapRequest` used to admit the same swap twice.
+///
+/// Session requests are handled in their own tasks. Both handlers found the invoice intent
+/// pending, both completed it against a backend that answers the second lookup with the invoice
+/// the first one registered, and both spawned a driver over one record. Each driver keeps its own
+/// copy of that record, so neither sees the other's funding marker and both can fund the HTLC.
+/// The second reservation also overwrote the first, so releasing both left half the exposure
+/// committed for the life of the process.
+#[tokio::test]
+async fn concurrent_replays_admit_a_pending_swap_once() {
+    let directory = std::env::temp_dir().join(format!("swap-replay-race-{}", Uuid::new_v4()));
+    let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+    let record = invoice_intent();
+    store.put(&record).unwrap();
+    let ln = IntentLightning::new(store.clone(), record.swap_id);
+    // The backend registered the invoice and then lost the response: the state a replay exists to
+    // recover, and the one both replays would recover from.
+    ln.fail_after_create.store(true, Ordering::SeqCst);
+    assert!(
+        complete_invoice_intent(&ln, store.as_ref(), record.swap_id, false)
+            .await
+            .is_err()
+    );
+
+    let risk = risk::RiskManager::new(risk::RiskLimits::default());
+    let admissions = AdmissionLocks::default();
+    let reserve = |pending: SwapRecord| {
+        let risk = risk.clone();
+        async move {
+            risk.reserve_pending(&pending.peer, pending.swap_id, pending.onchain_amount_sat)
+                .map_err(|reason| anyhow!("{reason}"))
+        }
+    };
+    let replay =
+        || recover_pending_admission(&admissions, store.as_ref(), &ln, record.swap_id, reserve);
+    let (first, second) = tokio::join!(replay(), replay());
+
+    let (first, first_reservation) = first.unwrap();
+    let (second, second_reservation) = second.unwrap();
+    assert_eq!(
+        [&first_reservation, &second_reservation]
+            .iter()
+            .filter(|reservation| reservation.is_some())
+            .count(),
+        1,
+        "only one replay may own the swap, and only its owner starts a driver for it"
+    );
+    assert_eq!(
+        ln.create_calls.load(Ordering::SeqCst),
+        1,
+        "the recovered invoice is the one already registered"
+    );
+    // Both replies describe the same admitted swap, whichever of them did the work.
+    assert!(first.pending_hold_invoice.is_none() && second.pending_hold_invoice.is_none());
+    assert_eq!(
+        first.swap_accept.as_ref().unwrap().invoice.as_deref(),
+        Some("hold-invoice")
+    );
+    assert_eq!(first.swap_accept, second.swap_accept);
+
+    assert_eq!(risk.in_flight(), 1);
+    assert_eq!(risk.committed_sat(), record.onchain_amount_sat);
+    drop((first_reservation, second_reservation));
+    assert_eq!(risk.in_flight(), 0);
+    assert_eq!(
+        risk.committed_sat(),
+        0,
+        "the finished swap gives back everything it committed"
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -533,6 +608,10 @@ fn negotiation_only_providers_do_not_advertise_execution_capabilities() {
         .features
         .iter()
         .any(|feature| feature == "swap-status-v1"));
+    assert!(executable
+        .features
+        .iter()
+        .any(|feature| feature == "dm-retention-v1"));
 }
 
 #[cfg(feature = "iroh")]
@@ -555,9 +634,10 @@ mod direct_requests {
             invoice_expiry_secs: config.invoice_expiry_secs,
             max_routing_fee_msat: config.max_routing_fee_msat,
             quote_ttl_secs: config.quote_ttl_secs,
-            quotes: Arc::new(Mutex::new(HashMap::new())),
+            quotes: Arc::new(Mutex::new(QuoteBook::default())),
             store,
             risk: risk::RiskManager::new(risk_limits(&config)),
+            admissions: Arc::new(AdmissionLocks::default()),
             min_onchain_reserve_sat: 0,
             // Nothing new may start: every reply below comes from what is already persisted.
             capable: false,
@@ -724,6 +804,7 @@ mod direct_requests {
         ctx.quotes
             .lock()
             .await
+            .quotes
             .get(&quote_id)
             .is_some_and(|quote| quote.peer == peer)
     }

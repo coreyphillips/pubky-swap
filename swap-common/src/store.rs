@@ -181,6 +181,18 @@ pub struct SwapRecord {
     /// re-reading a number from the counterparty.
     #[serde(default)]
     pub quote_total_sat: u64,
+    /// Terms accepted by the client before publishing its creation request.
+    #[serde(default)]
+    pub client_quote: Option<crate::messages::Quote>,
+    /// Set before the first creation attempt. False proves no request was sent by this client.
+    #[serde(default)]
+    pub client_creation_started: bool,
+    /// Chain tip observed before publishing the creation request, for quote timeout validation.
+    #[serde(default)]
+    pub client_creation_tip: Option<u32>,
+    /// Full contract and invoice validation completed before an execution driver may run.
+    #[serde(default)]
+    pub client_execution_ready: bool,
 
     // --- diagnostics ---
     /// The lowest height at which a reorg was seen while this swap was in flight.
@@ -262,6 +274,8 @@ impl std::fmt::Debug for SwapRecord {
 /// any of this existed: the fields only ever narrow what a resumed driver is willing to do.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resume {
+    /// Present when an invoice payment may have reached the node before the previous run ended.
+    pub invoice_pay_started_at_unix: Option<u64>,
     /// The HTLC funding outpoint, once it was known.
     pub funding: Option<OutPoint>,
     /// The tip height at which a funding broadcast was about to be attempted, still set because
@@ -341,6 +355,10 @@ impl SwapRecord {
             preimage_hex: None,
             dest_spk_hex: None,
             quote_total_sat: 0,
+            client_quote: None,
+            client_creation_started: false,
+            client_creation_tip: None,
+            client_execution_ready: false,
             last_error: None,
             retry_count: 0,
             next_retry_at_unix: None,
@@ -431,6 +449,7 @@ impl SwapRecord {
     /// What a driver resuming this swap must honour.
     pub fn resume(&self) -> Resume {
         Resume {
+            invoice_pay_started_at_unix: self.invoice_pay_started_at_unix,
             funding: self.funding_outpoint(),
             funding_intent_at_height: self.funding_intent_at_height,
             our_spends: self.our_spends(),

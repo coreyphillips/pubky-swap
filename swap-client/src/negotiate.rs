@@ -16,11 +16,16 @@
 
 use anyhow::{anyhow, Error, Result};
 use pubky_transport::Transport;
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::Mutex;
+use std::time::Duration;
 use swap_common::messages::*;
-use tokio::sync::OnceCell;
+use swap_common::store::{JsonFileSwapStore, SwapRole, SwapStore};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 use tokio::time::sleep;
+use tokio::time::Instant;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -75,6 +80,15 @@ pub trait Channel {
         request: &SwapMessage,
         expected: fn(&SwapMessage) -> bool,
     ) -> std::result::Result<SwapMessage, ExchangeError>;
+
+    /// Complete transport delivery after the application has persisted the outcome.
+    fn acknowledge(&self, _request: &SwapMessage) -> Result<()> {
+        Ok(())
+    }
+
+    async fn close(&self) {}
+
+    async fn maintain(&self) {}
 }
 
 /// A transport this build does not have.
@@ -117,6 +131,9 @@ impl IrohChannel {
 #[cfg(feature = "iroh")]
 impl Channel for IrohChannel {
     const NAME: &'static str = "iroh";
+    async fn close(&self) {
+        self.client.close().await;
+    }
     async fn exchange(
         &self,
         request: &SwapMessage,
@@ -136,7 +153,9 @@ impl Channel for IrohChannel {
         };
         let reply: SwapMessage = serde_json::from_slice(&bytes)
             .map_err(|error| ExchangeError::Uncertain(anyhow!("unreadable reply: {error}")))?;
-        if matches!(reply, SwapMessage::Reject(_)) || expected(&reply) {
+        if reply_matches(request, &reply)
+            && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
+        {
             Ok(reply)
         } else {
             Err(ExchangeError::Uncertain(anyhow!(
@@ -150,28 +169,32 @@ impl Channel for IrohChannel {
 pub struct DmChannel {
     transport: Transport,
     provider: String,
-    signed_in: bool,
     /// Rung before the first request, so a provider that does not follow us starts polling.
     doorbell: Option<[u8; 32]>,
     ready: OnceCell<()>,
     reply_timeout: Duration,
+    exchanges: AsyncMutex<()>,
+    receipts: Mutex<HashMap<String, Vec<pubky_transport::Receipt>>>,
+    accepted_store: Option<JsonFileSwapStore>,
 }
 
 impl DmChannel {
-    /// `signed_in` says whether `transport` has already signed in to its homeserver.
+    /// The compatibility sign-in argument is ignored; the bounded mutation engine owns sessions.
     pub fn new(
         transport: Transport,
         provider: &str,
-        signed_in: bool,
+        _signed_in: bool,
         doorbell: Option<[u8; 32]>,
     ) -> Self {
         Self {
             transport,
             provider: provider.to_string(),
-            signed_in,
             doorbell,
             ready: OnceCell::new(),
             reply_timeout: Duration::from_secs(30),
+            exchanges: AsyncMutex::new(()),
+            receipts: Mutex::new(HashMap::new()),
+            accepted_store: None,
         }
     }
 
@@ -179,19 +202,65 @@ impl DmChannel {
         &self.transport
     }
 
-    /// Sign in, skip the conversation's history and ring the doorbell, once.
+    fn recorded_acceptance(&self, reply: &SwapMessage) -> Result<bool> {
+        let Some(store) = &self.accepted_store else {
+            return Ok(false);
+        };
+        let records = store.load_all_checked()?;
+        Ok(records.iter().any(|record| {
+            record.role == SwapRole::Client
+                && pubky_transport::same_pubky(&record.peer, &self.provider)
+                && match reply {
+                    SwapMessage::SwapAccept(accept) => record.swap_accept.as_ref() == Some(accept),
+                    SwapMessage::SwapStatusSnapshot(snapshot) => {
+                        record.swap_accept.as_ref() == Some(&snapshot.accept)
+                    }
+                    SwapMessage::SwapStatusUpdate(update) => record
+                        .swap_accept
+                        .as_ref()
+                        .is_some_and(|accept| accept.swap_id == update.swap_id),
+                    _ => false,
+                }
+        }))
+    }
+
+    async fn maintain_outbox(&self) {
+        let result = async {
+            if let Some(store) = &self.accepted_store {
+                for record in store.load_all_checked()? {
+                    if record.role == SwapRole::Client
+                        && pubky_transport::same_pubky(&record.peer, &self.provider)
+                    {
+                        if let Some(request) = &record.swap_request {
+                            let scope = SwapMessage::SwapRequest(request.clone()).delivery_scope();
+                            match crate::store::cleanup_deadline(&record) {
+                                Some(deadline) => self.transport.complete_scope(
+                                    &self.provider,
+                                    &scope,
+                                    deadline,
+                                )?,
+                                None => self.transport.reopen_scope(&self.provider, &scope)?,
+                            }
+                        }
+                    }
+                }
+            }
+            self.transport.process_outbox(crate::now_unix(), 8).await?;
+            Ok::<_, Error>(())
+        };
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), result).await,
+            Ok(Ok(()))
+        ) {
+            warn!("message maintenance remains pending for the next connection");
+        }
+    }
+
+    /// Register the peer and ring the doorbell once. Pending replies survive process restarts.
     async fn prepare(&self) -> Result<()> {
         self.ready
             .get_or_try_init(|| async {
-                if !self.signed_in {
-                    self.transport.sign_in().await?;
-                }
-                self.transport.add_known_peer(self.provider.clone());
-                // Everything already in this conversation belongs to an earlier run, and none of
-                // it answers a request this run has not sent yet.
-                if let Err(e) = self.transport.mark_conversation_seen(&self.provider).await {
-                    warn!("could not read the existing conversation with the provider ({e}); a reply from an earlier run may be picked up instead of this one's");
-                }
+                self.transport.register_peer(&self.provider, true)?;
                 ring_doorbell(self.doorbell, &self.provider).await;
                 Ok::<_, Error>(())
             })
@@ -202,35 +271,189 @@ impl DmChannel {
 
 impl Channel for DmChannel {
     const NAME: &'static str = "Pubky DMs";
+
+    async fn close(&self) {
+        self.maintain().await;
+    }
+
+    async fn maintain(&self) {
+        if self.ready.get().is_some() {
+            self.maintain_outbox().await;
+        }
+    }
+
+    fn acknowledge(&self, request: &SwapMessage) -> Result<()> {
+        let mut receipts = self
+            .receipts
+            .lock()
+            .map_err(|_| anyhow!("reply receipts poisoned"))?;
+        if let Some(pending) = receipts.get_mut(&request_key(request)) {
+            for receipt in pending.iter() {
+                receipt.acknowledge()?;
+            }
+            pending.clear();
+        }
+        receipts.remove(&request_key(request));
+        Ok(())
+    }
+
     async fn exchange(
         &self,
         request: &SwapMessage,
         expected: fn(&SwapMessage) -> bool,
     ) -> std::result::Result<SwapMessage, ExchangeError> {
-        self.prepare().await.map_err(ExchangeError::NotSent)?;
-        self.transport
-            .send(&self.provider, request)
-            .await
-            .map_err(|error| ExchangeError::Uncertain(error.into()))?;
         let deadline = Instant::now() + self.reply_timeout;
-        while Instant::now() <= deadline {
-            let messages = self
-                .transport
-                .receive_from::<SwapMessage>(&self.provider)
+        let exchange = async {
+            let _guard = self.exchanges.lock().await;
+            self.prepare().await.map_err(ExchangeError::NotSent)?;
+            self.transport
+                .send_with_scope(&self.provider, &request_scope(request), request)
                 .await
-                .unwrap_or_default();
-            for message in messages {
-                if matches!(message, SwapMessage::Reject(_)) || expected(&message) {
-                    return Ok(message);
+                .map_err(|error| ExchangeError::Uncertain(error.into()))?;
+            loop {
+                let messages = self
+                    .transport
+                    .poll_from::<SwapMessage>(&self.provider)
+                    .await
+                    .map_err(|error| ExchangeError::Uncertain(error.into()))?;
+                let mut matched = None;
+                let mut matched_receipts = Vec::new();
+                let mut unresolved = false;
+                for inbound in messages {
+                    // An earlier status reply can recover this exact creation after a crash.
+                    let reply = match (request, inbound.message) {
+                        (
+                            SwapMessage::SwapRequest(request),
+                            SwapMessage::SwapStatusSnapshot(snapshot),
+                        ) if snapshot.accept.quote_id == request.quote_id => {
+                            SwapMessage::SwapAccept(snapshot.accept)
+                        }
+                        (_, reply) => reply,
+                    };
+                    if reply_matches(request, &reply)
+                        && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
+                    {
+                        if let Some(previous) = &matched {
+                            if acceptance_conflicts(previous, &reply) {
+                                return Err(ExchangeError::Uncertain(anyhow!(
+                                    "provider sent conflicting correlated replies"
+                                )));
+                            }
+                        }
+                        if read_only_reply(&reply) {
+                            inbound
+                                .receipt
+                                .acknowledge()
+                                .map_err(|error| ExchangeError::Uncertain(error.into()))?;
+                        } else {
+                            matched_receipts.push(inbound.receipt);
+                        }
+                        if matched.is_none() || !matches!(reply, SwapMessage::Reject(_)) {
+                            matched = Some(reply);
+                        }
+                    } else if read_only_reply(&reply)
+                        || self
+                            .recorded_acceptance(&reply)
+                            .map_err(ExchangeError::Uncertain)?
+                    {
+                        inbound
+                            .receipt
+                            .acknowledge()
+                            .map_err(|error| ExchangeError::Uncertain(error.into()))?;
+                    } else {
+                        // Never discard a creation reply just to advance the bounded inbox.
+                        unresolved = true;
+                    }
                 }
+                if let Some(reply) = matched {
+                    self.receipts
+                        .lock()
+                        .map_err(|_| ExchangeError::Uncertain(anyhow!("reply receipts poisoned")))?
+                        .entry(request_key(request))
+                        .or_default()
+                        .extend(matched_receipts);
+                    return Ok(reply);
+                }
+                if unresolved {
+                    return Err(ExchangeError::Uncertain(anyhow!("an unrecorded creation reply is pending; recover the earlier swap before negotiating another")));
+                }
+                sleep(Duration::from_millis(200)).await;
             }
-            sleep(Duration::from_millis(500)).await;
+        };
+        match tokio::time::timeout_at(deadline, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(ExchangeError::Uncertain(anyhow!(
+                "timed out waiting for provider response"
+            ))),
         }
-        // A provider that restarted since the last ring has stopped polling this conversation.
-        ring_doorbell(self.doorbell, &self.provider).await;
-        Err(ExchangeError::Uncertain(anyhow!(
-            "timed out waiting for provider response"
-        )))
+    }
+}
+
+fn acceptance_conflicts(first: &SwapMessage, second: &SwapMessage) -> bool {
+    fn acceptance(message: &SwapMessage) -> Option<&SwapAccept> {
+        match message {
+            SwapMessage::SwapAccept(accept) => Some(accept),
+            SwapMessage::SwapStatusSnapshot(snapshot) => Some(&snapshot.accept),
+            _ => None,
+        }
+    }
+    matches!((acceptance(first), acceptance(second)), (Some(first), Some(second)) if first != second)
+}
+
+fn read_only_reply(reply: &SwapMessage) -> bool {
+    matches!(
+        reply,
+        SwapMessage::Offer(_)
+            | SwapMessage::Quote(_)
+            | SwapMessage::Reject(_)
+            | SwapMessage::SwapStatusUpdate(_)
+    )
+}
+
+fn request_key(request: &SwapMessage) -> String {
+    match request {
+        SwapMessage::OfferRequest(r) => format!("offer:{:?}", r.request_id),
+        SwapMessage::QuoteRequest(r) => format!("request:{:?}", r.request_id),
+        SwapMessage::SwapRequest(r) => format!("quote:{}", r.quote_id),
+        SwapMessage::SwapStatusRequest(r) => r
+            .quote_id
+            .map(|id| format!("quote:{id}"))
+            .unwrap_or_else(|| format!("swap:{:?}", r.swap_id)),
+        _ => "unsupported".into(),
+    }
+}
+
+fn request_scope(request: &SwapMessage) -> String {
+    request.delivery_scope()
+}
+
+/// Match identity as well as message kind before consuming a response.
+pub fn reply_matches(request: &SwapMessage, reply: &SwapMessage) -> bool {
+    match (request, reply) {
+        (SwapMessage::OfferRequest(r), SwapMessage::Offer(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
+        (SwapMessage::QuoteRequest(r), SwapMessage::Quote(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
+        (SwapMessage::SwapRequest(r), SwapMessage::SwapAccept(v)) => v.quote_id == r.quote_id,
+        (SwapMessage::SwapStatusRequest(r), SwapMessage::SwapStatusSnapshot(v)) => {
+            r.request_id.is_some()
+                && v.request_id == r.request_id
+                && r.quote_id.is_none_or(|id| v.accept.quote_id == id)
+                && r.swap_id.is_none_or(|id| v.accept.swap_id == id)
+        }
+        (SwapMessage::OfferRequest(r), SwapMessage::Reject(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
+        (SwapMessage::QuoteRequest(r), SwapMessage::Reject(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
+        (SwapMessage::SwapRequest(r), SwapMessage::Reject(v)) => v.quote_id == Some(r.quote_id),
+        (SwapMessage::SwapStatusRequest(r), SwapMessage::Reject(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
+        _ => false,
     }
 }
 
@@ -277,6 +500,54 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
 
     pub fn fallback(&self) -> Option<&F> {
         self.fallback.as_ref()
+    }
+
+    pub fn acknowledge(&self, request: &SwapMessage) -> Result<()> {
+        if let Some(channel) = &self.preferred {
+            channel.acknowledge(request)?;
+        }
+        if let Some(channel) = &self.fallback {
+            channel.acknowledge(request)?;
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        if let Some(channel) = &self.preferred {
+            channel.close().await;
+        }
+        if let Some(channel) = &self.fallback {
+            channel.close().await;
+        }
+    }
+
+    /// Bounded maintenance runs alongside execution and is canceled when the caller completes.
+    pub(crate) async fn maintenance(&self) {
+        loop {
+            sleep(Duration::from_secs(10)).await;
+            if let Some(channel) = &self.fallback {
+                channel.maintain().await;
+            }
+        }
+    }
+
+    /// Recover a creation whose exact request was persisted by an earlier process.
+    pub async fn recover_creation(&self, request: &SwapRequest) -> Result<SwapAccept> {
+        negotiation_deadline(self.recover_creation_within_deadline(request)).await
+    }
+
+    async fn recover_creation_within_deadline(&self, request: &SwapRequest) -> Result<SwapAccept> {
+        // A crash may precede publication. Replay the saved request without changing its keys.
+        let message = SwapMessage::SwapRequest(request.clone());
+        let expected = |reply: &SwapMessage| matches!(reply, SwapMessage::SwapAccept(_));
+        match self.exchange(&message, expected).await {
+            Ok(Exchanged {
+                reply: SwapMessage::SwapAccept(accept),
+                ..
+            }) if accept.quote_id == request.quote_id => Ok(accept),
+            Ok(Exchanged { reply, .. }) => self.recover(request.quote_id, rejection(reply)).await,
+            Err(error) => self.recover(request.quote_id, error.into_inner()).await,
+        }
     }
 
     async fn exchange(
@@ -329,6 +600,10 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
 
     /// The provider's current offer.
     pub async fn offer(&self) -> Result<SwapOffer> {
+        negotiation_deadline(self.offer_within_deadline()).await
+    }
+
+    async fn offer_within_deadline(&self) -> Result<SwapOffer> {
         let request_id = Some(Uuid::new_v4());
         let request = SwapMessage::OfferRequest(OfferRequest { request_id });
         let expected =
@@ -339,13 +614,20 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
             .map_err(ExchangeError::into_inner)?
             .reply
         {
-            SwapMessage::Offer(offer) if offer.request_id == request_id => Ok(offer),
+            SwapMessage::Offer(offer) if offer.request_id == request_id => {
+                self.acknowledge(&request)?;
+                Ok(offer)
+            }
             SwapMessage::Offer(_) => Err(anyhow!("offer answers a different request")),
             other => Err(rejection(other)),
         }
     }
 
     pub async fn quote(&self, request: &QuoteRequest) -> Result<Quote> {
+        negotiation_deadline(self.quote_within_deadline(request)).await
+    }
+
+    async fn quote_within_deadline(&self, request: &QuoteRequest) -> Result<Quote> {
         let message = SwapMessage::QuoteRequest(request.clone());
         let expected = |m: &SwapMessage| matches!(m, SwapMessage::Quote(_));
         match self
@@ -354,10 +636,10 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
             .map_err(ExchangeError::into_inner)?
             .reply
         {
-            // An older provider does not echo the identifier.
             SwapMessage::Quote(quote)
-                if quote.request_id.is_none() || quote.request_id == request.request_id =>
+                if request.request_id.is_some() && quote.request_id == request.request_id =>
             {
+                self.acknowledge(&message)?;
                 Ok(quote)
             }
             SwapMessage::Quote(_) => Err(anyhow!("quote answers a different request")),
@@ -367,6 +649,10 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
 
     /// Create the swap, or recover the one an earlier attempt already created.
     pub async fn create(&self, request: &SwapRequest) -> Result<SwapAccept> {
+        negotiation_deadline(self.create_within_deadline(request)).await
+    }
+
+    async fn create_within_deadline(&self, request: &SwapRequest) -> Result<SwapAccept> {
         let message = SwapMessage::SwapRequest(request.clone());
         let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapAccept(_));
         let accept = match self.exchange(&message, expected).await {
@@ -404,9 +690,18 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
             };
             let message = SwapMessage::SwapStatusRequest(query.clone());
             let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapStatusSnapshot(_));
-            match self.exchange(&message, expected).await.map(|e| e.reply) {
+            match tokio::time::timeout_at(deadline, self.exchange(&message, expected))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ExchangeError::Uncertain(anyhow!(
+                        "recovery deadline elapsed"
+                    )))
+                })
+                .map(|e| e.reply)
+            {
                 Ok(SwapMessage::SwapStatusSnapshot(snapshot))
-                    if snapshot.request_id == query.request_id =>
+                    if snapshot.request_id == query.request_id
+                        && snapshot.accept.quote_id == quote_id =>
                 {
                     info!("recovered swap {} by its quote", snapshot.accept.swap_id);
                     return Ok(snapshot.accept);
@@ -425,11 +720,18 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
                     "the provider may have created a swap for quote {quote_id}; query its status before requesting another"
                 )));
             }
-            sleep(RECOVERY_POLL).await;
+            tokio::time::sleep_until((Instant::now() + RECOVERY_POLL).min(deadline)).await;
         }
     }
 
     pub async fn status(&self, request: &SwapStatusRequest) -> Result<SwapStatusSnapshot> {
+        negotiation_deadline(self.status_within_deadline(request)).await
+    }
+
+    async fn status_within_deadline(
+        &self,
+        request: &SwapStatusRequest,
+    ) -> Result<SwapStatusSnapshot> {
         let message = SwapMessage::SwapStatusRequest(request.clone());
         let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapStatusSnapshot(_));
         match self
@@ -439,7 +741,14 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
             .reply
         {
             SwapMessage::SwapStatusSnapshot(snapshot)
-                if snapshot.request_id == request.request_id =>
+                if request.request_id.is_some()
+                    && snapshot.request_id == request.request_id
+                    && request
+                        .quote_id
+                        .is_none_or(|id| snapshot.accept.quote_id == id)
+                    && request
+                        .swap_id
+                        .is_none_or(|id| snapshot.accept.swap_id == id) =>
             {
                 Ok(snapshot)
             }
@@ -449,6 +758,18 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
             other => Err(rejection(other)),
         }
     }
+}
+
+async fn negotiation_deadline<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(RECOVERY_WINDOW, future)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "negotiation deadline elapsed; any persisted creation remains pending for recovery"
+            )
+        })?
 }
 
 fn rejection(reply: SwapMessage) -> Error {
@@ -470,14 +791,67 @@ pub async fn connect(
     preference: Negotiation,
     rendezvous_iroh: bool,
 ) -> Result<(Negotiator<Preferred, DmChannel>, String)> {
+    connect_inner(identity, provider, preference, rendezvous_iroh, None).await
+}
+
+pub async fn connect_durable(
+    identity: &swap_config::Identity,
+    provider: &str,
+    preference: Negotiation,
+    rendezvous_iroh: bool,
+    data_dir: &Path,
+) -> Result<(Negotiator<Preferred, DmChannel>, String)> {
+    connect_inner(
+        identity,
+        provider,
+        preference,
+        rendezvous_iroh,
+        Some(data_dir),
+    )
+    .await
+}
+
+async fn connect_inner(
+    identity: &swap_config::Identity,
+    provider: &str,
+    preference: Negotiation,
+    rendezvous_iroh: bool,
+    data_dir: Option<&Path>,
+) -> Result<(Negotiator<Preferred, DmChannel>, String)> {
+    let provider = pubky_transport::canonical_pubky(provider)?;
+    let provider = provider.as_str();
+    #[cfg(feature = "iroh")]
+    let secret = pubky_transport::identity::secret_from_recovery(
+        identity.method,
+        &identity.value,
+        &identity.passphrase,
+    )?;
+    let transport =
+        Transport::unsigned_from_recovery(identity.method, &identity.value, &identity.passphrase)?;
+    let client_pkarr = transport.public_key_string();
+    #[cfg(feature = "iroh")]
+    let doorbell = rendezvous_iroh.then_some(secret);
+    #[cfg(not(feature = "iroh"))]
+    let doorbell = None;
+    let dm = || -> Result<DmChannel> {
+        let mut transport = transport;
+        let mut accepted_store = None;
+        if let Some(data_dir) = data_dir {
+            let journal = data_dir
+                .join("transport")
+                .join(&client_pkarr)
+                .join(provider);
+            transport = transport
+                .with_receive_journal(journal.join("inbox.json"))?
+                .with_outbox(journal.join("outbox.json"))?;
+            accepted_store = Some(JsonFileSwapStore::new(data_dir.join("swaps"))?);
+        }
+        let mut channel = DmChannel::new(transport, provider, false, doorbell);
+        channel.accepted_store = accepted_store;
+        Ok(channel)
+    };
     #[cfg(feature = "iroh")]
     {
-        let secret = pubky_transport::identity::secret_from_recovery(
-            identity.method,
-            &identity.value,
-            &identity.passphrase,
-        )?;
-        let client_pkarr = pubky_transport::identity_from_secret(&secret);
         let preferred = match preference {
             Negotiation::Dm => None,
             Negotiation::Auto => match IrohChannel::new(secret, provider).await {
@@ -490,17 +864,15 @@ pub async fn connect(
             Negotiation::Iroh => Some(IrohChannel::new(secret, provider).await?),
         };
         // Signing in waits until a request actually needs DMs.
-        let fallback = (preference != Negotiation::Iroh).then(|| {
-            Transport::unsigned(secret).map(|transport| {
-                DmChannel::new(
-                    transport,
-                    provider,
-                    false,
-                    rendezvous_iroh.then_some(secret),
-                )
-            })
-        });
-        let fallback = fallback.transpose()?;
+        let fallback = match (preference != Negotiation::Iroh).then(dm).transpose() {
+            Ok(fallback) => fallback,
+            Err(error) => {
+                if let Some(channel) = &preferred {
+                    channel.close().await;
+                }
+                return Err(error);
+            }
+        };
         Ok((Negotiator::new(preferred, fallback), client_pkarr))
     }
     #[cfg(not(feature = "iroh"))]
@@ -513,14 +885,7 @@ pub async fn connect(
         if rendezvous_iroh {
             warn!("--rendezvous-iroh set but this build lacks the `iroh` feature; ignoring");
         }
-        let transport = match identity.method {
-            "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
-            _ => {
-                Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?
-            }
-        };
-        let client_pkarr = transport.public_key_string();
-        let fallback = DmChannel::new(transport, provider, true, None);
+        let fallback = dm()?;
         Ok((Negotiator::new(None, Some(fallback)), client_pkarr))
     }
 }
@@ -916,5 +1281,275 @@ mod tests {
         );
         assert_eq!(negotiator.preferred().unwrap().0.seen().len(), 2);
         assert!(negotiator.fallback().unwrap().0.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restarting_before_publication_replays_the_saved_creation() {
+        let provider = Arc::new(Provider::default());
+        let request = swap_request(Uuid::new_v4());
+        let saved: SwapRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        let negotiator = negotiator(&provider, [], Some(vec![]));
+        negotiator.recover_creation(&saved).await.unwrap();
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            negotiator.preferred().unwrap().0.seen(),
+            vec![serde_json::to_value(SwapMessage::SwapRequest(request)).unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_after_publication_checks_a_refused_replay_against_status() {
+        let provider = Arc::new(Provider::default());
+        let request = swap_request(Uuid::new_v4());
+        let original = provider.handle(&SwapMessage::SwapRequest(request.clone()));
+        provider.refuse_replays.store(true, Ordering::SeqCst);
+        let negotiator = negotiator(&provider, [], Some(vec![]));
+        let recovered = negotiator.recover_creation(&request).await.unwrap();
+        let SwapMessage::SwapAccept(original) = original else {
+            panic!("expected acceptance")
+        };
+        assert_eq!(original, recovered);
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unmatched_read_only_replies_do_not_discard_creation_outcomes() {
+        let quote = Provider::default().handle(&SwapMessage::QuoteRequest(quote_request()));
+        assert!(read_only_reply(&quote));
+        assert!(!read_only_reply(&SwapMessage::SwapAccept(acceptance(
+            Uuid::new_v4()
+        ))));
+        assert!(read_only_reply(&reject("creation outcome")));
+        let first = SwapMessage::SwapRequest(swap_request(Uuid::new_v4()));
+        let unrelated = SwapMessage::SwapAccept(acceptance(Uuid::new_v4()));
+        assert!(!reply_matches(&first, &unrelated));
+        assert!(
+            request_scope(&SwapMessage::QuoteRequest(quote_request())).starts_with("ephemeral:")
+        );
+        assert!(request_scope(&first).starts_with("quote:"));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_an_exchange_slot_obeys_the_reply_deadline() {
+        let transport = Transport::unsigned([7; 32]).unwrap();
+        let provider = pubky_transport::identity_from_secret(&[8; 32]);
+        let mut channel = DmChannel::new(transport, &provider, false, None);
+        channel.reply_timeout = Duration::from_millis(20);
+        let _guard = channel.exchanges.lock().await;
+        let request = SwapMessage::QuoteRequest(quote_request());
+        let started = Instant::now();
+        let result = channel
+            .exchange(&request, |reply| matches!(reply, SwapMessage::Quote(_)))
+            .await;
+        assert!(matches!(result, Err(ExchangeError::Uncertain(_))));
+        assert!(started.elapsed() < Duration::from_millis(750));
+        assert_eq!(channel.transport().homeserver_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_connections_open_journals_without_signing_in_and_release_them_on_drop() {
+        let dir = std::env::temp_dir().join(format!("client-dm-journals-{}", Uuid::new_v4()));
+        let identity = swap_config::Identity { method: "phrase",
+            value: "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".into(),
+            passphrase: String::new() };
+        let provider = pubky_transport::identity_from_secret(&[8; 32]);
+        let (negotiator, owner) =
+            connect_durable(&identity, &provider, Negotiation::Dm, false, &dir)
+                .await
+                .unwrap();
+        assert_eq!(
+            negotiator
+                .fallback()
+                .unwrap()
+                .transport()
+                .homeserver_requests(),
+            0
+        );
+        assert!(dir.join("transport").join(owner).join(&provider).is_dir());
+        negotiator.close().await;
+        drop(negotiator);
+        let (reopened, _) = connect_durable(&identity, &provider, Negotiation::Dm, false, &dir)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .fallback()
+                .unwrap()
+                .transport()
+                .homeserver_requests(),
+            0
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    struct Never;
+    impl Channel for Never {
+        const NAME: &'static str = "pending test channel";
+        async fn exchange(
+            &self,
+            _: &SwapMessage,
+            _: fn(&SwapMessage) -> bool,
+        ) -> std::result::Result<SwapMessage, ExchangeError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_public_negotiation_operation_has_one_total_deadline() {
+        let negotiator = Negotiator::<_, Unavailable>::new(Some(Never), None);
+        let request = swap_request(Uuid::new_v4());
+        let status = SwapStatusRequest {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: None,
+            quote_id: Some(request.quote_id),
+        };
+        let start = Instant::now();
+        assert!(negotiator
+            .offer()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
+        assert!(negotiator
+            .quote(&quote_request())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
+        assert!(negotiator
+            .create(&request)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
+        assert!(negotiator
+            .recover_creation(&request)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
+        assert!(negotiator
+            .status(&status)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("deadline"));
+        assert_eq!(start.elapsed(), RECOVERY_WINDOW * 5);
+    }
+
+    struct LateReply {
+        canceled: AtomicUsize,
+    }
+    struct DropCount<'a>(&'a AtomicUsize);
+    impl Drop for DropCount<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Channel for LateReply {
+        const NAME: &'static str = "late test channel";
+        async fn exchange(
+            &self,
+            request: &SwapMessage,
+            _: fn(&SwapMessage) -> bool,
+        ) -> std::result::Result<SwapMessage, ExchangeError> {
+            let _guard = DropCount(&self.canceled);
+            sleep(RECOVERY_WINDOW + Duration::from_secs(1)).await;
+            let SwapMessage::SwapRequest(request) = request else {
+                panic!("creation expected")
+            };
+            Ok(SwapMessage::SwapAccept(acceptance(request.quote_id)))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_replies_are_canceled_at_the_total_deadline_without_detached_work() {
+        let negotiator = Negotiator::<_, Unavailable>::new(
+            Some(LateReply {
+                canceled: AtomicUsize::new(0),
+            }),
+            None,
+        );
+        let start = Instant::now();
+        assert!(negotiator
+            .create(&swap_request(Uuid::new_v4()))
+            .await
+            .is_err());
+        assert_eq!(start.elapsed(), RECOVERY_WINDOW);
+        assert_eq!(
+            negotiator
+                .preferred()
+                .unwrap()
+                .canceled
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn repeated_pending_rejections_never_need_a_durable_acceptance_receipt() {
+        let quote_id = Uuid::new_v4();
+        for _ in 0..64 {
+            let request_id = Some(Uuid::new_v4());
+            let request = SwapMessage::SwapStatusRequest(SwapStatusRequest {
+                request_id,
+                swap_id: None,
+                quote_id: Some(quote_id),
+            });
+            let reply = SwapMessage::Reject(Reject {
+                request_id,
+                quote_id: Some(quote_id),
+                swap_id: None,
+                code: Some("pending".into()),
+                reason: "creation pending".into(),
+            });
+            assert!(reply_matches(&request, &reply));
+            assert!(
+                read_only_reply(&reply),
+                "a correlated pending reply must be acknowledged immediately"
+            );
+        }
+        assert!(!read_only_reply(&SwapMessage::SwapAccept(acceptance(
+            quote_id
+        ))));
+    }
+
+    #[test]
+    fn retry_replies_may_change_read_only_fields_but_not_accepted_contracts() {
+        let provider = Provider::default();
+        let quote_request = SwapMessage::QuoteRequest(quote_request());
+        let first = provider.handle(&quote_request);
+        let second = provider.handle(&quote_request);
+        assert_ne!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert!(!acceptance_conflicts(&first, &second));
+
+        let request = swap_request(Uuid::new_v4());
+        let accepted = provider.handle(&SwapMessage::SwapRequest(request.clone()));
+        let query = SwapMessage::SwapStatusRequest(SwapStatusRequest {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: None,
+            quote_id: Some(request.quote_id),
+        });
+        let first = provider.handle(&query);
+        let mut second = first.clone();
+        let SwapMessage::SwapStatusSnapshot(snapshot) = &mut second else {
+            panic!("snapshot expected")
+        };
+        snapshot.observed_at_unix = 1234;
+        snapshot.updated_at_unix = 1233;
+        snapshot.state = swap_common::SwapState::LockupPending;
+        assert!(!acceptance_conflicts(&first, &second));
+        assert!(!acceptance_conflicts(&accepted, &second));
+        let SwapMessage::SwapStatusSnapshot(snapshot) = &mut second else {
+            unreachable!()
+        };
+        snapshot.accept.onchain_amount_sat += 1;
+        assert!(acceptance_conflicts(&first, &second));
+        assert!(acceptance_conflicts(&accepted, &second));
     }
 }

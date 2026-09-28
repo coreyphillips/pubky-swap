@@ -18,6 +18,8 @@ compile_error!(
      reached by pubkys it already follows."
 );
 
+mod delivery;
+mod dispatch;
 pub mod preflight;
 pub mod pricing;
 pub(crate) mod recovery;
@@ -44,7 +46,7 @@ use lightning_backend::{LightningBackend, LndConfig, StubBackend};
 use pubky_transport::Transport;
 mod reply_transport;
 use reply_transport::ReplyTransport;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use swap_common::chain::{run_blocking, ChainWatcher};
 use swap_common::htlc::{htlc_p2wsh_address, PaymentHash};
@@ -234,9 +236,48 @@ fn now_unix() -> u64 {
 /// limit even before they expire.
 const MAX_TRACKED_QUOTES: usize = 10_000;
 
-/// Drop expired quotes from the map.
-fn prune_quotes(quotes: &mut HashMap<Uuid, IssuedQuote>, now: u64) {
-    quotes.retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
+/// Quotes the provider has issued and not yet seen redeemed or expire.
+///
+/// A full book evicts its oldest quote rather than refusing new ones. Refusing let anyone with
+/// enough fresh keys hold every slot for a whole TTL and turn every other client away. Evicting
+/// means a flood can only take a client's quote by issuing `MAX_TRACKED_QUOTES` more between
+/// that client's quote and its swap request, and a client that loses the race can ask again.
+/// Limiting per sender would not help: a key costs nothing.
+#[derive(Default)]
+struct QuoteBook {
+    quotes: HashMap<Uuid, IssuedQuote>,
+    /// Issuance order, oldest first. Ids already redeemed or pruned stay here until skipped or
+    /// compacted away.
+    order: VecDeque<Uuid>,
+}
+
+impl QuoteBook {
+    /// Drop expired quotes.
+    fn prune(&mut self, now: u64) {
+        self.quotes
+            .retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
+    }
+
+    fn insert(&mut self, quote_id: Uuid, quote: IssuedQuote, now: u64) {
+        self.prune(now);
+        if self.order.len() >= 2 * MAX_TRACKED_QUOTES {
+            let quotes = &self.quotes;
+            self.order.retain(|id| quotes.contains_key(id));
+        }
+        while self.quotes.len() >= MAX_TRACKED_QUOTES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.quotes.remove(&oldest) {
+                debug!(
+                    "quote cache full; evicted quote {oldest} issued to {}",
+                    evicted.peer
+                );
+            }
+        }
+        self.quotes.insert(quote_id, quote);
+        self.order.push_back(quote_id);
+    }
 }
 
 /// Remove and return a still-valid quote issued to `peer` for `direction` (single-use, so a quote
@@ -247,16 +288,16 @@ fn prune_quotes(quotes: &mut HashMap<Uuid, IssuedQuote>, now: u64) {
 /// before the quote leaves the map, so a request from the wrong peer, or for the wrong direction,
 /// cannot burn the quote its owner is still holding.
 async fn take_valid_quote(
-    quotes: &Mutex<HashMap<Uuid, IssuedQuote>>,
+    quotes: &Mutex<QuoteBook>,
     quote_id: Uuid,
     peer: &str,
     direction: SwapDirection,
 ) -> Result<IssuedQuote> {
     use std::collections::hash_map::Entry;
 
-    let mut quotes = quotes.lock().await;
-    prune_quotes(&mut quotes, now_unix());
-    let Entry::Occupied(entry) = quotes.entry(quote_id) else {
+    let mut book = quotes.lock().await;
+    book.prune(now_unix());
+    let Entry::Occupied(entry) = book.quotes.entry(quote_id) else {
         return Err(anyhow!("unknown or expired quote"));
     };
     if !pubky_transport::same_pubky(&entry.get().peer, peer) {
@@ -431,12 +472,67 @@ struct ExecCtx {
     invoice_expiry_secs: u64,
     max_routing_fee_msat: u64,
     quote_ttl_secs: u64,
-    quotes: Arc<Mutex<HashMap<Uuid, IssuedQuote>>>,
+    quotes: Arc<Mutex<QuoteBook>>,
     store: Arc<dyn SwapStore>,
     risk: Arc<risk::RiskManager>,
+    admissions: Arc<AdmissionLocks>,
     min_onchain_reserve_sat: u64,
     /// True when the provider can execute swaps (real LN + chain + wallet present).
     capable: bool,
+}
+
+/// Per-swap exclusion over the step that turns a persisted admission into a running driver.
+///
+/// Session requests are served in their own tasks, so the same redelivered `SwapRequest` can be
+/// in two handlers at once. Both would find the invoice intent pending, both would complete it
+/// against a backend that answers the second lookup with the first one's invoice, and both would
+/// spawn a driver over one record. Each driver starts from its own copy of that record, so
+/// neither sees the other's funding marker and both can fund the same HTLC.
+#[derive(Default)]
+struct AdmissionLocks {
+    // Initial admission reads shared records before writing a contract. All transports share
+    // this exclusion, while independent quote and status handlers remain concurrent.
+    creation: tokio::sync::Mutex<()>,
+    locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl AdmissionLocks {
+    async fn lock(&self, swap_id: Uuid) -> AdmissionGuard<'_> {
+        let lock = self.locked().entry(swap_id).or_default().clone();
+        let held = lock.lock_owned().await;
+        AdmissionGuard {
+            locks: self,
+            swap_id,
+            held: Some(held),
+        }
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+struct AdmissionGuard<'a> {
+    locks: &'a AdmissionLocks,
+    swap_id: Uuid,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for AdmissionGuard<'_> {
+    fn drop(&mut self) {
+        // Released first, so the only handle left when nobody is waiting is the map's own and the
+        // entry can go. A caller that is waiting holds a clone, which keeps its lock alive.
+        self.held.take();
+        let mut locks = self.locks.locked();
+        if locks
+            .get(&self.swap_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.swap_id);
+        }
+    }
 }
 
 /// A [`ProgressSink`] that records driver progress into the persistent [`SwapStore`], so a
@@ -750,10 +846,17 @@ fn spawn_offer_refresher(
 
 /// Sweep terminal swap records that are old enough to drop.
 fn spawn_record_pruner(ctx: &ExecCtx) {
-    let store = ctx.store.clone();
+    let ctx = ctx.clone();
     tokio::spawn(async move {
         loop {
-            match store.prune_terminal(TERMINAL_RECORD_RETENTION) {
+            // A long downtime may make records immediately eligible. Persist their message
+            // cleanup scopes before removing the only local mapping to those resources.
+            if !delivery::refresh_retention(&ctx, now_unix()).await {
+                warn!("retaining terminal records until message cleanup ownership is saved");
+                sleep(Duration::from_secs(60)).await;
+                continue;
+            }
+            match ctx.store.prune_terminal(TERMINAL_RECORD_RETENTION) {
                 Ok(n) if n > 0 => info!("pruned {n} terminal swap record(s)"),
                 Ok(_) => {}
                 Err(e) => warn!("pruning terminal swap records failed: {e}"),
@@ -778,6 +881,11 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
         _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
     };
+    let transport = transport
+        .with_receive_journal(std::path::Path::new(&config.data_dir).join("receive-journal.json"))
+        .context("open receive journal")?
+        .with_outbox(std::path::Path::new(&config.data_dir).join("message-outbox.json"))
+        .context("open message outbox")?;
     let provider_pkarr = transport.public_key_string();
     info!("Provider pubky: {provider_pkarr}");
 
@@ -914,9 +1022,10 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         invoice_expiry_secs: config.invoice_expiry_secs,
         max_routing_fee_msat: config.max_routing_fee_msat,
         quote_ttl_secs: config.quote_ttl_secs,
-        quotes: Arc::new(Mutex::new(HashMap::new())),
+        quotes: Arc::new(Mutex::new(QuoteBook::default())),
         store,
         risk,
+        admissions: Arc::new(AdmissionLocks::default()),
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
     };
@@ -930,6 +1039,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     // Sweep terminal swap records once they are old enough to drop. Records are retained
     // rather than deleted on completion, so a driver failure can never take one with it.
     spawn_record_pruner(&ctx);
+    delivery::spawn(&ctx);
     // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
     spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
 
@@ -988,24 +1098,63 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     }
 
     info!("Provider running; waiting for quote/swap requests...");
+    let mut inbox = transport.receiver::<SwapMessage>(pubky_transport::PollConfig::default());
+    let mut dispatcher = dispatch::Dispatcher::new(
+        16,
+        32,
+        512,
+        |inbound: &pubky_transport::Inbound<SwapMessage>| {
+            matches!(inbound.message, SwapMessage::SwapRequest(_))
+        },
+        message_handler(&ctx, &offer),
+    );
+    let mut last_stats = std::time::Instant::now();
     loop {
-        let messages = transport
-            .receive_all::<SwapMessage>()
-            .await
-            .unwrap_or_default();
-        for (sender, msg) in messages {
-            // No offer yet means the daemon is still working out what it can serve. Nothing to
-            // quote against, so nothing to answer; the message stays unprocessed and comes round
-            // again on the next poll.
-            let Some(current) = offer.read().await.clone() else {
-                continue;
-            };
-            if let Err(e) = handle_message(&ctx, &current, &sender, msg).await {
-                warn!("error handling message from {sender}: {e}");
-            }
+        let batch = inbox.recv().await;
+        dispatcher.dispatch(batch.peer, batch.messages);
+        if last_stats.elapsed() >= Duration::from_secs(60) {
+            debug!(
+                queued_messages = dispatcher.queued(),
+                busy_peers = dispatcher.busy_peers(),
+                "message dispatch"
+            );
+            last_stats = std::time::Instant::now();
         }
-        sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn message_handler(
+    ctx: &ExecCtx,
+    offer: &SharedOffer,
+) -> dispatch::Handler<pubky_transport::Inbound<SwapMessage>> {
+    let ctx = ctx.clone();
+    let offer = offer.clone();
+    Arc::new(move |sender, inbound| {
+        let ctx = ctx.clone();
+        let offer = offer.clone();
+        Box::pin(async move {
+            // Every early return drops the receipt, leaving the durable request pending.
+            let Some(current) = offer.read().await.clone() else {
+                return;
+            };
+            match handle_message(&ctx, &current, &sender, inbound.message).await {
+                Ok(()) => {
+                    if ctx.transport.acknowledge(&inbound.receipt).is_err() {
+                        warn!("could not persist message acknowledgment; request remains pending");
+                    }
+                }
+                Err(error) => {
+                    // Application rejections are successful replies. An error is unfinished
+                    // work, including an acceptance the homeserver may not have stored.
+                    if is_reply_not_sent(&error) {
+                        warn!("reply delivery failed; request remains pending");
+                    } else {
+                        warn!("message handler failed; request remains pending");
+                    }
+                }
+            }
+        })
+    })
 }
 
 /// A shared HTTP client for the configured beignet daemon.
@@ -1306,7 +1455,11 @@ fn build_offer(
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
         features: if capable {
-            let mut features = vec!["boltz-taproot-v1".into(), "swap-status-v1".into()];
+            let mut features = vec![
+                "boltz-taproot-v1".into(),
+                "swap-status-v1".into(),
+                "dm-retention-v1".into(),
+            ];
             if cfg!(feature = "iroh") && config.rendezvous_iroh {
                 features.push("session-rpc-v1".into());
                 features.push("direct-rpc-v1".into());
@@ -1324,13 +1477,16 @@ async fn handle_message(
     sender: &str,
     msg: SwapMessage,
 ) -> Result<()> {
+    let _creation = if matches!(msg, SwapMessage::SwapRequest(_)) {
+        Some(ctx.admissions.creation.lock().await)
+    } else {
+        None
+    };
     match msg {
         SwapMessage::OfferRequest(req) => {
             let mut current = offer.clone();
             current.request_id = req.request_id;
-            ctx.transport
-                .send(sender, &SwapMessage::Offer(current))
-                .await?;
+            respond(&ctx.transport, sender, &SwapMessage::Offer(current)).await?;
         }
         SwapMessage::SwapStatusRequest(req) => {
             match status_snapshot(
@@ -1340,9 +1496,12 @@ async fn handle_message(
                 &req,
             ) {
                 Ok(snapshot) => {
-                    ctx.transport
-                        .send(sender, &SwapMessage::SwapStatusSnapshot(snapshot))
-                        .await?
+                    respond(
+                        &ctx.transport,
+                        sender,
+                        &SwapMessage::SwapStatusSnapshot(snapshot),
+                    )
+                    .await?
                 }
                 Err(error) => {
                     let code = match error.downcast_ref::<SwapLookupError>() {
@@ -1365,8 +1524,18 @@ async fn handle_message(
         }
 
         SwapMessage::QuoteRequest(req) => {
+            // Refused rather than ignored: the offer refreshes while its predecessor is still
+            // advertised, so a client naming it would otherwise wait out its timeout.
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
-                return Ok(());
+                return reject_request(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    &format!("offer {} is no longer current", req.offer_id),
+                )
+                .await;
             }
             // The cheapest place to find a mismatch: nothing is quoted, nothing reserved, and no
             // key generated. Finding it later means finding it with money already committed.
@@ -1436,41 +1605,23 @@ async fn handle_message(
                 valid_until_unix: expires_at_unix,
                 protocol_version: PROTOCOL_VERSION,
             };
-            {
-                let mut quotes = ctx.quotes.lock().await;
-                prune_quotes(&mut quotes, now);
-                // Bound memory under a quote flood: drop the request if we're already at capacity.
-                if quotes.len() >= MAX_TRACKED_QUOTES {
-                    warn!(
-                        "quote cache full ({MAX_TRACKED_QUOTES}); dropping request from {sender}"
-                    );
-                    return reject_request(
-                        &ctx.transport,
-                        sender,
-                        req.request_id,
-                        None,
-                        None,
-                        "provider busy",
-                    )
-                    .await;
-                }
-                quotes.insert(
-                    quote.quote_id,
-                    IssuedQuote {
-                        peer: sender.to_string(),
-                        direction: req.direction,
-                        amount_sat: req.amount_sat,
-                        fee_sat: fee.total_fee_sat,
-                        service_fee_sat: fee.service_fee_sat,
-                        onchain_fee_sat: fee.onchain_fee_sat,
-                        expires_at_unix,
-                    },
-                );
-            }
+            ctx.quotes.lock().await.insert(
+                quote.quote_id,
+                IssuedQuote {
+                    peer: sender.to_string(),
+                    direction: req.direction,
+                    amount_sat: req.amount_sat,
+                    fee_sat: fee.total_fee_sat,
+                    service_fee_sat: fee.service_fee_sat,
+                    onchain_fee_sat: fee.onchain_fee_sat,
+                    expires_at_unix,
+                },
+                now,
+            );
             info!("Sending quote {} to {sender}", quote.quote_id);
-            ctx.transport
-                .send(sender, &SwapMessage::Quote(quote))
-                .await?;
+            // A failed send may still have been published, so the quote stays redeemable
+            // until it expires even though the retry issues another.
+            respond(&ctx.transport, sender, &SwapMessage::Quote(quote)).await?;
         }
 
         SwapMessage::SwapRequest(req) => {
@@ -1492,31 +1643,53 @@ async fn handle_message(
             ) {
                 Ok(Some(mut record)) => {
                     if record.pending_hold_invoice.is_some() {
-                        let reservation = Some(reserve_pending_swap(ctx, &record).await?);
-                        record = complete_invoice_intent(
-                            ctx.ln.as_ref(),
-                            ctx.store.as_ref(),
-                            record.swap_id,
-                            true,
-                        )
-                        .await?;
-                        let swap = reverse_swap_from_record(&record, ctx.timelock)?;
-                        spawn_reverse_driver(
-                            ctx,
-                            swap,
-                            record.clone(),
-                            reservation,
-                            Duration::ZERO,
-                        );
+                        let resumed = async {
+                            let (completed, reservation) = recover_pending_admission(
+                                ctx.admissions.as_ref(),
+                                ctx.store.as_ref(),
+                                ctx.ln.as_ref(),
+                                record.swap_id,
+                                |pending: SwapRecord| async move {
+                                    reserve_pending_swap(ctx, &pending).await
+                                },
+                            )
+                            .await?;
+                            // No reservation means a concurrent request completed this admission
+                            // and is driving it; this one only replays the acceptance.
+                            if reservation.is_some() {
+                                let swap = reverse_swap_from_record(&completed, ctx.timelock)?;
+                                spawn_reverse_driver(
+                                    ctx,
+                                    swap,
+                                    completed.clone(),
+                                    reservation,
+                                    Duration::ZERO,
+                                );
+                            }
+                            anyhow::Ok(completed)
+                        }
+                        .await;
+                        record = match resumed {
+                            Ok(completed) => completed,
+                            // Refused like a failed start, so a failed send releases the request
+                            // and the pending intent is tried again on the next poll.
+                            Err(e) => {
+                                warn!("failed to resume reverse swap {}: {e}", record.swap_id);
+                                return reject(
+                                    &ctx.transport,
+                                    sender,
+                                    None,
+                                    Some(req.quote_id),
+                                    &format!("swap start failed: {e}"),
+                                )
+                                .await;
+                            }
+                        };
                     }
                     let accept = record
                         .swap_accept
                         .ok_or_else(|| anyhow!("persisted creation is missing its acceptance"))?;
-                    return ctx
-                        .transport
-                        .send(sender, &SwapMessage::SwapAccept(accept))
-                        .await
-                        .map_err(Into::into);
+                    return respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1547,15 +1720,23 @@ async fn handle_message(
                 SwapDirection::Submarine => start_submarine(ctx, sender, req).await,
             };
             if let Err(e) = result {
+                // The swap started and only its acceptance was lost. Refusing it now would
+                // contradict the persisted record the redelivered request replays.
+                if is_reply_not_sent(&e) {
+                    return Err(e);
+                }
                 warn!("failed to start {direction:?} swap: {e}");
-                reject(
+                // A failed send is retried. The retry cannot start a second swap: the quote is
+                // single-use and a persisted start replays. At worst the client is refused
+                // with "unknown quote", which still beats waiting out its timeout.
+                return reject(
                     &ctx.transport,
                     sender,
                     None,
                     Some(quote_id),
                     &format!("swap start failed: {e}"),
                 )
-                .await?;
+                .await;
             }
         }
 
@@ -1574,6 +1755,39 @@ fn ensure_reverse_hash_available(store: &dyn SwapStore, hash: &PaymentHash) -> R
         }
     }
     Ok(())
+}
+
+/// Recover a persisted admission whose invoice creation never finished, once.
+///
+/// Returns the record as it now stands, and a reservation only for the caller that completed the
+/// admission -- that caller, and only that caller, owns the swap and starts its driver. A caller
+/// that finds the intent already completed gets the finished record to reply with and nothing to
+/// drive, which is what a replay of an admitted swap does anyway.
+///
+/// The record is re-read under the lock rather than trusted from the caller: the request that
+/// held the lock before may have completed this very intent, and the copy in hand still says
+/// pending. That stale copy is the whole race. See [`AdmissionLocks`].
+async fn recover_pending_admission<Reserve, Reserved>(
+    admissions: &AdmissionLocks,
+    store: &dyn SwapStore,
+    ln: &dyn LightningBackend,
+    swap_id: Uuid,
+    reserve: Reserve,
+) -> Result<(SwapRecord, Option<risk::ReservationGuard>)>
+where
+    Reserve: FnOnce(SwapRecord) -> Reserved,
+    Reserved: std::future::Future<Output = Result<risk::ReservationGuard>>,
+{
+    let _admission = admissions.lock(swap_id).await;
+    let record = store
+        .get(swap_id)?
+        .ok_or_else(|| anyhow!("the persisted admission is no longer in the store"))?;
+    if record.pending_hold_invoice.is_none() {
+        return Ok((record, None));
+    }
+    let reservation = reserve(record).await?;
+    let completed = complete_invoice_intent(ln, store, swap_id, true).await?;
+    Ok((completed, Some(reservation)))
 }
 
 /// Finish only the invoice associated with a previously persisted admission.
@@ -1972,17 +2186,13 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         .clone()
         .ok_or_else(|| anyhow!("completed reverse swap has no acceptance"))?;
 
-    if let Err(e) = ctx
-        .transport
-        .send(sender, &SwapMessage::SwapAccept(accept))
-        .await
-    {
-        warn!("could not send acceptance for {swap_id}: {e}; keeping its persisted driver active for recovery");
-    }
+    let sent = respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
     info!("Reverse swap {swap_id} started (timeout height {timeout_height})");
 
+    // The driver runs whether or not the acceptance arrived. A failed send releases the request,
+    // and its redelivery replays the persisted acceptance without starting another driver.
     spawn_reverse_driver(ctx, swap, record, Some(reservation), Duration::ZERO);
-    Ok(())
+    sent
 }
 
 /// Spawn the per-swap reverse driver task (shared by fresh starts and restart-resume), persisting
@@ -2182,19 +2392,14 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         return Err(anyhow!("cannot start submarine swap {swap_id}: {e}"));
     }
 
-    if let Err(e) = ctx
-        .transport
-        .send(sender, &SwapMessage::SwapAccept(accept))
-        .await
-    {
-        warn!("could not send acceptance for {swap_id}: {e}; keeping its persisted driver active for recovery");
-    }
+    let sent = respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
     info!(
         "Submarine swap {swap_id} started (fund {} to the HTLC)",
         swap.onchain_amount_sat
     );
+    // As in the reverse direction, a failed send is answered by replay on redelivery.
     spawn_submarine_driver(ctx, swap, record, Some(reservation), Duration::ZERO);
-    Ok(())
+    sent
 }
 
 /// Spawn the per-swap submarine driver task (shared by fresh starts and restart-resume).
@@ -2527,12 +2732,14 @@ async fn resume_swaps(ctx: &ExecCtx) {
         .filter(|record| record.pending_hold_invoice.is_none())
         .cloned()
         .collect();
-    let mut guards: std::collections::HashMap<Uuid, risk::ReservationGuard> = ctx
+    // Keyed off each guard rather than zipped with the records it was built from: `restore` skips
+    // any record it cannot reserve, and a zip would then hand every later swap the guard of a
+    // different one.
+    let mut guards: HashMap<Uuid, risk::ReservationGuard> = ctx
         .risk
         .restore(&accepted_records)
         .into_iter()
-        .zip(accepted_records.iter().map(|r| r.swap_id))
-        .map(|(g, id)| (id, g))
+        .map(|guard| (guard.swap_id(), guard))
         .collect();
     info!("Resuming {} persisted swap(s)", records.len());
     let needing_recovery = records.iter().filter(|r| needs_recovery(r)).count();
@@ -2651,7 +2858,9 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: Sh
                 while let Some(event) = server.next_event().await {
                     match event {
                         pubky_transport::p2p::RendezvousEvent::Peer(pubky) => {
-                            ctx.transport.add_known_peer(pubky)
+                            if ctx.transport.register_peer(&pubky, false).is_err() {
+                                warn!("could not persist rendezvous peer; registration will need retry");
+                            }
                         }
                         pubky_transport::p2p::RendezvousEvent::Direct(request) => {
                             let ctx = ctx.clone();
@@ -2765,6 +2974,9 @@ fn maybe_spawn_iroh_rendezvous(_ctx: &ExecCtx, config: &ProviderConfig, _offer: 
 /// This keeps the poll set and the persistent follow graph bounded. A returning client must be
 /// re-discovered (e.g. via DHT rendezvous) to be polled again.
 async fn evict_peer_if_idle(ctx: &ExecCtx, peer: &str) {
+    if ctx.transport.has_pending_messages(peer) {
+        return;
+    }
     let still_active = match ctx.store.load_active() {
         Ok(recs) => recs.iter().any(|r| r.peer == peer),
         // On a store error, keep the peer rather than risk evicting one mid-swap.
@@ -2810,15 +3022,24 @@ async fn notify_terminal_peer(
     swap_id: Uuid,
     state: SwapState,
 ) {
-    if progress.snapshot().peer_account.is_some() {
+    let record = progress.snapshot();
+    if record.peer_account.is_some() {
         return;
+    }
+    match delivery::has_dm_history(&ctx.transport, &record) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            warn!("final swap notification remains pending until message history can be read");
+            return;
+        }
     }
     send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
     evict_peer_if_idle(ctx, peer).await;
 }
 
 async fn send_final_status(
-    transport: &ReplyTransport,
+    transport: &Transport,
     peer: &str,
     swap_id: Uuid,
     result: Result<SwapState>,
@@ -2830,8 +3051,9 @@ async fn send_final_status(
         state,
         reference: None,
     };
+    let message = SwapMessage::SwapStatusUpdate(update);
     if let Err(e) = transport
-        .send(peer, &SwapMessage::SwapStatusUpdate(update))
+        .send_with_scope(peer, &message.delivery_scope(), &message)
         .await
     {
         warn!("failed to send final status for swap {swap_id}: {e}");
@@ -2871,19 +3093,51 @@ async fn reject_coded(
     reason: &str,
     code: Option<&str>,
 ) -> Result<()> {
-    transport
-        .send(
-            sender,
-            &SwapMessage::Reject(Reject {
-                code: code.map(str::to_string),
-                request_id,
-                swap_id,
-                quote_id,
-                reason: reason.to_string(),
-            }),
-        )
-        .await?;
-    Ok(())
+    respond(
+        transport,
+        sender,
+        &SwapMessage::Reject(Reject {
+            code: code.map(str::to_string),
+            request_id,
+            swap_id,
+            quote_id,
+            reason: reason.to_string(),
+        }),
+    )
+    .await
+}
+
+/// A reply to a request that the messenger failed to deliver.
+///
+/// Every reply sent through [`respond`] answers a request that is safe to handle again: offers,
+/// quotes and refusals are recomputed, and an admitted swap is replayed from the store. So the
+/// request is released for another poll instead of leaving the client to time out.
+#[derive(Debug)]
+struct ReplyNotSent(pubky_transport::TransportError);
+
+impl std::fmt::Display for ReplyNotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reply not sent: {}", self.0)
+    }
+}
+
+impl std::error::Error for ReplyNotSent {}
+
+async fn respond(transport: &ReplyTransport, peer: &str, message: &SwapMessage) -> Result<()> {
+    transport.send(peer, message).await.map_err(reply_error)
+}
+
+/// Only a messenger failure can pass; a message that did not serialize or a bad key will fail
+/// the same way every time.
+fn reply_error(error: pubky_transport::TransportError) -> anyhow::Error {
+    match error {
+        pubky_transport::TransportError::Messenger(_) => ReplyNotSent(error).into(),
+        other => other.into(),
+    }
+}
+
+fn is_reply_not_sent(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<ReplyNotSent>().is_some()
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {
@@ -2918,6 +3172,23 @@ fn variant_name(msg: &SwapMessage) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+
+    /// A request whose reply the homeserver refused goes back for another poll; one that would
+    /// fail the same way again does not.
+    #[test]
+    fn only_a_failed_delivery_releases_the_request() {
+        use pubky_transport::TransportError;
+
+        let refused =
+            super::reply_error(TransportError::Messenger("send dm: 503".into())).context("quote");
+        assert!(super::is_reply_not_sent(&refused));
+
+        let malformed = super::reply_error(TransportError::InvalidPubkey("bad".into()));
+        assert!(!super::is_reply_not_sent(&malformed));
+        assert!(!super::is_reply_not_sent(&anyhow::anyhow!(
+            "unknown or expired quote"
+        )));
+    }
 
     /// One momentary Electrum failure used to delete a funded swap's record, because the driver
     /// called `store.remove` on every return including errors and every `?` in a driver
@@ -3038,12 +3309,13 @@ mod tests {
     }
 
     /// One quote per direction, issued to peer A.
-    async fn quote_map(direction: SwapDirection) -> (Mutex<HashMap<Uuid, IssuedQuote>>, Uuid) {
+    async fn quote_map(direction: SwapDirection) -> (Mutex<QuoteBook>, Uuid) {
         let id = Uuid::new_v4();
-        let quotes = Mutex::new(HashMap::new());
+        let quotes = Mutex::new(QuoteBook::default());
         quotes.lock().await.insert(
             id,
             issued("peer-a", direction, now_unix().saturating_add(300)),
+            now_unix(),
         );
         (quotes, id)
     }
@@ -3061,7 +3333,7 @@ mod tests {
                 "{direction:?}: another pubky must not redeem peer A's quote"
             );
             assert_eq!(
-                quotes.lock().await.len(),
+                quotes.lock().await.quotes.len(),
                 1,
                 "{direction:?}: the rejected attempt must not consume the quote"
             );
@@ -3073,7 +3345,7 @@ mod tests {
                 });
             assert_eq!(mine.peer, "peer-a");
             assert!(
-                quotes.lock().await.is_empty(),
+                quotes.lock().await.quotes.is_empty(),
                 "{direction:?}: redeeming is single-use"
             );
             assert!(
@@ -3095,7 +3367,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(quotes.lock().await.len(), 1);
+        assert_eq!(quotes.lock().await.quotes.len(), 1);
         assert!(
             take_valid_quote(&quotes, id, "peer-a", SwapDirection::Reverse)
                 .await
@@ -3105,12 +3377,12 @@ mod tests {
 
     #[tokio::test]
     async fn expired_quotes_are_rejected_and_pruned() {
-        let quotes = Mutex::new(HashMap::new());
+        let quotes = Mutex::new(QuoteBook::default());
         let (mine, stale) = (Uuid::new_v4(), Uuid::new_v4());
         {
-            let mut map = quotes.lock().await;
-            map.insert(mine, issued("peer-a", SwapDirection::Reverse, 1));
-            map.insert(stale, issued("peer-b", SwapDirection::Reverse, 1));
+            let mut book = quotes.lock().await;
+            book.insert(mine, issued("peer-a", SwapDirection::Reverse, 1), 0);
+            book.insert(stale, issued("peer-b", SwapDirection::Reverse, 1), 0);
         }
         assert!(
             take_valid_quote(&quotes, mine, "peer-a", SwapDirection::Reverse)
@@ -3119,9 +3391,86 @@ mod tests {
             "a quote past its expiry is not redeemable by its owner either"
         );
         assert!(
-            quotes.lock().await.is_empty(),
+            quotes.lock().await.quotes.is_empty(),
             "every expired quote goes, not just the one asked for"
         );
+    }
+
+    /// A full cache used to refuse every new quote with `provider busy`, so fresh keys asking
+    /// fast enough locked every other client out for as long as they kept asking.
+    #[tokio::test]
+    async fn a_quote_flood_from_many_keys_does_not_lock_out_another_client() {
+        let now = now_unix();
+        let expires = now.saturating_add(300);
+        let flood = |book: &mut QuoteBook, from: usize, count: usize| {
+            for i in from..from + count {
+                let key = format!("throwaway-{i}");
+                book.insert(
+                    Uuid::new_v4(),
+                    issued(&key, SwapDirection::Reverse, expires),
+                    now,
+                );
+            }
+        };
+        let quotes = Mutex::new(QuoteBook::default());
+
+        flood(&mut *quotes.lock().await, 0, 2 * MAX_TRACKED_QUOTES);
+        let mine = Uuid::new_v4();
+        {
+            let mut book = quotes.lock().await;
+            book.insert(mine, issued("honest", SwapDirection::Reverse, expires), now);
+            assert!(book.quotes.contains_key(&mine), "a full cache still issues");
+            // The flood carries on while the honest client prepares its swap request.
+            flood(&mut book, 2 * MAX_TRACKED_QUOTES, MAX_TRACKED_QUOTES - 1);
+            assert_eq!(book.quotes.len(), MAX_TRACKED_QUOTES);
+            assert!(book.order.len() <= 2 * MAX_TRACKED_QUOTES);
+        }
+        take_valid_quote(&quotes, mine, "honest", SwapDirection::Reverse)
+            .await
+            .expect("the honest client's quote survives the flood and is redeemable");
+    }
+
+    /// Eviction follows issuance order, so a quote goes only after a full cache's worth of newer
+    /// ones, however many have been redeemed in between.
+    #[test]
+    fn a_full_quote_cache_evicts_the_oldest_live_quote() {
+        let now = now_unix();
+        let expires = now.saturating_add(300);
+        let mut book = QuoteBook::default();
+        let ids: Vec<Uuid> = (0..MAX_TRACKED_QUOTES).map(|_| Uuid::new_v4()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            book.insert(
+                *id,
+                issued(&format!("peer-{i}"), SwapDirection::Reverse, expires),
+                now,
+            );
+        }
+        // Redeemed quotes leave their ids at the front of the order, and skipping one must not
+        // count as an eviction.
+        book.quotes.remove(&ids[0]);
+        book.quotes.remove(&ids[1]);
+        book.insert(
+            Uuid::new_v4(),
+            issued("x", SwapDirection::Reverse, expires),
+            now,
+        );
+        book.insert(
+            Uuid::new_v4(),
+            issued("y", SwapDirection::Reverse, expires),
+            now,
+        );
+        assert!(
+            book.quotes.contains_key(&ids[2]),
+            "freed slots are reused first"
+        );
+        book.insert(
+            Uuid::new_v4(),
+            issued("z", SwapDirection::Reverse, expires),
+            now,
+        );
+        assert!(!book.quotes.contains_key(&ids[2]));
+        assert!(book.quotes.contains_key(&ids[3]));
+        assert_eq!(book.quotes.len(), MAX_TRACKED_QUOTES);
     }
 
     /// `client_pkarr` is self-declared. Believing it over the sender the message authenticated as

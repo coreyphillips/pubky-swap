@@ -88,3 +88,25 @@ The provider fee is `base_fee_sat + floor(amount_sat * fee_ppm / 1_000_000) + on
 An adapter accepting an inclusive reverse invoice amount must invert that integer calculation
 and validate the resulting fresh quote. It must not silently reinterpret the invoice amount as
 the on-chain amount.
+
+## Delivery lifecycle for application adapters
+
+Use persistent `DirectRpcClient` or `SessionRpcClient` connections for interactive requests.
+Keep the same request ID and exact creation request across reconnects and transport fallback.
+For DMs, initialize `with_receive_journal` and `with_outbox`, send using
+`SwapMessage::delivery_scope()`, and carry `Inbound.receipt` until the application has persisted
+the corresponding outcome. `enqueue_with_scope` reserves a stable encrypted publication before
+network I/O; a bounded application worker calls `process_outbox` to publish or clean it later.
+
+The transport resource ID is separate from the business operation ID. Exact PUT replay avoids
+duplicate files, while the authenticated owner and saved creation request prevent a second
+contract. Persist complete acceptance data, validate the contract and invoice independently,
+and save execution readiness before funding or paying. Do not allow generic retry limits,
+request cancellation or cleanup to discard funded-swap recovery records.
+
+Providers advertising `dm-retention-v1` retain read-only traffic for ten minutes and completed
+creation/final traffic for a 24-hour recovery window. The status API retains acceptance and
+outcome information under the separate 30-day local record policy. Call `complete_scope` only
+after a safe terminal transition is durable, preserve ambiguous failures, and let each owner
+delete its own exact resources. See [the delivery contract](transports.md#message-retention-contract)
+for limits, crash ordering and recovery responsibilities.

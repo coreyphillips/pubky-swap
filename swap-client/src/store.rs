@@ -17,6 +17,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use std::path::Path;
+use swap_common::messages::{Quote, SwapAccept, SwapRequest};
 use swap_common::store::{JsonFileSwapStore, SwapRecord, SwapRole, SwapStore};
 use swap_common::{NetworkSpec, SwapDirection, SwapState};
 use uuid::Uuid;
@@ -53,7 +54,14 @@ pub struct NewClientSwap {
 /// a path to funds moving. A record written after the acceptance would leave a window where the
 /// key exists only in memory.
 pub fn record_intent(store: &dyn SwapStore, swap: &NewClientSwap) -> Result<()> {
-    let rec = SwapRecord {
+    let rec = client_record(swap);
+    store
+        .put(&rec)
+        .with_context(|| format!("persist the swap {} before sending it", swap.swap_id))
+}
+
+fn client_record(swap: &NewClientSwap) -> SwapRecord {
+    SwapRecord {
         swap_id: swap.swap_id,
         role: SwapRole::Client,
         direction: swap.direction,
@@ -68,28 +76,122 @@ pub fn record_intent(store: &dyn SwapStore, swap: &NewClientSwap) -> Result<()> 
         fee_rate_sat_vb: swap.fee_rate_sat_vb,
         state: SwapState::Created,
         ..SwapRecord::new_progress()
-    };
-    store
-        .put(&rec)
-        .with_context(|| format!("persist the swap {} before sending it", swap.swap_id))
+    }
 }
 
-/// Fill in what the counterparty's acceptance settled, before any funds move.
-#[allow(clippy::too_many_arguments)]
+/// Save the keys, agreed terms and exact creation request in one durable record.
+pub fn record_negotiation_intent(
+    store: &dyn SwapStore,
+    swap: &NewClientSwap,
+    quote: &Quote,
+    request: &SwapRequest,
+) -> Result<()> {
+    if request.quote_id != quote.quote_id
+        || request.direction != swap.direction
+        || request.payment_hash_hex != hex::encode(swap.payment_hash)
+        || quote.total_sat != swap.quote_total_sat
+    {
+        return Err(anyhow!(
+            "creation intent does not match the saved swap terms"
+        ));
+    }
+    let mut rec = client_record(swap);
+    rec.swap_request = Some(request.clone());
+    rec.client_quote = Some(quote.clone());
+    store
+        .put(&rec)
+        .context("persist complete negotiation intent before publication")
+}
+
+pub fn record_creation_started(
+    store: &dyn SwapStore,
+    swap_id: Uuid,
+    tip: Option<u32>,
+) -> Result<()> {
+    let mut rec = load(store, swap_id)?;
+    if rec.client_creation_started {
+        return Ok(());
+    }
+    rec.client_creation_tip = tip;
+    rec.client_creation_started = true;
+    store
+        .put(&rec)
+        .context("persist creation attempt before publication")
+}
+
+/// Save the complete correlated reply before acknowledging its inbox receipt.
+/// Validation and destination selection are separate from durable receipt acceptance.
+pub fn record_creation_reply(
+    store: &dyn SwapStore,
+    swap_id: Uuid,
+    accept: &SwapAccept,
+) -> Result<()> {
+    let mut rec = load(store, swap_id)?;
+    if rec
+        .swap_request
+        .as_ref()
+        .is_none_or(|request| request.quote_id != accept.quote_id)
+        || rec.direction != accept.direction
+    {
+        return Err(anyhow!("acceptance does not match the persisted request"));
+    }
+    if rec
+        .swap_accept
+        .as_ref()
+        .is_some_and(|saved| saved != accept)
+    {
+        return Err(anyhow!("provider changed the persisted acceptance"));
+    }
+    if rec.swap_accept.as_ref() == Some(accept) {
+        return Ok(());
+    }
+    if rec.direction == SwapDirection::Reverse {
+        rec.invoice = accept
+            .invoice
+            .clone()
+            .ok_or_else(|| anyhow!("reverse acceptance lacks invoice"))?;
+    }
+    rec.swap_accept = Some(accept.clone());
+    store
+        .put(&rec)
+        .context("persist the complete creation reply before acknowledgment")
+}
+
+/// Mark the validated contract ready for execution, before any funds move.
 pub fn record_accept(
     store: &dyn SwapStore,
     swap_id: Uuid,
-    htlc_script_hex: String,
-    timeout_height: u32,
-    onchain_amount_sat: u64,
+    accept: &SwapAccept,
     dest_spk_hex: String,
 ) -> Result<()> {
+    record_creation_reply(store, swap_id, accept)?;
     let mut rec = load(store, swap_id)?;
-    rec.htlc_script_hex = htlc_script_hex;
-    rec.timeout_height = timeout_height;
-    rec.onchain_amount_sat = onchain_amount_sat;
+    rec.htlc_script_hex = accept.htlc_script_hex.clone();
+    rec.timeout_height = accept.timeout_block_height;
+    rec.onchain_amount_sat = accept.onchain_amount_sat;
     rec.dest_spk_hex = Some(dest_spk_hex);
-    store.put(&rec).context("persist the accepted swap")
+    rec.client_execution_ready = true;
+    store
+        .put(&rec)
+        .context("persist validated acceptance before moving funds")
+}
+
+/// New negotiation records cannot enter execution until all acceptance checks have passed.
+pub fn execution_ready(record: &SwapRecord) -> bool {
+    record.swap_request.is_none() || record.client_execution_ready
+}
+
+/// Persist possible payment submission before opening the Lightning payment RPC.
+pub fn record_payment_started(store: &dyn SwapStore, swap_id: Uuid) -> Result<()> {
+    let mut record = load(store, swap_id)?;
+    if record.invoice_pay_started_at_unix.is_some() {
+        return Ok(());
+    }
+    record.invoice_pay_started_at_unix = Some(crate::now_unix());
+    record.state = SwapState::InvoicePending;
+    store
+        .put(&record)
+        .context("persist invoice payment intent before submission")
 }
 
 /// Note that a funding transaction is about to be broadcast.
@@ -133,7 +235,16 @@ pub fn record_our_spend(store: &dyn SwapStore, swap_id: Uuid, txid: bitcoin::Txi
 pub fn record_terminal(store: &dyn SwapStore, swap_id: Uuid, state: SwapState) -> Result<()> {
     let mut rec = load(store, swap_id)?;
     rec.state = state;
+    rec.updated_at_unix = crate::now_unix();
     store.mark_terminal(&rec).context("record the outcome")
+}
+
+/// Only completed outcomes and uncommitted expiry may retire transport resources.
+pub(crate) fn cleanup_deadline(record: &SwapRecord) -> Option<u64> {
+    let eligible = matches!(record.state, SwapState::Claimed | SwapState::Refunded)
+        || (record.state == SwapState::Expired && !record.funds_at_risk());
+    (record.role == SwapRole::Client && eligible && record.updated_at_unix != 0)
+        .then(|| record.updated_at_unix.saturating_add(24 * 60 * 60))
 }
 
 fn load(store: &dyn SwapStore, swap_id: Uuid) -> Result<SwapRecord> {

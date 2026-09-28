@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
         &identity.passphrase,
     )?;
 
-    // DMs: the first request also signs in, skips the conversation history and rings the doorbell.
+    // DMs: the first request establishes storage authentication and rings the doorbell.
     let dm = DmChannel::new(
         pubky_transport::Transport::unsigned(secret)?,
         &provider,

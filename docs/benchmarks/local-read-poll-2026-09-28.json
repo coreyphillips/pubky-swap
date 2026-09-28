@@ -1,0 +1,404 @@
+[
+  {
+    "benchmark": "local_homeserver_read_poll",
+    "elapsed_ms": 9.40525,
+    "fixture_body": "JSON object with 128-byte data field",
+    "history": 0,
+    "history_layout": "incoming messages in one conversation",
+    "phase": "fixture_seed",
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 0.0,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    }
+  },
+  {
+    "acknowledged_history": 0,
+    "benchmark": "local_homeserver_read_poll",
+    "fixture_body": "JSON object with 128-byte data field",
+    "history_layout": "incoming messages in one conversation",
+    "p50_ms": 5.460875,
+    "p95_ms": 7.948416,
+    "phase": "full_history",
+    "receive_journal_bytes": 0,
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 6,
+        "request_body_bytes": 0,
+        "response_body_bytes": 114
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 0.034291,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    },
+    "sample_ms": [
+      5.138041,
+      7.948416,
+      5.460875
+    ],
+    "samples": 3
+  },
+  {
+    "acknowledged_history": 0,
+    "benchmark": "local_homeserver_read_poll",
+    "fixture_body": "JSON object with 128-byte data field",
+    "history_layout": "incoming messages in one conversation",
+    "p50_ms": 3.558084,
+    "p95_ms": 4.345375000000001,
+    "phase": "incremental_acknowledged",
+    "receive_journal_bytes": 252,
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 14,
+        "request_body_bytes": 0,
+        "response_body_bytes": 266
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 0.035872,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    },
+    "sample_ms": [
+      2.2422079999999998,
+      3.68875,
+      4.345375000000001,
+      1.910625,
+      3.558084,
+      3.709459,
+      2.505834
+    ],
+    "samples": 7
+  },
+  {
+    "benchmark": "local_homeserver_read_poll",
+    "elapsed_ms": 4209.321959000001,
+    "fixture_body": "JSON object with 128-byte data field",
+    "history": 200,
+    "history_layout": "incoming messages in one conversation",
+    "phase": "fixture_seed",
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "put": {
+        "attempts": 200,
+        "request_body_bytes": 286041,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 2.852,
+      "retries": 0,
+      "session": {
+        "attempts": 1,
+        "request_body_bytes": 140,
+        "response_body_bytes": 69
+      },
+      "timeouts": 0
+    }
+  },
+  {
+    "acknowledged_history": 200,
+    "benchmark": "local_homeserver_read_poll",
+    "fixture_body": "JSON object with 128-byte data field",
+    "history_layout": "incoming messages in one conversation",
+    "p50_ms": 1346.890083,
+    "p95_ms": 1441.267708,
+    "phase": "full_history",
+    "receive_journal_bytes": 0,
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 600,
+        "request_body_bytes": 0,
+        "response_body_bytes": 858123
+      },
+      "list": {
+        "attempts": 9,
+        "request_body_bytes": 0,
+        "response_body_bytes": 113454
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 425713.018159,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    },
+    "sample_ms": [
+      1441.267708,
+      1282.687208,
+      1346.890083
+    ],
+    "samples": 3
+  },
+  {
+    "acknowledged_history": 200,
+    "benchmark": "local_homeserver_read_poll",
+    "fixture_body": "JSON object with 128-byte data field",
+    "history_layout": "incoming messages in one conversation",
+    "p50_ms": 14.034041,
+    "p95_ms": 36.656792,
+    "phase": "incremental_acknowledged",
+    "receive_journal_bytes": 39508,
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 21,
+        "request_body_bytes": 0,
+        "response_body_bytes": 264726
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 3.540417,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    },
+    "sample_ms": [
+      36.656792,
+      14.975875,
+      14.034041,
+      10.17825,
+      11.376459,
+      16.534042,
+      11.389750000000001
+    ],
+    "samples": 7
+  },
+  {
+    "benchmark": "local_homeserver_read_poll",
+    "elapsed_ms": 186243.38795899999,
+    "fixture_body": "JSON object with 128-byte data field",
+    "history": 10000,
+    "history_layout": "incoming messages in one conversation",
+    "phase": "fixture_seed",
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "put": {
+        "attempts": 10003,
+        "request_body_bytes": 14354697,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 99.398746,
+      "retries": 3,
+      "session": {
+        "attempts": 1,
+        "request_body_bytes": 140,
+        "response_body_bytes": 69
+      },
+      "timeouts": 3
+    }
+  },
+  {
+    "acknowledged_history": 10000,
+    "benchmark": "local_homeserver_read_poll",
+    "fixture_body": "JSON object with 128-byte data field",
+    "history_layout": "incoming messages in one conversation",
+    "p50_ms": 8252.010083,
+    "p95_ms": 13797.402791,
+    "phase": "full_history",
+    "receive_journal_bytes": 0,
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 30000,
+        "request_body_bytes": 0,
+        "response_body_bytes": 43051185
+      },
+      "list": {
+        "attempts": 36,
+        "request_body_bytes": 0,
+        "response_body_bytes": 5670027
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 133226778.38675702,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    },
+    "sample_ms": [
+      8252.010083,
+      7744.590999999999,
+      13797.402791
+    ],
+    "samples": 3
+  },
+  {
+    "acknowledged_history": 10000,
+    "benchmark": "local_homeserver_read_poll",
+    "fixture_body": "JSON object with 128-byte data field",
+    "history_layout": "incoming messages in one conversation",
+    "p50_ms": 290.90500000000003,
+    "p95_ms": 609.093083,
+    "phase": "incremental_acknowledged",
+    "receive_journal_bytes": 1960308,
+    "request_totals": {
+      "delete": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "get": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "list": {
+        "attempts": 84,
+        "request_body_bytes": 0,
+        "response_body_bytes": 13230063
+      },
+      "put": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "queue_wait_ms": 0.535917,
+      "retries": 0,
+      "session": {
+        "attempts": 0,
+        "request_body_bytes": 0,
+        "response_body_bytes": 0
+      },
+      "timeouts": 0
+    },
+    "sample_ms": [
+      294.414416,
+      609.093083,
+      279.860917,
+      237.2785,
+      290.90500000000003,
+      371.793333,
+      171.34
+    ],
+    "samples": 7
+  }
+]

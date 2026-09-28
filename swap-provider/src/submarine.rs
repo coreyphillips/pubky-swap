@@ -362,7 +362,7 @@ pub async fn drive_submarine_swap(
                     "invoice payment failed: {reason}"
                 )));
             }
-            PaymentStatus::Unknown => {
+            PaymentStatus::Unknown | PaymentStatus::NotFound => {
                 if resume.funding.is_some() && already_attempted_payment {
                     // We recorded an intent to pay and the node has no record of it. Do not assume
                     // either way: keep polling. Paying again could pay twice; giving up would

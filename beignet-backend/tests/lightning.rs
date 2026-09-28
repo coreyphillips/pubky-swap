@@ -415,6 +415,7 @@ async fn payment_status_maps_the_node_answer() {
         ("COMPLETED", "succeeded"),
         ("PENDING", "inflight"),
         ("FAILED", "failed"),
+        ("UNRECOGNIZED", "unknown"),
     ] {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -437,15 +438,15 @@ async fn payment_status_maps_the_node_answer() {
             (PaymentStatus::Succeeded(_), "succeeded")
                 | (PaymentStatus::InFlight, "inflight")
                 | (PaymentStatus::Failed(_), "failed")
+                | (PaymentStatus::Unknown, "unknown")
         );
         assert!(matched, "{reported} mapped to {status:?}");
     }
 }
 
-/// A hash the node has never seen is `Unknown`, not an error: the caller uses that to decide
-/// whether it is safe to pay.
+/// An authoritative missing hash is distinct from an ambiguous or unreadable payment state.
 #[tokio::test]
-async fn an_unknown_payment_hash_is_unknown_not_an_error() {
+async fn an_absent_payment_hash_is_distinct_from_unknown_status() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/payment"))
@@ -458,7 +459,7 @@ async fn an_unknown_payment_hash_is_unknown_not_an_error() {
             .payment_status(hash_bytes())
             .await
             .unwrap(),
-        PaymentStatus::Unknown
+        PaymentStatus::NotFound
     ));
 }
 
