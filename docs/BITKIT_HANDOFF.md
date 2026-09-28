@@ -2,7 +2,7 @@
 
 Status: upstream implementation handoff, based on code and downstream inspection on 2026-09-28. Use the exact revisions in the implementation PR and lockfile; run the downstream checks before opening dependent PRs. The wrapper, core and Android worktrees already contain unrelated uncommitted work. Preserve that work and coordinate commits with their owners.
 
-The messenger prepared-message change is merged in [PR 19](https://github.com/coreyphillips/pubky-messenger/pull/19), following cleanup [PR 18](https://github.com/coreyphillips/pubky-messenger/pull/18). The swap lockfile pins messenger `4fff0ce2183f7273c0418801c262ed291a0a145a` (package 0.4.0), with no local override. The swap implementation revision and its validation are recorded below when the integration PR lands.
+The messenger prepared-message change is merged in [PR 19](https://github.com/coreyphillips/pubky-messenger/pull/19), following cleanup [PR 18](https://github.com/coreyphillips/pubky-messenger/pull/18). The swap lockfile pins messenger `4fff0ce2183f7273c0418801c262ed291a0a145a` (package 0.4.0), with no local override. Pin every pubky-swap crate to implementation revision `30c6a0ab0d553094644fd258708c04b2fa482456`. The following documentation commit does not change its code. Merge and CI status are linked from [the upstream tracker](https://github.com/coreyphillips/pubky-swap/issues/85).
 
 The dependency order is pubky-messenger, pubky-swap, pubky-swap-boltz, bitkit-core, then bitkit-android. A dependency update alone will not enable the new delivery lifecycle in all callers. The wrapper currently makes individual rendezvous and exchange calls, and core has its own reconciliation loop.
 
@@ -50,6 +50,23 @@ The receive journal format is version 2 and the outbox format is version 1. Corr
 or unsupported journals fail visibly. Preserve pending data when designing migration. The
 receive journal contains decrypted pending payloads, while the outbox stores signed encrypted
 resources. Both belong in protected storage and backup decisions.
+
+## Validated upstream revision
+
+Use this shared dependency source for `pubky-transport`, `swap-common`, `swap-config` and any
+other workspace crate consumed downstream:
+
+```toml
+pubky-transport = { git = "https://github.com/coreyphillips/pubky-swap", rev = "30c6a0ab0d553094644fd258708c04b2fa482456" }
+```
+
+Preserve each caller's required features. The implementation was checked with locked workspace
+tests and doctests, full-feature client tests, strict all-target client/provider Clippy, iroh
+transport/provider tests, targeted journal/outbox tests and local homeserver lifecycle tests.
+The local read/poll fixture and cold/warm iroh measurements are recorded in
+[transport-performance.md](transport-performance.md). CI and the funded regtest must pass on
+the final PR head before merge; use the tracker links to verify that result before downstream
+integration. Local fixtures alone do not demonstrate complete funded swap or mobile behavior.
 
 ## 1. Update pubky-swap-boltz
 
