@@ -38,6 +38,8 @@ pub struct MockChain {
     broadcasts: Mutex<Vec<Transaction>>,
     /// When set, every broadcast after the first fails, to exercise the CPFP fallback.
     reject_replacements: Mutex<bool>,
+    /// Fees by txid. A transaction not listed has an unknown fee.
+    fees: Mutex<HashMap<Txid, u64>>,
     /// Consumed one entry per `tip_height` call, the last repeating. Empty means `tip` is fixed.
     ///
     /// Blocks arrive while a driver runs, and some of what a driver decides depends on where the
@@ -116,6 +118,11 @@ impl MockChain {
 
     pub fn rejecting_replacements(self) -> Self {
         *self.reject_replacements.lock().unwrap() = true;
+        self
+    }
+
+    pub fn with_transaction_fee(self, txid: Txid, fee_sat: u64) -> Self {
+        self.fees.lock().unwrap().insert(txid, fee_sat);
         self
     }
 
@@ -257,6 +264,10 @@ impl ChainWatcher for MockChain {
         }
         Ok(self.block_hashes.lock().unwrap().get(&height).copied())
     }
+
+    fn transaction_fee_sat(&self, txid: &Txid) -> Result<Option<u64>> {
+        Ok(self.fees.lock().unwrap().get(txid).copied())
+    }
 }
 
 /// A chain that answers every call with a transient failure until it is told to recover.
@@ -357,6 +368,10 @@ impl<C: ChainWatcher> ChainWatcher for FlakyChain<C> {
     fn block_hash_at(&self, height: u32) -> Result<Option<BlockHash>> {
         self.gate()?;
         self.inner.block_hash_at(height)
+    }
+    fn transaction_fee_sat(&self, txid: &Txid) -> Result<Option<u64>> {
+        self.gate()?;
+        self.inner.transaction_fee_sat(txid)
     }
 }
 

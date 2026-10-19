@@ -120,6 +120,10 @@ pub struct SwapRecord {
     /// actually spent is how good the estimate was.
     #[serde(default)]
     pub onchain_fee_sat: u64,
+    /// What our funding transaction actually paid in miner fees, measured from the chain once the
+    /// swap finished. Only the side that funds the HTLC has one, and none is measured until then.
+    #[serde(default)]
+    pub funding_fee_sat: Option<u64>,
 
     // --- progress / idempotency ---
     pub required_confirmations: u32,
@@ -341,6 +345,7 @@ impl SwapRecord {
             max_routing_fee_msat: 0,
             service_fee_sat: 0,
             onchain_fee_sat: 0,
+            funding_fee_sat: None,
             required_confirmations: 0,
             funding_txid_hex: None,
             funding_vout: None,

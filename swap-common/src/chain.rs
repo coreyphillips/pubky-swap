@@ -141,6 +141,13 @@ pub trait ChainWatcher: Send + Sync {
     /// Returns fewer than `count` entries when the range runs past the tip, and never pads.
     fn block_hashes_from(&self, start_height: u32, count: u16) -> Result<Vec<BlockHash>>;
 
+    /// The miner fee transaction `txid` paid: what its inputs spent less what its outputs pay.
+    /// `None` when the watcher cannot say.
+    ///
+    /// No swap decision reads this. It is what an operator is shown a swap actually cost, beside
+    /// the estimate it was priced at.
+    fn transaction_fee_sat(&self, txid: &Txid) -> Result<Option<u64>>;
+
     /// Cheap liveness probe, used by startup checks to fail loudly on an unreachable backend
     /// rather than at the first swap.
     fn health_check(&self) -> Result<()> {
