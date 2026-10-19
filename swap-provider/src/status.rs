@@ -216,9 +216,15 @@ struct SwapView {
     onchain_amount_sat: u64,
     service_fee_sat: u64,
     onchain_fee_sat: u64,
+    /// What our funding actually paid in miner fees, once the swap has finished and it has been
+    /// measured. `onchain_fee_sat` is what the swap was priced at.
+    funding_fee_sat: Option<u64>,
     timeout_height: u32,
     funding: Option<String>,
+    /// Our own claim or refund, once broadcast.
     spend: Option<String>,
+    /// The counterparty's claim that revealed the preimage, once seen.
+    observed_claim: Option<String>,
     reorg_seen_at_height: Option<u32>,
     last_error: Option<String>,
     /// Consecutive failed driver runs, and when the next one is due.
@@ -257,9 +263,11 @@ impl From<&SwapRecord> for SwapView {
             onchain_amount_sat: rec.onchain_amount_sat,
             service_fee_sat: rec.service_fee_sat,
             onchain_fee_sat: rec.onchain_fee_sat,
+            funding_fee_sat: rec.funding_fee_sat,
             timeout_height: rec.timeout_height,
             funding: rec.funding_outpoint().map(|o| o.to_string()),
             spend: rec.spend_txid_hex.clone(),
+            observed_claim: rec.claim_observed_txid_hex.clone(),
             reorg_seen_at_height: rec.reorg_seen_at_height,
             last_error: rec.last_error.clone(),
             retry_count: rec.retry_count,
@@ -724,5 +732,22 @@ mod tests {
         let view = SwapView::from(&rec);
         assert_eq!(view.state, "lockup_confirmed");
         assert_eq!(view.state_detail, None);
+    }
+
+    /// In a reverse swap the provider's own spend is a refund, so a swap the client claimed has
+    /// none. Showing only that made a finished swap read as if nothing had spent its funding.
+    #[test]
+    fn a_swap_view_shows_the_claim_that_ended_it_and_what_its_funding_paid() {
+        let mut rec = SwapRecord::new_progress();
+        rec.state = SwapState::Claimed;
+        rec.onchain_fee_sat = 1_395;
+        rec.funding_fee_sat = Some(775);
+        rec.claim_observed_txid_hex = Some("cc".repeat(32));
+
+        let view = SwapView::from(&rec);
+        assert_eq!(view.spend, None);
+        assert_eq!(view.observed_claim, Some("cc".repeat(32)));
+        assert_eq!(view.onchain_fee_sat, 1_395);
+        assert_eq!(view.funding_fee_sat, Some(775));
     }
 }

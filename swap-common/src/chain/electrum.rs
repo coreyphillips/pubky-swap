@@ -359,6 +359,26 @@ impl ChainWatcher for ElectrumWatcher {
         Ok(None)
     }
 
+    fn transaction_fee_sat(&self, txid: &Txid) -> Result<Option<u64>> {
+        let tx = self.transaction(txid)?;
+        let mut inputs_sat = 0u64;
+        for input in &tx.input {
+            let prev = self.transaction(&input.previous_output.txid)?;
+            let Some(output) = prev.output.get(input.previous_output.vout as usize) else {
+                return Err(SwapError::Permanent(format!(
+                    "{txid} spends {}, which that transaction does not have",
+                    input.previous_output
+                )));
+            };
+            inputs_sat = inputs_sat.saturating_add(output.value.to_sat());
+        }
+        let outputs_sat = tx
+            .output
+            .iter()
+            .fold(0u64, |sum, o| sum.saturating_add(o.value.to_sat()));
+        Ok(inputs_sat.checked_sub(outputs_sat))
+    }
+
     fn health_check(&self) -> Result<()> {
         self.tip_height().map(|_| ())
     }

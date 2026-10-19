@@ -720,6 +720,29 @@ fn is_transient(e: &anyhow::Error) -> bool {
     })
 }
 
+/// Record what our funding of a finished swap paid in miner fees, for the operator.
+///
+/// Measured once the swap is over, when the funding has confirmed and the chain backend is sure to
+/// have it, rather than straight after the broadcast, which the wallet's node may not have relayed
+/// yet. Best effort: no decision reads it, so a lookup that fails only leaves it unmeasured.
+fn note_funding_fee(chain: &dyn ChainWatcher, progress: &StoreProgress) {
+    let rec = progress.snapshot();
+    if rec.funding_fee_sat.is_some() {
+        return;
+    }
+    let Some(funding) = rec.funding_outpoint() else {
+        return;
+    };
+    match run_blocking(|| chain.transaction_fee_sat(&funding.txid)) {
+        Ok(Some(fee)) => progress.update("funding fee", |rec| rec.funding_fee_sat = Some(fee)),
+        Ok(None) => {}
+        Err(e) => warn!(
+            "could not measure the funding fee of swap {}: {e}",
+            rec.swap_id
+        ),
+    }
+}
+
 /// Finish a driver run: persist what happened, tell the peer, and decide whether to try again.
 ///
 /// The record is never deleted here. It used to be, unconditionally, on every return including
@@ -2241,6 +2264,9 @@ fn spawn_reverse_driver(
             progress.as_ref(),
         )
         .await;
+        if matches!(&result, Ok(state) if state.is_terminal()) {
+            note_funding_fee(chain.as_ref(), &progress);
+        }
         finish_driver_run(
             &ctx2,
             &progress,
@@ -3213,6 +3239,75 @@ mod tests {
         assert!(!is_transient(&anyhow!("a bare string error")));
     }
     use super::*;
+
+    /// What the funding actually paid is what an operator compares the quoted miner cost with, so
+    /// a finished swap measures it once and keeps it.
+    #[test]
+    fn a_finished_swap_records_what_its_funding_paid() {
+        use swap_common::chain::mock::MockChain;
+        use swap_common::store::{JsonFileSwapStore, SwapRecord};
+
+        let funding = "0000000000000000000000000000000000000000000000000000000000000002"
+            .parse::<Txid>()
+            .unwrap();
+        let mut rec = SwapRecord {
+            funding_txid_hex: Some(funding.to_string()),
+            funding_vout: Some(1),
+            state: SwapState::Claimed,
+            ..SwapRecord::new_progress()
+        };
+        rec.swap_id = Uuid::new_v4();
+        let swap_id = rec.swap_id;
+        let dir = std::env::temp_dir().join(format!("pubky-swap-funding-fee-{swap_id}"));
+        let store = Arc::new(JsonFileSwapStore::new(&dir).unwrap());
+        let progress = StoreProgress {
+            store: store.clone(),
+            record: std::sync::Mutex::new(rec),
+        };
+
+        note_funding_fee(
+            &MockChain::new().with_transaction_fee(funding, 775),
+            &progress,
+        );
+        assert_eq!(progress.snapshot().funding_fee_sat, Some(775));
+        let stored = store.get(swap_id).unwrap().unwrap();
+        assert_eq!(stored.funding_fee_sat, Some(775));
+
+        // Measured once. A later lookup that cannot say does not clear it.
+        note_funding_fee(&MockChain::new(), &progress);
+        assert_eq!(progress.snapshot().funding_fee_sat, Some(775));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A swap that ended before funding paid nothing on chain, whatever the chain knows.
+    #[test]
+    fn a_swap_that_never_funded_has_no_funding_fee() {
+        use swap_common::chain::mock::MockChain;
+        use swap_common::store::{JsonFileSwapStore, SwapRecord};
+
+        let mut rec = SwapRecord {
+            state: SwapState::Expired,
+            ..SwapRecord::new_progress()
+        };
+        rec.swap_id = Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("pubky-swap-no-funding-{}", rec.swap_id));
+        let progress = StoreProgress {
+            store: Arc::new(JsonFileSwapStore::new(&dir).unwrap()),
+            record: std::sync::Mutex::new(rec),
+        };
+        let unrelated = "0000000000000000000000000000000000000000000000000000000000000003"
+            .parse::<Txid>()
+            .unwrap();
+
+        note_funding_fee(
+            &MockChain::new().with_transaction_fee(unrelated, 775),
+            &progress,
+        );
+        assert_eq!(progress.snapshot().funding_fee_sat, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A driver stuck on one step still rewrites what it already knows on every re-entry: the
     /// invoice it has already paid, and the claim it is about to broadcast. Clearing the retry
