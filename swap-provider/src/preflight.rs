@@ -163,6 +163,14 @@ pub async fn diagnose(config: &crate::ProviderConfig) -> Report {
         }
     };
 
+    match crate::access::Policy::load(config.access_policy_file.as_deref()) {
+        Ok(_) => report.push(Check::pass("access_policy", "access policy is valid")),
+        Err(error) => report.push(Check::fail(
+            "access_policy",
+            format!("new quotes and swaps are denied: {error:#}"),
+            "repair the JSON access policy file; existing swap recovery remains available",
+        )),
+    }
     check_identity(config, &mut report);
     check_parameters(config, network, &mut report);
     check_data_dir(config, &mut report);

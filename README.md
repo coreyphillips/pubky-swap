@@ -166,6 +166,30 @@ Each takes either the value or a path to a file holding it:
 A secret file more permissive than `0600` is warned about, not refused. `--show-config` prints the
 resolved configuration with every secret redacted, so it is safe to paste into an issue.
 
+### Provider access controls
+
+By default any authenticated Pubky can request swaps. Set `access_policy_file` in TOML,
+`PUBKY_SWAP_ACCESS_POLICY_FILE`, or `--access-policy-file` to a JSON file:
+
+```json
+{"mode":"approved_only","allowed":["<approved-pubky>"],"blocked":[]}
+```
+
+Use `open` to admit everyone except the `blocked` list, or `approved_only` to admit only
+accounts in `allowed`. A block always wins, and an empty approved list admits nobody.
+Each list accepts up to 256 Pubkys, including `pubky://` prefixes. All three fields are required.
+Validate a candidate offline with `swap-provider --check-access-policy --access-policy-file <path>`.
+For session clients such as Bitkit, list the verified Pubky account, not its temporary device key.
+
+The provider reloads the file for each new quote and swap admission. Replace it atomically to
+apply changes without restarting. A missing, malformed, or unreadable configured file denies
+new business until repaired. Existing swaps still run, replay their acceptances, and expose
+status only to their authenticated owners. Quotes issued before a block cannot start new swaps.
+An admission already past its access check may finish while the file is replaced.
+
+Offers remain discoverable. These controls govern swap admission, not network-level traffic.
+A blocked user can create a different Pubky; use approved-only mode for a private service.
+
 ## Diagnostics
 
 `swap-provider --doctor` runs every check the daemon depends on and prints what to do about
