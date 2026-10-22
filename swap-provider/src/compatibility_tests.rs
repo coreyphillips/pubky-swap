@@ -853,6 +853,8 @@ mod direct_requests {
         for (allowed, blocked, expected) in [
             (vec![device.as_str()], vec![owner.as_str()], false),
             (vec![owner.as_str()], vec![], true),
+            (vec![owner.as_str()], vec![device.as_str()], false),
+            (vec![device.as_str()], vec![], false),
         ] {
             write("approved_only", allowed, blocked);
             let (reply, answer) = tokio::sync::oneshot::channel();

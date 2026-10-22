@@ -16,12 +16,19 @@ enum Mode {
 }
 
 /// All fields are required in a configured file to avoid silently relaxing a broken policy.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default)]
 pub struct Policy {
     mode: Mode,
     allowed: HashSet<String>,
     blocked: HashSet<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyFile {
+    mode: Mode,
+    allowed: Vec<String>,
+    blocked: Vec<String>,
 }
 
 impl Policy {
@@ -40,10 +47,20 @@ impl Policy {
             bytes.len() as u64 <= MAX_BYTES,
             "access policy is too large"
         );
-        let mut policy: Self = serde_json::from_slice(&bytes).context("parse access policy")?;
-        policy.allowed = normalize(policy.allowed)?;
-        policy.blocked = normalize(policy.blocked)?;
-        Ok(policy)
+        let policy: PolicyFile = serde_json::from_slice(&bytes).context("parse access policy")?;
+        Ok(Self {
+            mode: policy.mode,
+            allowed: normalize(policy.allowed, "allowed")?,
+            blocked: normalize(policy.blocked, "blocked")?,
+        })
+    }
+
+    /// Allowlist membership follows the verified account; either identity can be blocked.
+    pub fn allows_request(&self, account: &str, sender: &str) -> bool {
+        let Ok(sender) = pubky_transport::canonical_pubky(sender) else {
+            return false;
+        };
+        self.allows(account) && !self.blocked.contains(&sender)
     }
 
     pub fn allows(&self, account: &str) -> bool {
@@ -55,13 +72,17 @@ impl Policy {
     }
 }
 
-fn normalize(keys: HashSet<String>) -> Result<HashSet<String>> {
+fn normalize(keys: Vec<String>, list: &str) -> Result<HashSet<String>> {
     ensure!(
         keys.len() <= MAX_KEYS,
         "access list exceeds {MAX_KEYS} pubkys"
     );
     keys.into_iter()
-        .map(|key| pubky_transport::canonical_pubky(&key).context("invalid access-list pubky"))
+        .enumerate()
+        .map(|(index, key)| {
+            pubky_transport::canonical_pubky(&key)
+                .with_context(|| format!("invalid {list} pubky at entry {}", index + 1))
+        })
         .collect()
 }
 

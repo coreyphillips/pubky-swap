@@ -28,7 +28,7 @@ struct Cli {
     doctor: bool,
 
     /// Validate the configured access policy offline and exit.
-    #[arg(long, requires = "access_policy_file")]
+    #[arg(long)]
     check_access_policy: bool,
 
     /// Print the resolved configuration, with secrets redacted, and exit.
@@ -342,7 +342,14 @@ async fn main() -> anyhow::Result<()> {
     let config: ProviderConfig = swap_config::load(Some(&path), "PUBKY_SWAP_", &cli.overrides()?)?;
 
     if cli.check_access_policy {
-        swap_provider::access::Policy::load(config.access_policy_file.as_deref())?;
+        let path = config
+            .access_policy_file
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("configure access_policy_file before validating a policy")
+            })?;
+        swap_provider::access::Policy::load(Some(path))?;
         println!("Access policy is valid");
         return Ok(());
     }

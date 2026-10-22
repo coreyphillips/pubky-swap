@@ -1504,9 +1504,10 @@ fn build_offer(
 async fn access_allowed(ctx: &ExecCtx, sender: &str) -> bool {
     let file = ctx.access_policy_file.clone();
     let account = ctx.transport.account().unwrap_or(sender).to_owned();
+    let sender = sender.to_owned();
     // File IO must not hold up the async runtime or running swap drivers.
     tokio::task::spawn_blocking(move || match access::Policy::load(file.as_deref()) {
-        Ok(policy) => policy.allows(&account),
+        Ok(policy) => policy.allows_request(&account, &sender),
         Err(error) => {
             warn!("access policy unavailable; refusing new business: {error:#}");
             false
@@ -1675,7 +1676,10 @@ async fn handle_message(
                 },
                 now,
             );
-            info!("Sending quote {} to {sender}", quote.quote_id);
+            info!(
+                account = ctx.transport.account().unwrap_or(sender),
+                "Sending quote {} to {sender}", quote.quote_id
+            );
             // A failed send may still have been published, so the quote stays redeemable
             // until it expires even though the retry issues another.
             respond(&ctx.transport, sender, &SwapMessage::Quote(quote)).await?;

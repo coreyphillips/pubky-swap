@@ -179,7 +179,9 @@ Use `open` to admit everyone except the `blocked` list, or `approved_only` to ad
 accounts in `allowed`. A block always wins, and an empty approved list admits nobody.
 Each list accepts up to 256 Pubkys, including `pubky://` prefixes. All three fields are required.
 Validate a candidate offline with `swap-provider --check-access-policy --access-policy-file <path>`.
-For session clients such as Bitkit, list the verified Pubky account, not its temporary device key.
+For session clients such as Bitkit, approve the verified Pubky account. Blocking either the
+account or its device key denies new requests. The status API exposes `peer_account` for session
+swaps, and quote logs include the account so operators can identify whom to block.
 
 The provider reloads the file for each new quote and swap admission. Replace it atomically to
 apply changes without restarting. A missing, malformed, or unreadable configured file denies

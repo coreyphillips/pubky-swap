@@ -173,6 +173,8 @@ impl InvoiceStatus {
     }
 }
 
+// async_trait adds must_use to boxed futures, which Rust 1.99 now flags redundantly.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait LightningBackend: Send + Sync {
     /// Node identity / sync status.
