@@ -213,6 +213,8 @@ struct SwapView {
     /// The reason, when the state carries one. `Failed` is the only variant that does.
     state_detail: Option<String>,
     peer: String,
+    /// Verified account for delegated sessions, used by the provider allowlist.
+    peer_account: Option<String>,
     onchain_amount_sat: u64,
     service_fee_sat: u64,
     onchain_fee_sat: u64,
@@ -260,6 +262,7 @@ impl From<&SwapRecord> for SwapView {
                 _ => None,
             },
             peer: rec.peer.clone(),
+            peer_account: rec.peer_account.clone(),
             onchain_amount_sat: rec.onchain_amount_sat,
             service_fee_sat: rec.service_fee_sat,
             onchain_fee_sat: rec.onchain_fee_sat,
@@ -554,6 +557,11 @@ mod tests {
         rec.secret_key_hex = "aa".repeat(32);
         rec.preimage_hex = Some("bb".repeat(32));
         rec.peer = "peer".into();
+        rec.peer_account = Some("account".into());
+        assert_eq!(
+            SwapView::from(&rec).peer_account.as_deref(),
+            Some("account")
+        );
 
         let json = serde_json::to_string(&SwapView::from(&rec)).unwrap();
         assert!(

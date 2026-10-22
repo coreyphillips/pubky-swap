@@ -634,6 +634,7 @@ mod direct_requests {
             invoice_expiry_secs: config.invoice_expiry_secs,
             max_routing_fee_msat: config.max_routing_fee_msat,
             quote_ttl_secs: config.quote_ttl_secs,
+            access_policy_file: None,
             quotes: Arc::new(Mutex::new(QuoteBook::default())),
             store,
             risk: risk::RiskManager::new(risk_limits(&config)),
@@ -690,7 +691,9 @@ mod direct_requests {
 
         // A provider that restarted: a fresh store and no in-memory quotes.
         let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
-        let ctx = context(store.clone(), record.swap_id);
+        let mut ctx = context(store.clone(), record.swap_id);
+        // Policy failures must not strand a persisted swap or break authenticated recovery.
+        ctx.access_policy_file = Some(directory.join("missing-policy.json").display().to_string());
         let replay = ask(&ctx, &owner, SwapMessage::SwapRequest(request.clone())).await;
         let Some(SwapMessage::SwapAccept(accept)) = replay else {
             panic!("expected the original acceptance, got {replay:?}");
@@ -797,6 +800,83 @@ mod direct_requests {
         // Only customer requests are handled; anything else gets no reply at all.
         let reply = ask(&ctx, &client, SwapMessage::Quote(issued)).await;
         assert!(reply.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn access_changes_recheck_quotes_and_use_the_verified_session_owner() {
+        let directory = std::env::temp_dir().join(format!("access-rpc-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let mut ctx = context(store.clone(), Uuid::new_v4());
+        let file = directory.join("access.policy");
+        ctx.access_policy_file = Some(file.display().to_string());
+        let owner = pubky_transport::identity_from_secret(&[41; 32]);
+        let device = pubky_transport::identity_from_secret(&[42; 32]);
+        let write = |mode: &str, allowed: Vec<&str>, blocked: Vec<&str>| {
+            std::fs::write(
+                &file,
+                serde_json::json!({
+                    "mode": mode, "allowed": allowed, "blocked": blocked,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let request = QuoteRequest {
+            request_id: Some(Uuid::new_v4()),
+            offer_id: Uuid::nil(),
+            client_pkarr: owner.clone(),
+            direction: SwapDirection::Reverse,
+            amount_sat: 100_000,
+            protocol_version: PROTOCOL_VERSION,
+            features: Vec::new(),
+        };
+        // A configured but absent file denies new business with a correlated response.
+        let reply = ask(&ctx, &owner, SwapMessage::QuoteRequest(request.clone())).await;
+        assert!(matches!(reply, Some(SwapMessage::Reject(r))
+            if r.code.as_deref() == Some("access_denied") && r.request_id == request.request_id));
+        write("approved_only", vec![&owner], vec![]);
+        let reply = ask(&ctx, &owner, SwapMessage::QuoteRequest(request.clone())).await;
+        let Some(SwapMessage::Quote(quote)) = reply else {
+            panic!("{reply:?}");
+        };
+        write("open", vec![], vec![&owner]);
+        let mut creation = owned_record(&owner).swap_request.unwrap();
+        creation.quote_id = quote.quote_id;
+        let reply = ask(&ctx, &owner, SwapMessage::SwapRequest(creation)).await;
+        assert!(matches!(reply, Some(SwapMessage::Reject(r))
+            if r.code.as_deref() == Some("access_denied") && r.quote_id == Some(quote.quote_id)));
+        assert!(store.load_all_checked().unwrap().is_empty());
+
+        // Exercise the shared handler after session verification, with an allowed device but
+        // a blocked owner. The device cannot substitute its own key for the account policy.
+        for (allowed, blocked, expected) in [
+            (vec![device.as_str()], vec![owner.as_str()], false),
+            (vec![owner.as_str()], vec![], true),
+            (vec![owner.as_str()], vec![device.as_str()], false),
+            (vec![device.as_str()], vec![], false),
+        ] {
+            write("approved_only", allowed, blocked);
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let mut session = ctx.clone();
+            session.transport = Arc::new(ctx.transport.session(
+                owner.clone(),
+                "/pub/test/".into(),
+                reply,
+            ));
+            let mut req = request.clone();
+            req.client_pkarr = device.clone();
+            handle_message(
+                &session,
+                offer().read().await.as_ref().unwrap(),
+                &device,
+                SwapMessage::QuoteRequest(req),
+            )
+            .await
+            .unwrap();
+            let message: SwapMessage = serde_json::from_slice(&answer.await.unwrap()).unwrap();
+            assert_eq!(matches!(message, SwapMessage::Quote(_)), expected);
+        }
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -18,6 +18,7 @@ compile_error!(
      reached by pubkys it already follows."
 );
 
+pub mod access;
 mod delivery;
 mod dispatch;
 pub mod preflight;
@@ -138,6 +139,8 @@ pub struct ProviderConfig {
     pub allow_unsafe: bool,
     /// How long an issued quote stays valid, in seconds. After this it is rejected and pruned.
     pub quote_ttl_secs: u64,
+    /// JSON access policy, reloaded for each new quote and swap. None allows everyone.
+    pub access_policy_file: Option<String>,
     /// Directory for persisted in-flight swap state (so a restart can resume them).
     pub data_dir: String,
     /// On-chain funding wallet backend: `"lnd"` (fund from LND's own wallet, no seed) or `"bdk"`
@@ -214,6 +217,7 @@ impl Default for ProviderConfig {
             max_routing_fee_msat: 10_000,
             allow_unsafe: false,
             quote_ttl_secs: 300,
+            access_policy_file: None,
             data_dir: "./pubky-swap-data".to_string(),
             wallet_backend: "bdk".to_string(),
             peer_idle_ttl_secs: 3600,
@@ -472,6 +476,7 @@ struct ExecCtx {
     invoice_expiry_secs: u64,
     max_routing_fee_msat: u64,
     quote_ttl_secs: u64,
+    access_policy_file: Option<String>,
     quotes: Arc<Mutex<QuoteBook>>,
     store: Arc<dyn SwapStore>,
     risk: Arc<risk::RiskManager>,
@@ -1045,6 +1050,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         invoice_expiry_secs: config.invoice_expiry_secs,
         max_routing_fee_msat: config.max_routing_fee_msat,
         quote_ttl_secs: config.quote_ttl_secs,
+        access_policy_file: config.access_policy_file.clone(),
         quotes: Arc::new(Mutex::new(QuoteBook::default())),
         store,
         risk,
@@ -1494,6 +1500,23 @@ fn build_offer(
     })
 }
 
+/// Session owners are verified by AuthorizationVerifier before this context is constructed.
+async fn access_allowed(ctx: &ExecCtx, sender: &str) -> bool {
+    let file = ctx.access_policy_file.clone();
+    let account = ctx.transport.account().unwrap_or(sender).to_owned();
+    let sender = sender.to_owned();
+    // File IO must not hold up the async runtime or running swap drivers.
+    tokio::task::spawn_blocking(move || match access::Policy::load(file.as_deref()) {
+        Ok(policy) => policy.allows_request(&account, &sender),
+        Err(error) => {
+            warn!("access policy unavailable; refusing new business: {error:#}");
+            false
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
 async fn handle_message(
     ctx: &ExecCtx,
     offer: &SwapOffer,
@@ -1547,6 +1570,18 @@ async fn handle_message(
         }
 
         SwapMessage::QuoteRequest(req) => {
+            if !access_allowed(ctx, sender).await {
+                return reject_coded(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    "provider access denied",
+                    Some("access_denied"),
+                )
+                .await;
+            }
             // Refused rather than ignored: the offer refreshes while its predecessor is still
             // advertised, so a client naming it would otherwise wait out its timeout.
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
@@ -1641,7 +1676,10 @@ async fn handle_message(
                 },
                 now,
             );
-            info!("Sending quote {} to {sender}", quote.quote_id);
+            info!(
+                account = ctx.transport.account().unwrap_or(sender),
+                "Sending quote {} to {sender}", quote.quote_id
+            );
             // A failed send may still have been published, so the quote stays redeemable
             // until it expires even though the retry issues another.
             respond(&ctx.transport, sender, &SwapMessage::Quote(quote)).await?;
@@ -1725,6 +1763,20 @@ async fn handle_message(
                     )
                     .await
                 }
+            }
+            // Replay above preserves already accepted swaps, even after access is revoked.
+            // Recheck here so a quote issued before a policy change grants no new admission.
+            if !access_allowed(ctx, sender).await {
+                return reject_coded(
+                    &ctx.transport,
+                    sender,
+                    None,
+                    None,
+                    Some(req.quote_id),
+                    "provider access denied",
+                    Some("access_denied"),
+                )
+                .await;
             }
             if !ctx.capable {
                 return reject(

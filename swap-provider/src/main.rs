@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long)]
     doctor: bool,
 
+    /// Validate the configured access policy offline and exit.
+    #[arg(long)]
+    check_access_policy: bool,
+
     /// Print the resolved configuration, with secrets redacted, and exit.
     #[arg(long)]
     show_config: bool,
@@ -142,6 +146,10 @@ struct Cli {
     #[arg(long)]
     quote_ttl: Option<u64>,
 
+    /// JSON access policy file, reloaded for new quotes and swaps without a restart.
+    #[arg(long)]
+    access_policy_file: Option<String>,
+
     /// Directory for persisted in-flight swap state (so a restart can resume swaps).
     #[arg(long)]
     data_dir: Option<String>,
@@ -247,6 +255,8 @@ struct Overrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    access_policy_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     data_dir: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wallet_backend: Option<String>,
@@ -305,6 +315,7 @@ impl Cli {
             max_new_swaps_per_peer_per_hour: self.max_new_swaps_per_peer_per_hour,
             allow_unsafe: flag(self.allow_unsafe),
             quote_ttl_secs: self.quote_ttl,
+            access_policy_file: self.access_policy_file.clone(),
             data_dir: self.data_dir.clone(),
             wallet_backend: self.wallet.clone(),
             peer_idle_ttl_secs: self.peer_idle_ttl,
@@ -329,6 +340,19 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let path = swap_config::paths::resolve_config_path(cli.config.as_deref());
     let config: ProviderConfig = swap_config::load(Some(&path), "PUBKY_SWAP_", &cli.overrides()?)?;
+
+    if cli.check_access_policy {
+        let path = config
+            .access_policy_file
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("configure access_policy_file before validating a policy")
+            })?;
+        swap_provider::access::Policy::load(Some(path))?;
+        println!("Access policy is valid");
+        return Ok(());
+    }
 
     if cli.show_config {
         print!("{}", swap_config::to_redacted_toml(&config)?);
