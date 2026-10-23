@@ -22,6 +22,15 @@ For `taproot_boltz`, the provider returns a P2TR address and `SwapAccept.swap_tr
 contract from direction, payment hash, both public keys, and timeout. Clients must independently
 check the script tree, address, amount, invoice, network, and timeout before committing funds.
 
+Adapters derive the contract and compare, and never use the provider's copy.
+`swap_common::validate::verify_contract` rebuilds it from the client's own key, the payment hash,
+`provider_pubkey_hex` and `timeout_block_height`. It compares each of `htlc_script_hex`,
+`swap_tree` and `htlc_address` that is present, and returns the output script to fund or watch.
+An adapter must accept an acceptance that omits `htlc_script_hex` and `htlc_address`. Both
+deserialize as empty strings and are derived. The verifier reads the contract type from
+`script_type`, so the caller checks it is the type it requested. Providers still send every
+field.
+
 Taproot claim and refund transactions use the unilateral script paths. The internal key is the
 Boltz-compatible aggregate key, but this protocol does not implement cooperative signature
 sessions. `CoopSignature` remains reserved. An adapter must reject unsupported cooperative

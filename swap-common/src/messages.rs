@@ -114,6 +114,13 @@ pub fn protocol_version_supported(version: u16) -> bool {
     (MIN_SUPPORTED_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version)
 }
 
+/// The largest plaintext a Paykit Event Message carries (paykit-rs `PUBKY_NOISE_MSG_LEN`).
+///
+/// Not a limit on any pubky-swap carrier: encrypted DMs and iroh streams take far larger messages.
+/// It binds an adapter that re-encodes these messages over Paykit Encrypted Links, and the test
+/// `negotiation_messages_fit_a_paykit_event_message` measures which ones fit.
+pub const PAYKIT_EVENT_MAX_BYTES: usize = 1_000;
+
 /// A provider's advertised swap capabilities and rates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwapOffer {
@@ -336,8 +343,14 @@ pub struct SwapAccept {
     pub swap_id: Uuid,
     pub direction: SwapDirection,
     /// HTLC redeem script (hex), so both parties can independently verify it.
+    ///
+    /// This and `htlc_address` follow from the other fields, so a receiver accepts an acceptance
+    /// without them and derives both (see [`crate::validate::verify_contract`]). They are still
+    /// always sent, because a receiver from before that cannot read one without them.
+    #[serde(default)]
     pub htlc_script_hex: String,
     /// Contract address the funding party must pay into.
+    #[serde(default)]
     pub htlc_address: String,
     /// Exact amount to lock on-chain.
     pub onchain_amount_sat: u64,
@@ -846,6 +859,192 @@ mod tests {
             panic!("wrong variant");
         };
         assert_eq!(reject.code(), None);
+    }
+
+    fn wire_len(message: SwapMessage) -> usize {
+        serde_json::to_vec(&message).unwrap().len()
+    }
+
+    /// Which messages fit a Paykit Event Message, with each field at its longest on mainnet.
+    ///
+    /// Numbers are at their maximum, ids are hyphenated uuids, keys are 66 hex characters and the
+    /// contract address is bech32m. Run with `--nocapture` to see the sizes.
+    #[test]
+    fn negotiation_messages_fit_a_paykit_event_message() {
+        let max = u64::MAX;
+        let id = Some(Uuid::new_v4());
+        let pubky = format!("pubky://{}", "y".repeat(52));
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (_, client) = crate::random_keypair(&secp);
+        let (_, provider) = crate::random_keypair(&secp);
+        let key_hex = |key: &bitcoin::PublicKey| hex::encode(key.to_bytes());
+        // Every capability a provider advertises today.
+        let features: Vec<String> = [
+            "boltz-taproot-v1",
+            "swap-status-v1",
+            "dm-retention-v1",
+            "session-rpc-v1",
+            "direct-rpc-v1",
+        ]
+        .map(String::from)
+        .to_vec();
+        // The longest text the provider words itself: a reverse start refused for wallet balance.
+        // A reason or failure detail that quotes a backend error has no bound, so an adapter has
+        // to truncate those.
+        let reason = format!(
+            "swap start failed: insufficient on-chain balance: {max} sat available, {max} sat \
+             needed for a {max} sat swap plus fees and the {max} sat reserve"
+        );
+        let code = RejectCode::ALL
+            .into_iter()
+            .map(RejectCode::as_str)
+            .max_by_key(|code| code.len())
+            .unwrap();
+        // The highest height a timelock can name, so the leaf scripts push the most bytes.
+        let timeout = 499_999_999;
+
+        let mut measured: Vec<(String, usize)> = vec![
+            (
+                "SwapOffer".into(),
+                wire_len(SwapMessage::Offer(SwapOffer {
+                    request_id: id,
+                    offer_id: Uuid::new_v4(),
+                    provider_pkarr: pubky.clone(),
+                    network: NetworkSpec::Bitcoin,
+                    directions: vec![SwapDirection::Submarine, SwapDirection::Reverse],
+                    min_amount_sat: max,
+                    max_amount_sat: max,
+                    base_fee_sat: max,
+                    fee_ppm: max,
+                    required_confirmations: u32::MAX,
+                    htlc_timeout_blocks: u32::MAX,
+                    lightning_node_id: Some(key_hex(&provider)),
+                    valid_until_unix: max,
+                    fund_within_secs: max,
+                    onchain_fee_sat: max,
+                    fee_rate_sat_vb: max,
+                    protocol_version: u16::MAX,
+                    features: features.clone(),
+                })),
+            ),
+            (
+                "QuoteRequest".into(),
+                wire_len(SwapMessage::QuoteRequest(QuoteRequest {
+                    request_id: id,
+                    offer_id: Uuid::new_v4(),
+                    client_pkarr: pubky.clone(),
+                    direction: SwapDirection::Submarine,
+                    amount_sat: max,
+                    protocol_version: u16::MAX,
+                    features,
+                })),
+            ),
+            (
+                "Quote".into(),
+                wire_len(SwapMessage::Quote(Quote {
+                    request_id: id,
+                    quote_id: Uuid::new_v4(),
+                    offer_id: Uuid::new_v4(),
+                    direction: SwapDirection::Submarine,
+                    amount_sat: max,
+                    fee_sat: max,
+                    service_fee_sat: max,
+                    onchain_fee_sat: max,
+                    fee_rate_sat_vb: max,
+                    total_sat: max,
+                    htlc_timeout_blocks: u32::MAX,
+                    required_confirmations: u32::MAX,
+                    valid_until_unix: max,
+                    fund_within_secs: max,
+                    protocol_version: u16::MAX,
+                })),
+            ),
+            (
+                "Reject".into(),
+                wire_len(SwapMessage::Reject(Reject {
+                    code: Some(code.into()),
+                    request_id: id,
+                    swap_id: Some(Uuid::new_v4()),
+                    quote_id: Some(Uuid::new_v4()),
+                    reason: reason.clone(),
+                })),
+            ),
+            (
+                "SwapStatusUpdate".into(),
+                wire_len(SwapMessage::SwapStatusUpdate(SwapStatusUpdate {
+                    swap_id: Uuid::new_v4(),
+                    state: SwapState::Failed(reason),
+                    reference: Some("ab".repeat(32)),
+                })),
+            ),
+            (
+                "SwapRequest without invoice".into(),
+                wire_len(SwapMessage::SwapRequest(SwapRequest {
+                    script_type: SwapScript::TaprootBoltz,
+                    quote_id: Uuid::new_v4(),
+                    client_pkarr: pubky,
+                    direction: SwapDirection::Submarine,
+                    payment_hash_hex: "ab".repeat(32),
+                    client_claim_pubkey_hex: Some(key_hex(&client)),
+                    client_refund_pubkey_hex: Some(key_hex(&client)),
+                    invoice: None,
+                })),
+            ),
+        ];
+        let mut compact_reverse = None;
+        for direction in [SwapDirection::Reverse, SwapDirection::Submarine] {
+            let (claim, refund) = match direction {
+                SwapDirection::Reverse => (&client, &provider),
+                SwapDirection::Submarine => (&provider, &client),
+            };
+            let contract = crate::taproot::BoltzTaprootSwap::new(
+                direction,
+                &[0xab; 32],
+                claim,
+                refund,
+                timeout,
+            )
+            .unwrap();
+            let accept = SwapAccept {
+                script_type: SwapScript::TaprootBoltz,
+                swap_tree: Some(contract.swap_tree()),
+                quote_id: Uuid::new_v4(),
+                swap_id: Uuid::new_v4(),
+                direction,
+                htlc_script_hex: String::new(),
+                htlc_address: contract.address(bitcoin::Network::Bitcoin).to_string(),
+                onchain_amount_sat: max,
+                timeout_block_height: timeout,
+                provider_pubkey_hex: key_hex(&provider),
+                invoice: None,
+            };
+            let name = format!("Taproot {direction} SwapAccept without invoice");
+            measured.push((name, wire_len(SwapMessage::SwapAccept(accept.clone()))));
+            if direction == SwapDirection::Reverse {
+                compact_reverse = Some(accept);
+            }
+        }
+
+        for (name, len) in &measured {
+            println!("{name}: {len} bytes");
+        }
+        // Where a reverse hold invoice rides is the adapter's question, so this is measured only.
+        let compact = SwapAccept {
+            swap_tree: None,
+            htlc_address: String::new(),
+            invoice: Some("l".repeat(400)),
+            ..compact_reverse.unwrap()
+        };
+        println!(
+            "compact Taproot reverse SwapAccept with a 400-character invoice: {} bytes",
+            wire_len(SwapMessage::SwapAccept(compact))
+        );
+        for (name, len) in measured {
+            assert!(
+                len <= PAYKIT_EVENT_MAX_BYTES,
+                "{name} is {len} bytes, over the {PAYKIT_EVENT_MAX_BYTES}-byte Paykit cap"
+            );
+        }
     }
 
     #[test]

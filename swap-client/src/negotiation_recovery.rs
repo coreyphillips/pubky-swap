@@ -5,7 +5,7 @@ use crate::{store, ClientConfig};
 use anyhow::{anyhow, Context, Result};
 use bitcoin::{Network, PublicKey, ScriptBuf};
 use std::path::Path;
-use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash};
+use swap_common::htlc::payment_hash;
 use swap_common::messages::{Quote, SwapAccept, SwapMessage, SwapScript};
 use swap_common::store::{JsonFileSwapStore, SwapRecord, SwapRole, SwapStore};
 use swap_common::validate::{self, ClientPolicy, DecodedHoldInvoice};
@@ -176,7 +176,7 @@ async fn recover_one(
         .get(record.swap_id)?
         .context("creation record disappeared")?;
     let policy = crate::client_policy(config, network);
-    validate_contract(&record, &accept, network, &policy, current_tip)?;
+    let htlc_script = validate_contract(&record, &accept, network, &policy, current_tip)?;
     let tip = current_tip.context("chain access is required before recovering execution")?;
     validate_execution_window(&record, &accept, &policy, tip)?;
     let quote = record
@@ -222,6 +222,7 @@ async fn recover_one(
         store,
         record.swap_id,
         &accept,
+        &htlc_script,
         hex::encode(destination.as_bytes()),
     )
 }
@@ -322,24 +323,14 @@ fn validate_contract(
         &bitcoin::secp256k1::Secp256k1::new(),
         &record.secret_key()?,
     ));
-    let theirs = crate::parse_pubkey(&accept.provider_pubkey_hex)?;
-    let (claim, refund) = match record.direction {
-        SwapDirection::Reverse => (ours, theirs),
-        SwapDirection::Submarine => (theirs, ours),
-    };
-    let script = build_htlc_script(
+    let (script, _) = crate::verify_p2wsh_contract(
+        accept,
+        record.direction,
         &record.payment_hash()?,
-        &claim,
-        &refund,
-        accept.timeout_block_height,
-    );
-    if hex::encode(script.as_bytes()) != accept.htlc_script_hex
-        || htlc_p2wsh_address(&script, network).to_string() != accept.htlc_address
-    {
-        return Err(anyhow!(
-            "recovered HTLC does not match the saved payment hash and branch key"
-        ));
-    }
+        &ours,
+        network,
+    )
+    .context("recovered HTLC does not match the saved payment hash and branch key")?;
     Ok(script)
 }
 
@@ -377,6 +368,7 @@ mod tests {
         Mutex,
     };
     use std::time::Duration;
+    use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address};
     use swap_common::messages::{SwapRequest, PROTOCOL_VERSION};
     use uuid::Uuid;
 
@@ -607,6 +599,38 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// The script and address follow from the saved keys, so an acceptance without them recovers
+    /// the same contract, and that derived script is what the record keeps for resume.
+    #[test]
+    fn recovered_contract_without_script_or_address_is_derived_and_saved() {
+        let (dir, store, record, accept) = fixture();
+        let policy = ClientPolicy::for_network(Network::Regtest, Default::default());
+        let compact = SwapAccept {
+            htlc_script_hex: String::new(),
+            htlc_address: String::new(),
+            ..accept.clone()
+        };
+        let script =
+            validate_contract(&record, &compact, Network::Regtest, &policy, Some(100)).unwrap();
+        assert_eq!(hex::encode(script.as_bytes()), accept.htlc_script_hex);
+        store::record_accept(&store, record.swap_id, &compact, &script, "0014".into()).unwrap();
+        let saved = store.get(record.swap_id).unwrap().unwrap();
+        assert_eq!(saved.htlc_script_hex, accept.htlc_script_hex);
+        assert_eq!(
+            saved.htlc_spk().unwrap(),
+            htlc_p2wsh_address(&script, Network::Regtest).script_pubkey()
+        );
+
+        let taproot = SwapAccept {
+            script_type: SwapScript::TaprootBoltz,
+            ..compact
+        };
+        assert!(
+            validate_contract(&record, &taproot, Network::Regtest, &policy, Some(100)).is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn saved_acceptance_cannot_change_and_only_validated_records_can_execute() {
         let (dir, store, record, accept) = fixture();
@@ -617,7 +641,8 @@ mod tests {
         assert!(!store::execution_ready(
             &store.get(record.swap_id).unwrap().unwrap()
         ));
-        store::record_accept(&store, record.swap_id, &accept, "0014".into()).unwrap();
+        let script = ScriptBuf::from_hex(&accept.htlc_script_hex).unwrap();
+        store::record_accept(&store, record.swap_id, &accept, &script, "0014".into()).unwrap();
         assert!(store::execution_ready(
             &store.get(record.swap_id).unwrap().unwrap()
         ));
