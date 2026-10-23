@@ -111,6 +111,95 @@ impl SwapState {
             SwapState::Claimed | SwapState::Refunded | SwapState::Expired | SwapState::Failed(_)
         )
     }
+
+    /// The Paykit leg status a provider record in this state reports, from the owner's point of
+    /// view. The table and its caveats are in `docs/CLIENT_ADAPTERS.md`.
+    ///
+    /// `funding_known` is whether the record has a funding outpoint (`funding_txid_hex`), which
+    /// decides whether a failure stranded funds. `needs_recovery` is the provider record's flag
+    /// for a funded swap its driver cannot progress. It is the only source of `needs_attention`,
+    /// and it never overrides a terminal status: a leg the owner already has is not reopened by
+    /// the provider's own trouble. A snapshot does not carry it, so a caller without the record
+    /// passes `false`.
+    ///
+    /// The status covers the whole route. A split into Lightning and chain legs can wrap this.
+    /// `replaced` is never produced: nothing in a swap consumes the owner's input for another
+    /// operation.
+    pub fn leg_status(
+        &self,
+        direction: SwapDirection,
+        funding_known: bool,
+        needs_recovery: bool,
+    ) -> LegStatus {
+        let status = match self {
+            SwapState::Created => LegStatus::Pending,
+            // The provider sets this only for its own reverse funding. In a submarine swap it
+            // could only be the owner's funding, still unresolved.
+            SwapState::LockupPending => match direction {
+                SwapDirection::Reverse => LegStatus::InTransit,
+                SwapDirection::Submarine => LegStatus::Pending,
+            },
+            // The provider sets `LockupConfirmed` when a reverse funding is broadcast, not at
+            // depth, so it says nothing about what the owner can safely claim.
+            SwapState::LockupConfirmed | SwapState::InvoicePending => LegStatus::InTransit,
+            // A paid invoice is the submarine owner's delivery, with the preimage as evidence.
+            // The reverse owner's delivery is its own claim, which may not have confirmed yet.
+            SwapState::InvoicePaid | SwapState::ClaimPending => match direction {
+                SwapDirection::Reverse => LegStatus::InTransit,
+                SwapDirection::Submarine => LegStatus::Delivered,
+            },
+            SwapState::Claimed => LegStatus::Delivered,
+            SwapState::Refunded => LegStatus::Refunded,
+            SwapState::Expired => LegStatus::Failed,
+            SwapState::Failed(_) if funding_known => LegStatus::DeliveryFailed,
+            SwapState::Failed(_) => LegStatus::Failed,
+        };
+        if needs_recovery && !status.is_terminal() {
+            LegStatus::NeedsAttention
+        } else {
+            status
+        }
+    }
+}
+
+/// Per-leg status vocabulary of the Paykit Intents draft (§5.5), which a Paykit solver sends in
+/// `paykit.intent_status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegStatus {
+    /// Source step signed or submitted; outcome unresolved.
+    Pending,
+    /// Source step failed or proved unexecuted.
+    Failed,
+    /// Another operation consumed the nonce or input.
+    Replaced,
+    /// Source executed; delivery unresolved.
+    InTransit,
+    /// Retryable delivery problem or missing evidence.
+    NeedsAttention,
+    /// Delivery permanently stopped. Does not imply a refund.
+    DeliveryFailed,
+    /// Source-chain evidence shows funds returned.
+    Refunded,
+    /// Delivery evidence accepted under the route's trust label.
+    Delivered,
+}
+
+impl LegStatus {
+    /// Whether automation is finished with this leg.
+    ///
+    /// `delivery_failed` counts: the draft allows a later `refunded` once refund evidence is
+    /// verified, but nothing retries it.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            LegStatus::Pending | LegStatus::InTransit | LegStatus::NeedsAttention => false,
+            LegStatus::Failed
+            | LegStatus::Replaced
+            | LegStatus::DeliveryFailed
+            | LegStatus::Refunded
+            | LegStatus::Delivered => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +244,154 @@ mod direction_tests {
                 format!("\"{}\"", d.as_str()),
                 "serde and as_str must agree"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod leg_status_tests {
+    use super::*;
+    use LegStatus::*;
+    use SwapDirection::{Reverse, Submarine};
+
+    fn all_states() -> [SwapState; 10] {
+        [
+            SwapState::Created,
+            SwapState::LockupPending,
+            SwapState::LockupConfirmed,
+            SwapState::InvoicePending,
+            SwapState::InvoicePaid,
+            SwapState::ClaimPending,
+            SwapState::Claimed,
+            SwapState::Refunded,
+            SwapState::Expired,
+            SwapState::Failed("the peer never paid".into()),
+        ]
+    }
+
+    /// The table in `docs/CLIENT_ADAPTERS.md`, row for row.
+    #[test]
+    fn every_state_maps_to_the_documented_leg_status() {
+        // (state, reverse, submarine), whatever is known about funding.
+        let rows = [
+            (SwapState::Created, Pending, Pending),
+            (SwapState::LockupPending, InTransit, Pending),
+            (SwapState::LockupConfirmed, InTransit, InTransit),
+            (SwapState::InvoicePending, InTransit, InTransit),
+            (SwapState::InvoicePaid, InTransit, Delivered),
+            (SwapState::ClaimPending, InTransit, Delivered),
+            (SwapState::Claimed, Delivered, Delivered),
+            (SwapState::Refunded, Refunded, Refunded),
+            (SwapState::Expired, Failed, Failed),
+        ];
+        for (state, reverse, submarine) in rows {
+            for funding_known in [false, true] {
+                assert_eq!(
+                    state.leg_status(Reverse, funding_known, false),
+                    reverse,
+                    "{state:?} reverse, funding known: {funding_known}"
+                );
+                assert_eq!(
+                    state.leg_status(Submarine, funding_known, false),
+                    submarine,
+                    "{state:?} submarine, funding known: {funding_known}"
+                );
+            }
+        }
+
+        let failed = SwapState::Failed("the peer never paid".into());
+        for direction in [Reverse, Submarine] {
+            assert_eq!(failed.leg_status(direction, false, false), Failed);
+            assert_eq!(failed.leg_status(direction, true, false), DeliveryFailed);
+        }
+    }
+
+    /// A finished swap never reports a leg still in progress. The converse holds except where the
+    /// owner's leg finishes before the swap does: a submarine owner is paid once its invoice is.
+    #[test]
+    fn terminal_states_report_terminal_leg_statuses() {
+        for state in all_states() {
+            for direction in [Reverse, Submarine] {
+                for funding_known in [false, true] {
+                    let leg = state.leg_status(direction, funding_known, false);
+                    let owner_paid_early = direction == Submarine
+                        && matches!(state, SwapState::InvoicePaid | SwapState::ClaimPending);
+                    assert_eq!(
+                        leg.is_terminal(),
+                        state.is_terminal() || owner_paid_early,
+                        "{state:?} {direction}, funding known: {funding_known} gave {leg:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The provider sets `LockupConfirmed` when a reverse funding is broadcast, not at depth, and
+    /// it never sets `ClaimPending`, so that state has to read like the one it would follow.
+    #[test]
+    fn lockup_confirmed_is_never_delivered_and_claim_pending_reads_as_invoice_paid() {
+        for direction in [Reverse, Submarine] {
+            for funding_known in [false, true] {
+                for needs_recovery in [false, true] {
+                    let leg = |state: SwapState| {
+                        state.leg_status(direction, funding_known, needs_recovery)
+                    };
+                    let case = format!(
+                        "{direction}, funding known: {funding_known}, \
+                         needs recovery: {needs_recovery}"
+                    );
+                    assert_ne!(leg(SwapState::LockupConfirmed), Delivered, "{case}");
+                    assert_eq!(
+                        leg(SwapState::ClaimPending),
+                        leg(SwapState::InvoicePaid),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `needs_attention` comes only from the record's recovery flag, and only for a leg still in
+    /// progress. `replaced` never comes at all.
+    #[test]
+    fn needs_attention_comes_only_from_the_recovery_flag() {
+        for state in all_states() {
+            for direction in [Reverse, Submarine] {
+                for funding_known in [false, true] {
+                    let plain = state.leg_status(direction, funding_known, false);
+                    let flagged = state.leg_status(direction, funding_known, true);
+                    assert_ne!(plain, NeedsAttention);
+                    assert_ne!(plain, Replaced);
+                    let expected = if plain.is_terminal() {
+                        plain
+                    } else {
+                        NeedsAttention
+                    };
+                    assert_eq!(
+                        flagged, expected,
+                        "{state:?} {direction}, funding known: {funding_known}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// These are wire words in `paykit.intent_status`, so they must match the draft exactly.
+    #[test]
+    fn leg_statuses_serialize_as_the_draft_spells_them() {
+        for (status, word) in [
+            (Pending, "pending"),
+            (Failed, "failed"),
+            (Replaced, "replaced"),
+            (InTransit, "in_transit"),
+            (NeedsAttention, "needs_attention"),
+            (DeliveryFailed, "delivery_failed"),
+            (Refunded, "refunded"),
+            (Delivered, "delivered"),
+        ] {
+            let wire = serde_json::to_string(&status).unwrap();
+            assert_eq!(wire, format!("\"{word}\""));
+            assert_eq!(serde_json::from_str::<LegStatus>(&wire).unwrap(), status);
         }
     }
 }

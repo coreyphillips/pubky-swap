@@ -73,8 +73,38 @@ is `SwapStatusSnapshot`, echoing the request identifier and carrying:
 Only the authenticated original counterparty can recover this information. The snapshot excludes
 private keys and preimages. Older records without a stored acceptance cannot provide this response.
 
-Provider lifecycle states describe its progress. In particular, `LockupConfirmed` historically
-means the funding outpoint is known and can be set immediately after a reverse funding broadcast.
+### Paykit leg status
+
+Provider lifecycle states describe its progress, not the owner's. `SwapState::leg_status` maps
+them to the Paykit Intents leg statuses, from the owner's point of view, so an adapter reports the
+same words whichever path filled an intent:
+
+| `SwapState` | Reverse (owner pays Lightning, receives on-chain) | Submarine (owner locks on-chain, receives Lightning) |
+| --- | --- | --- |
+| `Created` | `pending` | `pending` |
+| `LockupPending` | `in_transit` | `pending` (never set by the provider; defensive) |
+| `LockupConfirmed` | `in_transit` | `in_transit` |
+| `InvoicePending` | `in_transit` | `in_transit` |
+| `InvoicePaid` | `in_transit` (owner's claim observed, may be unconfirmed) | `delivered` (owner's invoice paid; the preimage is the evidence) |
+| `ClaimPending` | `in_transit` | `delivered` |
+| `Claimed` | `delivered` | `delivered` |
+| `Refunded` | `refunded` | `refunded` |
+| `Expired` | `failed` | `failed` |
+| `Failed` | `failed` if no funding is known, else `delivery_failed` | same |
+
+"Funding is known" means the record has `funding_txid_hex`. The status covers the whole route.
+Splitting it into Lightning and chain legs is left to the adapter.
+
+`needs_attention` comes only from the provider record's `needs_recovery` flag, which the operator
+API shows and the snapshot does not carry. It replaces a non-terminal status and never a terminal
+one. A caller working from a snapshot passes `false`. `replaced` is never produced.
+
+The provider sets `LockupConfirmed` as soon as a reverse funding is broadcast, not at depth, so it
+means only that the funding outpoint is known. It never maps to `delivered`, which on a reverse
+swap requires the owner's own chain view of its claim. The provider never sets `ClaimPending`, so
+it reads like `InvoicePaid`. `SwapStatusUpdate` is sent only for terminal states, so non-terminal
+statuses come from polling `SwapStatusRequest`.
+
 An adapter must obtain transaction contents and confirmation depth independently before emitting
 a status that promises on-chain confirmation or advising a client to reveal its preimage.
 
