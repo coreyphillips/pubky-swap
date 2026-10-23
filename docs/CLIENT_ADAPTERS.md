@@ -40,6 +40,43 @@ are optional UUIDs for backward compatibility. Concurrent integrations should al
 Only providers configured for execution advertise `boltz-taproot-v1` and `swap-status-v1`.
 Capabilities should be checked before requesting a Taproot contract.
 
+## Refusal codes
+
+Every `Reject` carries `code`, one of the strings below, and `Reject::code()` parses it into
+`RejectCode`. Act on the code; `reason` is for people and its wording can change. An absent code
+means a provider from before codes. `Reject::code()` also returns `None` for a string this build
+does not know. Treat either as a generic decline.
+
+The first eight are refusal reasons from the Paykit Intents draft, with its retry hints.
+`not_found` and `pending` answer status queries and creation replays, not intents. The last five
+have no Paykit equivalent, and an adapter reports them as its generic decline.
+
+| `code` | Sent when | Paykit | Retry |
+| --- | --- | --- | --- |
+| `unsupported_route` | The direction is not offered, or the provider cannot execute swaps | same | Other provider |
+| `amount_below_minimum` | Below the offer's effective minimum, stated in `reason` | same | Larger amount |
+| `amount_above_maximum` | Above `max_amount_sat`, stated in `reason` | same | Smaller amount |
+| `liquidity_unavailable` | Capacity or exposure limits are full, or the wallet cannot fund a reverse swap | same | Later or smaller |
+| `rate_limited` | The sender has started too many swaps in the last hour | same | Backoff |
+| `pricing_unavailable` | The provider has not priced an offer yet | same | Later |
+| `quote_expired` | The quote is unknown, expired or already spent | same | New quote |
+| `invalid_destination` | The submarine invoice has no amount, a sub-satoshi amount, an amount other than the quoted one, or too long a final CLTV | same | User fix |
+| `not_found` | A status query names no swap the sender owns | none | See [recovery](#durable-creation-and-recovery) |
+| `pending` | An admission exists and its invoice still needs recovery, or another request is admitting the same swap | none | Query again |
+| `access_denied` | The provider's access policy refuses the sender | generic decline | Other provider |
+| `invalid_request` | The request is malformed, names another pubky, reuses a payment hash, or changes an accepted request | generic decline | Fix the request |
+| `unsupported_protocol` | `protocol_version` is outside what the provider speaks | generic decline | Other provider |
+| `offer_stale` | `offer_id` names an offer that is no longer current | generic decline | Fetch the offer, then quote again |
+| `internal_error` | The provider failed for its own reasons | generic decline | Later |
+
+The draft's `amount_below_minimum {min}` and `amount_above_maximum {max}` take a number. The offer
+carries both: `effective_min_amount_sat()` and `max_amount_sat`.
+
+Capacity and rate limits are checked when quoting, against the provider's counters, so they can
+refuse an intent. They are checked again with the wallet balance when the quote is redeemed, so a
+quote holds no capacity and `liquidity_unavailable` or `rate_limited` can still answer a
+`SwapRequest`.
+
 ## Durable creation and recovery
 
 Persist the complete `SwapRequest` before sending it. For reverse swaps the provider writes an
@@ -55,9 +92,10 @@ have received the acceptance.
 After a creation timeout, retry the original request or query its quote identifier. A status
 rejection with `code: "pending"` means an admission exists and its invoice still needs recovery.
 Only `code: "not_found"` from an authenticated, correlated status query establishes that no owned
-record exists for that identifier. Other errors, including an unreadable store, do not establish
-absence. Do not create a new quote and assume it names the same swap. Acceptance recovery is retained with the
-swap record, currently for 30 days after terminal completion.
+record exists for that identifier. Other refusals, including `internal_error` for an unreadable
+store, do not establish absence. Do not create a new quote and assume it names the same swap.
+Acceptance recovery is retained with the swap record, currently for 30 days after terminal
+completion.
 
 Lightning backends must implement `lookup_hold_invoice` to recover a pending invoice. Unsupported
 lookups and unavailable backends leave the intent intact and prevent a second creation attempt.

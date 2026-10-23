@@ -307,13 +307,21 @@ async fn take_valid_quote(
     let mut book = quotes.lock().await;
     book.prune(now_unix());
     let Entry::Occupied(entry) = book.quotes.entry(quote_id) else {
-        return Err(anyhow!("unknown or expired quote"));
+        return Err(Refusal::new(RejectCode::QuoteExpired, "unknown or expired quote").into());
     };
     if !pubky_transport::same_pubky(&entry.get().peer, peer) {
-        return Err(anyhow!("quote {quote_id} was not issued to {peer}"));
+        return Err(Refusal::new(
+            RejectCode::InvalidRequest,
+            format!("quote {quote_id} was not issued to {peer}"),
+        )
+        .into());
     }
     if entry.get().direction != direction {
-        return Err(anyhow!("quote {quote_id} is not for a {direction:?} swap"));
+        return Err(Refusal::new(
+            RejectCode::InvalidRequest,
+            format!("quote {quote_id} is not for a {direction:?} swap"),
+        )
+        .into());
     }
     Ok(entry.remove())
 }
@@ -1182,11 +1190,8 @@ fn message_handler(
         let ctx = ctx.clone();
         let offer = offer.clone();
         Box::pin(async move {
-            // Every early return drops the receipt, leaving the durable request pending.
-            let Some(current) = offer.read().await.clone() else {
-                return;
-            };
-            match handle_message(&ctx, &current, &sender, inbound.message).await {
+            let current = offer.read().await.clone();
+            match handle_message(&ctx, current.as_ref(), &sender, inbound.message).await {
                 Ok(()) => {
                     if ctx.transport.acknowledge(&inbound.receipt).is_err() {
                         warn!("could not persist message acknowledgment; request remains pending");
@@ -1538,9 +1543,13 @@ async fn access_allowed(ctx: &ExecCtx, sender: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// The reason sent with `pricing_unavailable`.
+const UNPRICED: &str = "the provider has not priced its offer yet";
+
+/// `offer` is `None` until the provider has priced one. Only offer and quote requests need it.
 async fn handle_message(
     ctx: &ExecCtx,
-    offer: &SwapOffer,
+    offer: Option<&SwapOffer>,
     sender: &str,
     msg: SwapMessage,
 ) -> Result<()> {
@@ -1551,6 +1560,18 @@ async fn handle_message(
     };
     match msg {
         SwapMessage::OfferRequest(req) => {
+            let Some(offer) = offer else {
+                return reject(
+                    &ctx.transport,
+                    sender,
+                    req.request_id,
+                    None,
+                    None,
+                    RejectCode::PricingUnavailable,
+                    UNPRICED.into(),
+                )
+                .await;
+            };
             let mut current = offer.clone();
             current.request_id = req.request_id;
             respond(&ctx.transport, sender, &SwapMessage::Offer(current)).await?;
@@ -1572,18 +1593,18 @@ async fn handle_message(
                 }
                 Err(error) => {
                     let code = match error.downcast_ref::<SwapLookupError>() {
-                        Some(SwapLookupError::NotFound) => Some("not_found"),
-                        Some(SwapLookupError::Pending) => Some("pending"),
-                        None => None,
+                        Some(SwapLookupError::NotFound) => RejectCode::NotFound,
+                        Some(SwapLookupError::Pending) => RejectCode::Pending,
+                        None => refusal_code(&error),
                     };
-                    reject_coded(
+                    reject(
                         &ctx.transport,
                         sender,
                         req.request_id,
                         req.swap_id,
                         req.quote_id,
-                        &error.to_string(),
                         code,
+                        error.to_string(),
                     )
                     .await?
                 }
@@ -1591,41 +1612,31 @@ async fn handle_message(
         }
 
         SwapMessage::QuoteRequest(req) => {
+            let request_id = req.request_id;
+            let refuse = |code: RejectCode, reason: String| {
+                reject(&ctx.transport, sender, request_id, None, None, code, reason)
+            };
             if !access_allowed(ctx, sender).await {
-                return reject_coded(
-                    &ctx.transport,
-                    sender,
-                    req.request_id,
-                    None,
-                    None,
-                    "provider access denied",
-                    Some("access_denied"),
-                )
-                .await;
+                return refuse(RejectCode::AccessDenied, "provider access denied".into()).await;
             }
+            let Some(offer) = offer else {
+                return refuse(RejectCode::PricingUnavailable, UNPRICED.into()).await;
+            };
             // Refused rather than ignored: the offer refreshes while its predecessor is still
             // advertised, so a client naming it would otherwise wait out its timeout.
             if req.offer_id != Uuid::nil() && req.offer_id != offer.offer_id {
-                return reject_request(
-                    &ctx.transport,
-                    sender,
-                    req.request_id,
-                    None,
-                    None,
-                    &format!("offer {} is no longer current", req.offer_id),
+                return refuse(
+                    RejectCode::OfferStale,
+                    format!("offer {} is no longer current", req.offer_id),
                 )
                 .await;
             }
             // The cheapest place to find a mismatch: nothing is quoted, nothing reserved, and no
             // key generated. Finding it later means finding it with money already committed.
             if !protocol_version_supported(req.protocol_version) {
-                return reject_request(
-                    &ctx.transport,
-                    sender,
-                    req.request_id,
-                    None,
-                    None,
-                    &format!(
+                return refuse(
+                    RejectCode::UnsupportedProtocol,
+                    format!(
                         "protocol version {} is not supported (this provider speaks {}..={})",
                         req.protocol_version, MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION
                     ),
@@ -1633,39 +1644,41 @@ async fn handle_message(
                 .await;
             }
             if let Err(e) = check_client_pkarr(&req.client_pkarr, sender) {
-                return reject_request(
-                    &ctx.transport,
-                    sender,
-                    req.request_id,
-                    None,
-                    None,
-                    &e.to_string(),
-                )
-                .await;
+                return refuse(RejectCode::InvalidRequest, e.to_string()).await;
             }
             if !offer.supports(req.direction) {
-                return reject_request(
-                    &ctx.transport,
-                    sender,
-                    req.request_id,
-                    None,
-                    None,
-                    "unsupported direction",
+                return refuse(RejectCode::UnsupportedRoute, "unsupported direction".into()).await;
+            }
+            let min_amount_sat = offer.effective_min_amount_sat();
+            if req.amount_sat < min_amount_sat {
+                return refuse(
+                    RejectCode::AmountBelowMinimum,
+                    format!(
+                        "amount {} sat is below the minimum of {min_amount_sat} sat",
+                        req.amount_sat
+                    ),
                 )
                 .await;
             }
-            if !offer.accepts_amount(req.amount_sat) {
-                return reject_request(
-                    &ctx.transport,
-                    sender,
-                    req.request_id,
-                    None,
-                    None,
-                    "amount out of range",
+            if req.amount_sat > offer.max_amount_sat {
+                return refuse(
+                    RejectCode::AmountAboveMaximum,
+                    format!(
+                        "amount {} sat is above the maximum of {} sat",
+                        req.amount_sat, offer.max_amount_sat
+                    ),
                 )
                 .await;
             }
             let fee = offer.quote_fee(req.amount_sat);
+            // Counters only. The wallet balance is an RPC, and stays with the reservation at
+            // `SwapRequest`, which is what actually binds.
+            if let Err(reason) = ctx.risk.admissible(
+                ctx.transport.account().unwrap_or(sender),
+                exposure_sat(req.direction, req.amount_sat, fee.total_fee_sat),
+            ) {
+                return refuse(reason.code(), reason.to_string()).await;
+            }
             let now = now_unix();
             let expires_at_unix = now.saturating_add(ctx.quote_ttl_secs);
             let quote = Quote {
@@ -1708,15 +1721,20 @@ async fn handle_message(
         }
 
         SwapMessage::SwapRequest(req) => {
-            if let Err(error) = check_client_pkarr(&req.client_pkarr, sender) {
-                return reject(
+            let quote_id = req.quote_id;
+            let refuse = |code: RejectCode, reason: String| {
+                reject(
                     &ctx.transport,
                     sender,
                     None,
-                    Some(req.quote_id),
-                    &error.to_string(),
+                    None,
+                    Some(quote_id),
+                    code,
+                    reason,
                 )
-                .await;
+            };
+            if let Err(error) = check_client_pkarr(&req.client_pkarr, sender) {
+                return refuse(RejectCode::InvalidRequest, error.to_string()).await;
             }
             match replay_record(
                 ctx.store.as_ref(),
@@ -1758,14 +1776,8 @@ async fn handle_message(
                             // and the pending intent is tried again on the next poll.
                             Err(e) => {
                                 warn!("failed to resume reverse swap {}: {e}", record.swap_id);
-                                return reject(
-                                    &ctx.transport,
-                                    sender,
-                                    None,
-                                    Some(req.quote_id),
-                                    &format!("swap start failed: {e}"),
-                                )
-                                .await;
+                                return refuse(refusal_code(&e), format!("swap start failed: {e}"))
+                                    .await;
                             }
                         };
                     }
@@ -1775,43 +1787,21 @@ async fn handle_message(
                     return respond(&ctx.transport, sender, &SwapMessage::SwapAccept(accept)).await;
                 }
                 Ok(None) => {}
-                Err(error) => {
-                    return reject(
-                        &ctx.transport,
-                        sender,
-                        None,
-                        Some(req.quote_id),
-                        &error.to_string(),
-                    )
-                    .await
-                }
+                Err(error) => return refuse(refusal_code(&error), error.to_string()).await,
             }
             // Replay above preserves already accepted swaps, even after access is revoked.
             // Recheck here so a quote issued before a policy change grants no new admission.
             if !access_allowed(ctx, sender).await {
-                return reject_coded(
-                    &ctx.transport,
-                    sender,
-                    None,
-                    None,
-                    Some(req.quote_id),
-                    "provider access denied",
-                    Some("access_denied"),
-                )
-                .await;
+                return refuse(RejectCode::AccessDenied, "provider access denied".into()).await;
             }
             if !ctx.capable {
-                return reject(
-                    &ctx.transport,
-                    sender,
-                    None,
-                    Some(req.quote_id),
-                    "provider is not configured for swap execution",
+                return refuse(
+                    RejectCode::UnsupportedRoute,
+                    "provider is not configured for swap execution".into(),
                 )
                 .await;
             }
             let direction = req.direction;
-            let quote_id = req.quote_id;
             let result = match direction {
                 SwapDirection::Reverse => start_reverse(ctx, sender, req).await,
                 SwapDirection::Submarine => start_submarine(ctx, sender, req).await,
@@ -1826,14 +1816,7 @@ async fn handle_message(
                 // A failed send is retried. The retry cannot start a second swap: the quote is
                 // single-use and a persisted start replays. At worst the client is refused
                 // with "unknown quote", which still beats waiting out its timeout.
-                return reject(
-                    &ctx.transport,
-                    sender,
-                    None,
-                    Some(quote_id),
-                    &format!("swap start failed: {e}"),
-                )
-                .await;
+                return refuse(refusal_code(&e), format!("swap start failed: {e}")).await;
             }
         }
 
@@ -1846,9 +1829,11 @@ async fn handle_message(
 fn ensure_reverse_hash_available(store: &dyn SwapStore, hash: &PaymentHash) -> Result<()> {
     for record in store.load_all_checked()? {
         if record.direction == SwapDirection::Reverse && record.payment_hash()? == *hash {
-            return Err(anyhow!(
-                "payment hash already belongs to an admitted reverse swap"
-            ));
+            return Err(Refusal::new(
+                RejectCode::InvalidRequest,
+                "payment hash already belongs to an admitted reverse swap",
+            )
+            .into());
         }
     }
     Ok(())
@@ -1983,13 +1968,16 @@ fn replay_record(
         if original.quote_id != request.quote_id {
             continue;
         }
+        // Indistinguishable from a quote nobody holds, so a stranger learns nothing.
         if !authorized_peer(&record, sender, authorization) {
-            return Err(anyhow!("unknown or expired quote"));
+            return Err(Refusal::new(RejectCode::QuoteExpired, "unknown or expired quote").into());
         }
         if original != request {
-            return Err(anyhow!(
-                "quote was already accepted with a different request"
-            ));
+            return Err(Refusal::new(
+                RejectCode::InvalidRequest,
+                "quote was already accepted with a different request",
+            )
+            .into());
         }
         if record.swap_accept.is_none() {
             return Err(anyhow!("persisted creation is missing its acceptance"));
@@ -2014,7 +2002,13 @@ fn status_snapshot(
                 .as_ref()
                 .is_some_and(|original| original.quote_id == quote_id)
         }),
-        _ => return Err(anyhow!("exactly one of swap_id and quote_id is required")),
+        _ => {
+            return Err(Refusal::new(
+                RejectCode::InvalidRequest,
+                "exactly one of swap_id and quote_id is required",
+            )
+            .into())
+        }
     }
     .ok_or(SwapLookupError::NotFound)?;
     if !authorized_peer(&record, sender, authorization) {
@@ -2058,6 +2052,59 @@ impl std::fmt::Display for SwapLookupError {
 
 impl std::error::Error for SwapLookupError {}
 
+/// A refusal whose code the client is told, raised wherever a swap start finds it and carried
+/// through `anyhow` to the one place that replies. Anything else is the provider's own failure.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    code: RejectCode,
+    reason: String,
+}
+
+impl Refusal {
+    pub(crate) fn new(code: RejectCode, reason: impl Into<String>) -> Self {
+        Self {
+            code,
+            reason: reason.into(),
+        }
+    }
+
+    /// A request field that did not parse.
+    fn invalid(error: anyhow::Error) -> Self {
+        Self::new(RejectCode::InvalidRequest, format!("{error:#}"))
+    }
+}
+
+impl From<risk::RejectReason> for Refusal {
+    fn from(reason: risk::RejectReason) -> Self {
+        Self::new(reason.code(), reason.to_string())
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// The code to refuse a failed request with: the [`Refusal`] in its chain, else `internal_error`.
+fn refusal_code(error: &anyhow::Error) -> RejectCode {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<Refusal>())
+        .map_or(RejectCode::InternalError, |refusal| refusal.code)
+}
+
+/// What a swap is reserved for against the risk limits: a reverse swap's on-chain output, or a
+/// submarine swap's whole lockup. Shared by the quote-time check and the reservation.
+fn exposure_sat(direction: SwapDirection, amount_sat: u64, fee_sat: u64) -> u64 {
+    match direction {
+        SwapDirection::Reverse => amount_sat,
+        SwapDirection::Submarine => amount_sat.saturating_add(fee_sat),
+    }
+}
+
 /// Reserve capacity and check the wallet can actually fund this swap, before anything is
 /// promised to the counterparty.
 ///
@@ -2079,7 +2126,7 @@ async fn reserve_for_swap(
             swap_id,
             onchain_amount_sat,
         )
-        .map_err(|reason| anyhow!("{reason}"))?;
+        .map_err(Refusal::from)?;
 
     check_funding_balance(ctx, direction, onchain_amount_sat).await?;
     Ok(guard)
@@ -2096,7 +2143,7 @@ async fn reserve_pending_swap(
             record.swap_id,
             record.onchain_amount_sat,
         )
-        .map_err(|reason| anyhow!("{reason}"))?;
+        .map_err(Refusal::from)?;
     check_funding_balance(ctx, record.direction, record.onchain_amount_sat).await?;
     Ok(guard)
 }
@@ -2120,12 +2167,16 @@ async fn check_funding_balance(
                             .saturating_mul(pricing::FUNDING_VSIZE),
                     );
                 if available < needed {
-                    return Err(anyhow!(
-                        "insufficient on-chain balance: {available} sat available, {needed} sat \
-                         needed for a {onchain_amount_sat} sat swap plus fees and the \
-                         {} sat reserve",
-                        ctx.min_onchain_reserve_sat
-                    ));
+                    return Err(Refusal::new(
+                        RejectCode::LiquidityUnavailable,
+                        format!(
+                            "insufficient on-chain balance: {available} sat available, {needed} \
+                             sat needed for a {onchain_amount_sat} sat swap plus fees and the \
+                             {} sat reserve",
+                            ctx.min_onchain_reserve_sat
+                        ),
+                    )
+                    .into());
                 }
             }
         }
@@ -2142,12 +2193,14 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         .ok_or_else(|| anyhow!("no chain watcher"))?;
     // Everything the request has to get right is checked before the quote is spent, so a
     // malformed request cannot burn a quote its sender could otherwise still use.
-    let claim_pk = parse_pubkey(
-        req.client_claim_pubkey_hex
-            .as_deref()
-            .ok_or_else(|| anyhow!("reverse swap requires client_claim_pubkey"))?,
-    )?;
-    let payment_hash = parse_hash32(&req.payment_hash_hex)?;
+    let claim_pk = parse_pubkey(req.client_claim_pubkey_hex.as_deref().ok_or_else(|| {
+        Refusal::new(
+            RejectCode::InvalidRequest,
+            "reverse swap requires client_claim_pubkey",
+        )
+    })?)
+    .map_err(Refusal::invalid)?;
+    let payment_hash = parse_hash32(&req.payment_hash_hex).map_err(Refusal::invalid)?;
 
     ensure_reverse_hash_available(ctx.store.as_ref(), &payment_hash)?;
     let quote = take_valid_quote(&ctx.quotes, req.quote_id, sender, SwapDirection::Reverse).await?;
@@ -2160,7 +2213,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         sender,
         swap_id,
         SwapDirection::Reverse,
-        quote.amount_sat,
+        exposure_sat(SwapDirection::Reverse, quote.amount_sat, quote.fee_sat),
     )
     .await?;
 
@@ -2367,15 +2420,20 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         .ok_or_else(|| anyhow!("no chain watcher"))?;
     // As in the reverse direction: nothing about the request is taken on trust until it has been
     // checked, and the quote is only spent once it has.
-    let invoice = req
-        .invoice
-        .clone()
-        .ok_or_else(|| anyhow!("submarine swap requires an invoice"))?;
-    let client_refund_pk = parse_pubkey(
-        req.client_refund_pubkey_hex
-            .as_deref()
-            .ok_or_else(|| anyhow!("submarine swap requires client_refund_pubkey"))?,
-    )?;
+    let invoice = req.invoice.clone().ok_or_else(|| {
+        Refusal::new(
+            RejectCode::InvalidRequest,
+            "submarine swap requires an invoice",
+        )
+    })?;
+    let client_refund_pk =
+        parse_pubkey(req.client_refund_pubkey_hex.as_deref().ok_or_else(|| {
+            Refusal::new(
+                RejectCode::InvalidRequest,
+                "submarine swap requires client_refund_pubkey",
+            )
+        })?)
+        .map_err(Refusal::invalid)?;
 
     let quote =
         take_valid_quote(&ctx.quotes, req.quote_id, sender, SwapDirection::Submarine).await?;
@@ -2389,7 +2447,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         sender,
         swap_id,
         SwapDirection::Submarine,
-        quote.amount_sat.saturating_add(quote.fee_sat),
+        exposure_sat(SwapDirection::Submarine, quote.amount_sat, quote.fee_sat),
     )
     .await?;
 
@@ -2403,7 +2461,7 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
         SwapScript::P2wsh => None,
         SwapScript::TaprootBoltz => Some(swap_common::taproot::BoltzTaprootSwap::new(
             SwapDirection::Submarine,
-            &parse_hash32(&req.payment_hash_hex)?,
+            &parse_hash32(&req.payment_hash_hex).map_err(Refusal::invalid)?,
             &claim_pk,
             &client_refund_pk,
             timeout_height,
@@ -2427,8 +2485,12 @@ async fn start_submarine(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Resul
     .await?;
     if let Some(contract) = taproot {
         // The invoice and the script must commit to the same client-supplied hash.
-        if swap.payment_hash != parse_hash32(&req.payment_hash_hex)? {
-            return Err(anyhow!("request payment hash does not match the invoice"));
+        if swap.payment_hash != parse_hash32(&req.payment_hash_hex).map_err(Refusal::invalid)? {
+            return Err(Refusal::new(
+                RejectCode::InvalidRequest,
+                "request payment hash does not match the invoice",
+            )
+            .into());
         }
         swap.htlc_spk = contract.address(ctx.network).script_pubkey();
         swap.htlc_script = bitcoin::ScriptBuf::new();
@@ -3011,14 +3073,12 @@ async fn handle_session_request(
     let Some(message) = customer_request(request.request.message) else {
         return;
     };
-    let Some(current) = offer.read().await.clone() else {
-        return;
-    };
+    let current = offer.read().await.clone();
     ctx.transport = Arc::new(
         ctx.transport
             .session(owner, request.request.scope, request.reply),
     );
-    if handle_message(&ctx, &current, &request.remote_key, message)
+    if handle_message(&ctx, current.as_ref(), &request.remote_key, message)
         .await
         .is_err()
     {
@@ -3037,11 +3097,9 @@ async fn handle_direct_request(
     let Some(message) = customer_request(request.message) else {
         return;
     };
-    let Some(current) = offer.read().await.clone() else {
-        return;
-    };
+    let current = offer.read().await.clone();
     ctx.transport = Arc::new(ctx.transport.root_key(request.reply));
-    if handle_message(&ctx, &current, &request.remote_key, message)
+    if handle_message(&ctx, current.as_ref(), &request.remote_key, message)
         .await
         .is_err()
     {
@@ -3145,48 +3203,26 @@ async fn send_final_status(transport: &Transport, peer: &str, record: &SwapRecor
     }
 }
 
+/// Refuse a request. The code is not optional: a client acts on it, and `reason` is only for
+/// whoever reads it.
 async fn reject(
     transport: &ReplyTransport,
     sender: &str,
-    swap_id: Option<Uuid>,
-    quote_id: Option<Uuid>,
-    reason: &str,
-) -> Result<()> {
-    reject_request(transport, sender, None, swap_id, quote_id, reason).await
-}
-
-async fn reject_request(
-    transport: &ReplyTransport,
-    sender: &str,
     request_id: Option<Uuid>,
     swap_id: Option<Uuid>,
     quote_id: Option<Uuid>,
-    reason: &str,
-) -> Result<()> {
-    reject_coded(
-        transport, sender, request_id, swap_id, quote_id, reason, None,
-    )
-    .await
-}
-
-async fn reject_coded(
-    transport: &ReplyTransport,
-    sender: &str,
-    request_id: Option<Uuid>,
-    swap_id: Option<Uuid>,
-    quote_id: Option<Uuid>,
-    reason: &str,
-    code: Option<&str>,
+    code: RejectCode,
+    reason: String,
 ) -> Result<()> {
     respond(
         transport,
         sender,
         &SwapMessage::Reject(Reject {
-            code: code.map(str::to_string),
+            code: Some(code.as_str().to_string()),
             request_id,
             swap_id,
             quote_id,
-            reason: reason.to_string(),
+            reason,
         }),
     )
     .await
