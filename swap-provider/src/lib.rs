@@ -139,6 +139,10 @@ pub struct ProviderConfig {
     pub allow_unsafe: bool,
     /// How long an issued quote stays valid, in seconds. After this it is rejected and pruned.
     pub quote_ttl_secs: u64,
+    /// Seconds this provider declares it takes to fund its leg once the owner's funding is
+    /// final, advertised on offers and quotes. Declared, not enforced: nothing aborts a late
+    /// funding.
+    pub fund_within_secs: u64,
     /// JSON access policy, reloaded for each new quote and swap. None allows everyone.
     pub access_policy_file: Option<String>,
     /// Directory for persisted in-flight swap state (so a restart can resume them).
@@ -217,6 +221,7 @@ impl Default for ProviderConfig {
             max_routing_fee_msat: 10_000,
             allow_unsafe: false,
             quote_ttl_secs: 300,
+            fund_within_secs: 300,
             access_policy_file: None,
             data_dir: "./pubky-swap-data".to_string(),
             wallet_backend: "bdk".to_string(),
@@ -380,6 +385,21 @@ fn validate_timelocks(c: &ProviderConfig) -> Result<()> {
          {delta}-block final CLTV so the lightning leg outlives it",
         c.htlc_timeout_blocks
     );
+    Ok(())
+}
+
+/// Reject a funding deadline the provider cannot declare.
+///
+/// 0 would advertise nothing while looking configured, and anything past the client's ceiling
+/// gets every quote refused.
+fn validate_fund_within(c: &ProviderConfig) -> Result<()> {
+    let max = swap_common::validate::MAX_FUND_WITHIN_SECS;
+    if c.fund_within_secs == 0 || c.fund_within_secs > max {
+        return Err(anyhow!(
+            "fund_within_secs={} is outside 1..={max}",
+            c.fund_within_secs
+        ));
+    }
     Ok(())
 }
 
@@ -902,6 +922,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     let network = parse_network(&config.network)?;
     // Refuse to start with unsafe mainnet parameters (guards programmatic callers too).
     validate_timelocks(&config)?;
+    validate_fund_within(&config)?;
     validate_mainnet_safety(&config, network)?;
 
     let identity = config.identity()?;
@@ -1480,6 +1501,7 @@ fn build_offer(
         // Advisory: clients should always request a fresh Quote (which carries the firm,
         // enforced expiry) before committing.
         valid_until_unix: now_unix().saturating_add(config.quote_ttl_secs),
+        fund_within_secs: config.fund_within_secs,
         onchain_fee_sat,
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
@@ -1661,6 +1683,7 @@ async fn handle_message(
                 htlc_timeout_blocks: offer.htlc_timeout_blocks,
                 required_confirmations: offer.required_confirmations,
                 valid_until_unix: expires_at_unix,
+                fund_within_secs: offer.fund_within_secs,
                 protocol_version: PROTOCOL_VERSION,
             };
             ctx.quotes.lock().await.insert(
@@ -3441,6 +3464,22 @@ mod tests {
         assert!(validate_mainnet_safety(&cfg(3, 2, false), Network::Bitcoin).is_err());
         // The override permits both.
         assert!(validate_mainnet_safety(&cfg(1, 2, true), Network::Bitcoin).is_ok());
+    }
+
+    #[test]
+    fn fund_within_must_be_declared_and_within_the_client_ceiling() {
+        let with = |fund_within_secs| ProviderConfig {
+            fund_within_secs,
+            ..Default::default()
+        };
+        assert!(validate_fund_within(&ProviderConfig::default()).is_ok());
+        assert!(validate_fund_within(&with(3_600)).is_ok());
+        assert!(validate_fund_within(&with(0)).is_err());
+        assert!(validate_fund_within(&with(3_601)).is_err());
+        // Not a mainnet guard, so `allow_unsafe` does not lift it.
+        let mut unsafe_ok = with(0);
+        unsafe_ok.allow_unsafe = true;
+        assert!(validate_fund_within(&unsafe_ok).is_err());
     }
 
     fn issued(peer: &str, direction: SwapDirection, expires_at_unix: u64) -> IssuedQuote {

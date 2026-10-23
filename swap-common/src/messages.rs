@@ -138,6 +138,10 @@ pub struct SwapOffer {
     pub lightning_node_id: Option<String>,
     /// Unix seconds after which the offer is stale.
     pub valid_until_unix: u64,
+    /// Seconds the provider takes to fund its leg once the owner's funding is final. Advisory,
+    /// like `valid_until_unix`; the quote carries the binding figure. Absent means 0: undeclared.
+    #[serde(default)]
+    pub fund_within_secs: u64,
     /// What the provider expects to spend on chain to run one swap of this kind, at the fee rate
     /// it is currently seeing.
     ///
@@ -268,6 +272,13 @@ pub struct Quote {
     pub htlc_timeout_blocks: u32,
     pub required_confirmations: u32,
     pub valid_until_unix: u64,
+    /// Seconds, for this quote's direction, between the owner's funding becoming final and the
+    /// provider funding its own leg. Absent means 0: undeclared.
+    ///
+    /// Final means the hold invoice accepted for a reverse swap, and the lockup at
+    /// `required_confirmations` for a submarine one. Declared, not enforced.
+    #[serde(default)]
+    pub fund_within_secs: u64,
     /// The wire protocol this provider speaks. Absent means 0.
     ///
     /// Also on `SwapOffer`, and the check belongs on both: an offer is what a client will read
@@ -417,6 +428,7 @@ mod tests {
             htlc_timeout_blocks: 144,
             lightning_node_id: None,
             valid_until_unix: 0,
+            fund_within_secs: 300,
             onchain_fee_sat: 0,
             fee_rate_sat_vb: 0,
             protocol_version: PROTOCOL_VERSION,
@@ -487,9 +499,8 @@ mod tests {
         assert!(offer.accepts_amount(20_000));
     }
 
-    #[test]
-    fn quote_expiry() {
-        let mut q = Quote {
+    fn sample_quote() -> Quote {
+        Quote {
             request_id: None,
             quote_id: Uuid::nil(),
             offer_id: Uuid::nil(),
@@ -503,8 +514,40 @@ mod tests {
             htlc_timeout_blocks: 144,
             required_confirmations: 1,
             valid_until_unix: 1_000,
+            fund_within_secs: 300,
             protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// A provider from before the field existed declares nothing, which reads as 0 rather than
+    /// failing to parse.
+    #[test]
+    fn fund_within_reads_as_undeclared_when_absent_and_round_trips() {
+        let mut offer = serde_json::to_value(sample_offer()).unwrap();
+        offer.as_object_mut().unwrap().remove("fund_within_secs");
+        let offer: SwapOffer = serde_json::from_value(offer).unwrap();
+        assert_eq!(offer.fund_within_secs, 0);
+
+        let mut quote = serde_json::to_value(sample_quote()).unwrap();
+        quote.as_object_mut().unwrap().remove("fund_within_secs");
+        let quote: Quote = serde_json::from_value(quote).unwrap();
+        assert_eq!(quote.fund_within_secs, 0);
+
+        let json = serde_json::to_string(&SwapMessage::Offer(sample_offer())).unwrap();
+        let SwapMessage::Offer(offer) = serde_json::from_str(&json).unwrap() else {
+            panic!("wrong variant");
         };
+        assert_eq!(offer.fund_within_secs, 300);
+        let json = serde_json::to_string(&SwapMessage::Quote(sample_quote())).unwrap();
+        let SwapMessage::Quote(quote) = serde_json::from_str(&json).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(quote.fund_within_secs, 300);
+    }
+
+    #[test]
+    fn quote_expiry() {
+        let mut q = sample_quote();
         assert!(!q.is_expired(999));
         assert!(q.is_expired(1_000));
         assert!(q.is_expired(1_001));

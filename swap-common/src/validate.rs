@@ -20,6 +20,10 @@ use std::fmt;
 /// either broken or trying to get an old price honoured later.
 pub const MAX_QUOTE_VALIDITY_SECS: u64 = 3_600;
 
+/// The longest `fund_within_secs` a quote may declare. Past an hour the owner's payment or lockup
+/// sits idle long enough that the declaration says nothing a client should plan around.
+pub const MAX_FUND_WITHIN_SECS: u64 = 3_600;
+
 /// Slack allowed between the timeout height a quote promised and the one the acceptance carries,
 /// to absorb blocks found between the two messages.
 pub const ACCEPT_TIMEOUT_SLACK_BLOCKS: u32 = 6;
@@ -95,6 +99,10 @@ pub enum ValidationError {
     QuoteNeverExpires,
     QuoteValidTooLong {
         valid_for_secs: u64,
+        max: u64,
+    },
+    FundWithinTooLong {
+        fund_within_secs: u64,
         max: u64,
     },
     TotalNotAmountPlusFee {
@@ -177,6 +185,13 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "quote claims {valid_for_secs}s of validity; the ceiling is {max}s"
+            ),
+            Self::FundWithinTooLong {
+                fund_within_secs,
+                max,
+            } => write!(
+                f,
+                "provider declares it funds within {fund_within_secs}s; the ceiling is {max}s"
             ),
             Self::TotalNotAmountPlusFee { total, amount, fee } => write!(
                 f,
@@ -304,6 +319,13 @@ pub fn validate_quote(
         return Err(ValidationError::QuoteValidTooLong {
             valid_for_secs: valid_for,
             max: MAX_QUOTE_VALIDITY_SECS,
+        });
+    }
+    // 0 is a provider that declares nothing, which is every provider from before the field.
+    if quote.fund_within_secs > MAX_FUND_WITHIN_SECS {
+        return Err(ValidationError::FundWithinTooLong {
+            fund_within_secs: quote.fund_within_secs,
+            max: MAX_FUND_WITHIN_SECS,
         });
     }
 
@@ -540,6 +562,7 @@ mod tests {
             htlc_timeout_blocks: 144,
             required_confirmations: 2,
             valid_until_unix: NOW + 300,
+            fund_within_secs: 300,
             protocol_version: crate::messages::PROTOCOL_VERSION,
         }
     }
@@ -731,6 +754,24 @@ mod tests {
             validate_quote(&q, &request(SwapDirection::Reverse), NOW, &policy()),
             Err(ValidationError::QuoteValidTooLong { .. })
         ));
+    }
+
+    #[test]
+    fn fund_within_is_bounded_and_may_be_undeclared() {
+        let req = request(SwapDirection::Submarine);
+        let mut q = quote(SwapDirection::Submarine);
+        for declared in [0, 300, MAX_FUND_WITHIN_SECS] {
+            q.fund_within_secs = declared;
+            validate_quote(&q, &req, NOW, &policy()).unwrap();
+        }
+        q.fund_within_secs = MAX_FUND_WITHIN_SECS + 1;
+        assert_eq!(
+            validate_quote(&q, &req, NOW, &policy()),
+            Err(ValidationError::FundWithinTooLong {
+                fund_within_secs: MAX_FUND_WITHIN_SECS + 1,
+                max: MAX_FUND_WITHIN_SECS,
+            })
+        );
     }
 
     #[test]

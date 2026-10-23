@@ -407,6 +407,7 @@ mod tests {
             htlc_timeout_blocks: 144,
             required_confirmations: 1,
             valid_until_unix: u64::MAX,
+            fund_within_secs: 300,
             protocol_version: PROTOCOL_VERSION,
         };
         let request = SwapRequest {

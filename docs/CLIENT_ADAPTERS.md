@@ -119,6 +119,30 @@ An adapter accepting an inclusive reverse invoice amount must invert that intege
 and validate the resulting fresh quote. It must not silently reinterpret the invoice amount as
 the on-chain amount.
 
+## Timing
+
+`Quote.fund_within_secs` is how long the provider declares it takes to fund its leg once the
+owner's funding is final. The quote carries `direction`, so the figure is for that direction.
+`SwapOffer.fund_within_secs` repeats it and is advisory, like `SwapOffer.valid_until_unix`. 0 means
+undeclared, which is what a provider from before the field sends. The default is 300. Clients
+refuse a quote declaring more than `MAX_FUND_WITHIN_SECS` (3600), and a provider refuses to start
+with 0 or anything above it.
+
+| Direction | Clock starts | Within the window the provider | Evidence |
+| --- | --- | --- | --- |
+| Reverse | its node reports the hold invoice accepted | broadcasts the HTLC funding | `funding_txid_hex` in the status snapshot |
+| Submarine | the owner's lockup reaches `required_confirmations` | starts paying the owner's invoice | state `InvoicePending` or `InvoicePaid` |
+
+Time before the owner's funding is final never counts. The bound is on the provider's reaction,
+not on block times or Lightning routing. An owner sees when it sent its payment, not when the
+provider's node accepted it, so timing from its own send includes the routing delay.
+
+The figure is declared, not enforced. The provider does not abort a funding that runs late, and
+the owner has nothing to enforce it with: a held Lightning payment cannot be withdrawn, and
+cooperative refund is reserved. The Paykit draft's remedy is attribution through signed terms,
+which arrives with the adapter, whose `terms_hash` is built from the quote. That is why
+`SwapAccept` does not repeat the figure.
+
 ## Delivery lifecycle for application adapters
 
 Use persistent `DirectRpcClient` or `SessionRpcClient` connections for interactive requests.
