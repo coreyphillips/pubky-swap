@@ -8,7 +8,7 @@ use std::time::Duration;
 use swap_common::{
     messages::{SwapMessage, SwapStatusUpdate},
     store::{SwapRecord, SwapRole},
-    SwapState,
+    SwapDirection, SwapState,
 };
 use tracing::warn;
 
@@ -85,17 +85,43 @@ fn schedule_retention(
         // A crash can land between persisting the outcome and preparing its final reply.
         // Recreate that durable publication only inside its recovery window, using exactly
         // the same payload as the driver. Once the window ends, status queries recover it.
-        let update = SwapMessage::SwapStatusUpdate(SwapStatusUpdate {
-            swap_id: record.swap_id,
-            state: record.state.clone(),
-            reference: None,
-        });
-        transport.enqueue_with_scope(&record.peer, &update.delivery_scope(), &update)?;
+        let update = final_update(record);
+        let scope = update.delivery_scope();
+        // A completed scope already holds this reply, or one an earlier build encoded
+        // differently, and refuses new content.
+        if !transport.has_completed_scope(&record.peer, &scope)? {
+            transport.enqueue_with_scope(&record.peer, &scope, &update)?;
+        }
     }
     for scope in scopes {
         transport.complete_scope(&record.peer, &scope, eligible_after)?;
     }
     Ok(())
+}
+
+/// The final notification for a persisted terminal outcome, built here for both the driver and
+/// the retention worker because the outbox recognises a repeated publication by its bytes.
+pub(crate) fn final_update(record: &SwapRecord) -> SwapMessage {
+    SwapMessage::SwapStatusUpdate(SwapStatusUpdate {
+        swap_id: record.swap_id,
+        state: record.state.clone(),
+        reference: settlement_reference(record),
+    })
+}
+
+/// The transaction that evidences a provider record's terminal outcome, when it names one.
+fn settlement_reference(record: &SwapRecord) -> Option<String> {
+    match (&record.state, record.direction) {
+        // The owner's claim, which revealed the preimage the provider settled with.
+        (SwapState::Claimed, SwapDirection::Reverse) => record.claim_observed_txid_hex.clone(),
+        // The provider's own claim or refund.
+        (SwapState::Claimed, SwapDirection::Submarine) | (SwapState::Refunded, _) => {
+            record.spend_txid_hex.clone()
+        }
+        // The HTLC funding, when one exists, which is what any recovery has to spend.
+        (SwapState::Failed(_) | SwapState::Expired, _) => record.funding_txid_hex.clone(),
+        _ => None,
+    }
 }
 
 /// A persisted terminal outcome controls transport retention, never a driver return alone.
@@ -149,10 +175,7 @@ fn delivery_scopes(record: &SwapRecord) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swap_common::{
-        messages::{SwapAccept, SwapRequest},
-        SwapDirection,
-    };
+    use swap_common::messages::{SwapAccept, SwapRequest};
     use uuid::Uuid;
 
     fn record(state: SwapState) -> SwapRecord {
@@ -394,6 +417,100 @@ mod tests {
         let journal = Outbox::open(&path).unwrap();
         assert!(journal.due_pending(1000, 10).unwrap().is_empty());
         assert!(journal.eligible_cleanup(u64::MAX, 10).unwrap().is_empty());
+        drop(journal);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn final_reference_names_the_transaction_behind_each_outcome() {
+        let (funding, spend, claim) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
+        for direction in [SwapDirection::Reverse, SwapDirection::Submarine] {
+            let reference = |state: SwapState| {
+                let mut rec = record(state);
+                rec.direction = direction;
+                rec.funding_txid_hex = Some(funding.clone());
+                rec.spend_txid_hex = Some(spend.clone());
+                rec.claim_observed_txid_hex = Some(claim.clone());
+                settlement_reference(&rec)
+            };
+            let claimed = match direction {
+                SwapDirection::Reverse => &claim,
+                SwapDirection::Submarine => &spend,
+            };
+            assert_eq!(reference(SwapState::Claimed).as_ref(), Some(claimed));
+            assert_eq!(reference(SwapState::Refunded).as_ref(), Some(&spend));
+            assert_eq!(reference(SwapState::Expired).as_ref(), Some(&funding));
+            assert_eq!(
+                reference(SwapState::Failed("backend unavailable".into())).as_ref(),
+                Some(&funding)
+            );
+            for state in [
+                SwapState::Created,
+                SwapState::LockupPending,
+                SwapState::LockupConfirmed,
+                SwapState::InvoicePending,
+                SwapState::InvoicePaid,
+                SwapState::ClaimPending,
+            ] {
+                assert_eq!(reference(state), None);
+            }
+        }
+
+        // A missing transaction leaves the reference empty rather than naming another one.
+        let mut unfunded = record(SwapState::Expired);
+        unfunded.spend_txid_hex = Some(spend.clone());
+        assert_eq!(settlement_reference(&unfunded), None);
+        let mut claimed = record(SwapState::Claimed);
+        claimed.spend_txid_hex = Some(spend);
+        assert_eq!(settlement_reference(&claimed), None);
+
+        claimed.claim_observed_txid_hex = Some(claim.clone());
+        let SwapMessage::SwapStatusUpdate(update) = final_update(&claimed) else {
+            panic!("final update is not a status update");
+        };
+        assert_eq!(update.swap_id, claimed.swap_id);
+        assert_eq!(update.state, SwapState::Claimed);
+        assert_eq!(update.reference, Some(claim));
+    }
+
+    #[test]
+    fn completed_final_reply_from_an_earlier_build_does_not_block_retention() {
+        use pubky_transport::{outbox::Outbox, Transport};
+
+        let directory =
+            std::env::temp_dir().join(format!("provider-legacy-final-{}", Uuid::new_v4()));
+        let path = directory.join("outbox.json");
+        let mut completed = record(SwapState::Claimed);
+        completed.peer = Transport::unsigned([42; 32]).unwrap().public_key_string();
+        completed.claim_observed_txid_hex = Some("cc".repeat(32));
+        let deadline = completed.updated_at_unix + RECOVERY_GRACE;
+        let legacy = SwapMessage::SwapStatusUpdate(SwapStatusUpdate {
+            swap_id: completed.swap_id,
+            state: completed.state.clone(),
+            reference: None,
+        });
+        let transport = Transport::unsigned([41; 32])
+            .unwrap()
+            .with_outbox(&path)
+            .unwrap();
+        let scope = legacy.delivery_scope();
+        transport
+            .enqueue_with_scope(&completed.peer, &scope, &legacy)
+            .unwrap();
+        transport
+            .complete_scope(&completed.peer, &scope, deadline)
+            .unwrap();
+        // The new payload differs, and the outbox refuses new content in a completed scope.
+        assert!(transport
+            .enqueue_with_scope(&completed.peer, &scope, &final_update(&completed))
+            .is_err());
+
+        schedule_retention(&transport, &completed, 1000).unwrap();
+        drop(transport);
+        let journal = Outbox::open(&path).unwrap();
+        let status = journal.status().unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].cleanup_after, Some(deadline));
         drop(journal);
         std::fs::remove_dir_all(directory).unwrap();
     }

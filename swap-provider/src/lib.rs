@@ -793,8 +793,8 @@ async fn finish_driver_run(
 ) {
     match result {
         Ok(state) if state.is_terminal() => {
-            progress.set_terminal(state.clone());
-            notify_terminal_peer(ctx, progress, peer, swap_id, state).await;
+            progress.set_terminal(state);
+            notify_terminal_peer(ctx, progress, peer).await;
         }
         Ok(state) => {
             // A non-terminal return means the driver handed control back rather than finishing:
@@ -832,9 +832,8 @@ async fn finish_driver_run(
                 }
                 Recovery::GiveUp => {
                     error!("swap {swap_id} failed permanently: {e}");
-                    let state = SwapState::Failed(e.to_string());
-                    progress.set_terminal(state.clone());
-                    notify_terminal_peer(ctx, progress, peer, swap_id, state).await;
+                    progress.set_terminal(SwapState::Failed(e.to_string()));
+                    notify_terminal_peer(ctx, progress, peer).await;
                 }
             }
         }
@@ -2035,6 +2034,7 @@ fn status_snapshot(
         funding_txid_hex: record.funding_txid_hex,
         funding_vout: record.funding_vout,
         spend_txid_hex: record.spend_txid_hex,
+        claim_observed_txid_hex: record.claim_observed_txid_hex,
         required_confirmations: record.required_confirmations,
         updated_at_unix: record.updated_at_unix,
         observed_at_unix: now_unix(),
@@ -3116,13 +3116,7 @@ fn spawn_peer_reaper(ctx: &ExecCtx, idle_ttl: Duration) {
     });
 }
 
-async fn notify_terminal_peer(
-    ctx: &ExecCtx,
-    progress: &StoreProgress,
-    peer: &str,
-    swap_id: Uuid,
-    state: SwapState,
-) {
+async fn notify_terminal_peer(ctx: &ExecCtx, progress: &StoreProgress, peer: &str) {
     let record = progress.snapshot();
     if record.peer_account.is_some() {
         return;
@@ -3135,24 +3129,14 @@ async fn notify_terminal_peer(
             return;
         }
     }
-    send_final_status(&ctx.transport, peer, swap_id, Ok(state)).await;
+    send_final_status(&ctx.transport, peer, &record).await;
     evict_peer_if_idle(ctx, peer).await;
 }
 
-async fn send_final_status(
-    transport: &Transport,
-    peer: &str,
-    swap_id: Uuid,
-    result: Result<SwapState>,
-) {
-    let state = result.unwrap_or_else(|e| SwapState::Failed(e.to_string()));
-    info!("Swap {swap_id} finished: {state:?}");
-    let update = SwapStatusUpdate {
-        swap_id,
-        state,
-        reference: None,
-    };
-    let message = SwapMessage::SwapStatusUpdate(update);
+async fn send_final_status(transport: &Transport, peer: &str, record: &SwapRecord) {
+    let swap_id = record.swap_id;
+    info!("Swap {swap_id} finished: {:?}", record.state);
+    let message = delivery::final_update(record);
     if let Err(e) = transport
         .send_with_scope(peer, &message.delivery_scope(), &message)
         .await

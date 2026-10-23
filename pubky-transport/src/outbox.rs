@@ -205,6 +205,21 @@ impl Outbox {
 
     /// Whether a scope has owned resources, including prepared publications not yet sent.
     pub fn has_scope(&self, peer: &str, scope: &str) -> Result<bool> {
+        self.any_in_scope(peer, scope, |_| true)
+    }
+
+    /// Whether a scope has been completed and not reopened since. A completed scope refuses
+    /// resources with new content.
+    pub fn has_completed_scope(&self, peer: &str, scope: &str) -> Result<bool> {
+        self.any_in_scope(peer, scope, |entry| entry.cleanup_after.is_some())
+    }
+
+    fn any_in_scope(
+        &self,
+        peer: &str,
+        scope: &str,
+        matches: impl Fn(&Entry) -> bool,
+    ) -> Result<bool> {
         validate_scope(peer, scope)?;
         let state = self
             .state
@@ -219,7 +234,7 @@ impl Outbox {
             .journal
             .entries
             .iter()
-            .any(|entry| entry.peer == peer && entry.scope == scope))
+            .any(|entry| entry.peer == peer && entry.scope == scope && matches(entry)))
     }
 
     /// Reserve encrypted bytes before I/O. Repeated peer, scope and content reuse the saved resource.
@@ -1306,16 +1321,21 @@ mod tests {
     fn reopened_swaps_revoke_cleanup_without_changing_the_saved_resource() {
         let fixture = Fixture::new();
         let outbox = fixture.open();
+        let peer = fixture.peer.to_string();
         let original = fixture.reserve(&outbox, "quote:a", "acceptance");
         outbox.mark_published(original.id()).unwrap();
+        assert!(!outbox.has_completed_scope(&peer, "quote:a").unwrap());
         outbox
             .complete_scope(&fixture.peer.to_string(), "quote:a", 100)
             .unwrap();
+        assert!(outbox.has_completed_scope(&peer, "quote:a").unwrap());
+        assert!(!outbox.has_completed_scope(&peer, "quote:b").unwrap());
         outbox
             .reopen_scope(&fixture.peer.to_string(), "quote:a")
             .unwrap();
         drop(outbox);
         let outbox = fixture.open();
+        assert!(!outbox.has_completed_scope(&peer, "quote:a").unwrap());
         assert!(outbox.eligible_cleanup(1000, 10).unwrap().is_empty());
         assert!(!outbox.can_cleanup(original.id(), 1000).unwrap());
         assert_eq!(outbox.due_pending(0, 10).unwrap()[0].id(), original.id());
