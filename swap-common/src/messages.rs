@@ -376,6 +376,9 @@ pub struct SwapStatusSnapshot {
     pub funding_txid_hex: Option<String>,
     pub funding_vout: Option<u32>,
     pub spend_txid_hex: Option<String>,
+    /// Reverse only: the owner's claim of the HTLC, as the provider saw it.
+    #[serde(default)]
+    pub claim_observed_txid_hex: Option<String>,
     pub required_confirmations: u32,
     pub updated_at_unix: u64,
     pub observed_at_unix: u64,
@@ -606,6 +609,7 @@ mod tests {
             funding_txid_hex: None,
             funding_vout: None,
             spend_txid_hex: None,
+            claim_observed_txid_hex: None,
             required_confirmations: 1,
             updated_at_unix: 1,
             observed_at_unix: 1,
@@ -620,6 +624,30 @@ mod tests {
             quote_id: Some(accept.quote_id),
         });
         assert_ne!(creation, query.delivery_scope());
+    }
+
+    #[test]
+    fn status_snapshot_from_an_older_provider_has_no_claim_txid() {
+        let snapshot = SwapStatusSnapshot {
+            request_id: None,
+            accept: accepted_swap(),
+            network: NetworkSpec::Regtest,
+            state: SwapState::Claimed,
+            funding_txid_hex: Some("aa".repeat(32)),
+            funding_vout: Some(0),
+            spend_txid_hex: None,
+            claim_observed_txid_hex: Some("cc".repeat(32)),
+            required_confirmations: 1,
+            updated_at_unix: 1,
+            observed_at_unix: 1,
+        };
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("claim_observed_txid_hex");
+        let older: SwapStatusSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(older.claim_observed_txid_hex, None);
+        assert_eq!(older.funding_txid_hex, snapshot.funding_txid_hex);
     }
 
     #[test]

@@ -448,8 +448,10 @@ fn creation_replay_survives_restart_and_rejects_changed_requests() {
 fn status_recovery_is_correlated_owner_only_and_contains_no_secrets() {
     let directory = std::env::temp_dir().join(format!("swap-status-{}", Uuid::new_v4()));
     let store = JsonFileSwapStore::new(&directory).unwrap();
-    let mut record = accepted_record(SwapDirection::Submarine, SwapScript::TaprootBoltz);
+    let mut record = accepted_record(SwapDirection::Reverse, SwapScript::TaprootBoltz);
     record.preimage_hex = Some(hex::encode([7; 32]));
+    let claim_txid = "cc".repeat(32);
+    record.claim_observed_txid_hex = Some(claim_txid.clone());
     store.put(&record).unwrap();
     let request = SwapStatusRequest {
         request_id: Some(Uuid::new_v4()),
@@ -460,7 +462,9 @@ fn status_recovery_is_correlated_owner_only_and_contains_no_secrets() {
     assert_eq!(snapshot.request_id, request.request_id);
     assert_eq!(snapshot.required_confirmations, 2);
     assert_eq!(snapshot.accept.swap_id, record.swap_id);
+    assert_eq!(snapshot.claim_observed_txid_hex.as_ref(), Some(&claim_txid));
     let public_json = serde_json::to_string(&snapshot).unwrap();
+    assert!(public_json.contains(&claim_txid));
     for secret in [
         "secret_key_hex",
         "preimage_hex",

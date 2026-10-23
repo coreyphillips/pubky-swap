@@ -67,11 +67,28 @@ is `SwapStatusSnapshot`, echoing the request identifier and carrying:
 
 - The original `accept` and the explicit Bitcoin `network`.
 - The provider's persisted `state` and `required_confirmations`.
-- `funding_txid_hex`, `funding_vout`, and `spend_txid_hex` when known.
+- `funding_txid_hex`, `funding_vout`, and `spend_txid_hex` when known. `spend_txid_hex` is the
+  provider's own most recent claim or refund broadcast.
+- `claim_observed_txid_hex` on a reverse swap, once the provider has seen the owner's claim.
+  Providers from before this field omit it.
 - `updated_at_unix` for the record and `observed_at_unix` for the response.
 
 Only the authenticated original counterparty can recover this information. The snapshot excludes
 private keys and preimages. Older records without a stored acceptance cannot provide this response.
+
+The final `SwapStatusUpdate` names the transaction behind its outcome in `reference`, which is
+the `evidence` of a terminal Paykit intent status:
+
+| `state` | `reference` |
+| --- | --- |
+| `Claimed`, reverse | the owner's claim, as the provider saw it (`claim_observed_txid_hex`) |
+| `Claimed`, submarine | the provider's claim (`spend_txid_hex`) |
+| `Refunded` | the provider's refund (`spend_txid_hex`) |
+| `Failed`, `Expired` | the HTLC funding (`funding_txid_hex`) |
+
+`reference` is absent when the record has no such transaction, such as an expiry before funding,
+and from providers that predate it. After a fee bump, the spend that confirmed can be an earlier
+version than the one `spend_txid_hex` names.
 
 ### Paykit leg status
 

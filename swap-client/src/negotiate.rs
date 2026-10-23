@@ -990,6 +990,7 @@ mod tests {
                             funding_txid_hex: None,
                             funding_vout: None,
                             spend_txid_hex: None,
+                            claim_observed_txid_hex: None,
                             required_confirmations: 1,
                             updated_at_unix: 0,
                             observed_at_unix: 0,

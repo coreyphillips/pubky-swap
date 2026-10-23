@@ -382,6 +382,15 @@ impl Transport {
         outbox.has_scope(&canonical_pubky(peer)?, scope)
     }
 
+    /// Whether `complete_scope` has run for this scope since it was last reopened.
+    pub fn has_completed_scope(&self, peer: &str, scope: &str) -> Result<bool> {
+        let Some(outbox) = &self.outbox else {
+            return Ok(false);
+        };
+        outbox.check_owner(&self.public_key_string())?;
+        outbox.has_completed_scope(&canonical_pubky(peer)?, scope)
+    }
+
     /// Schedule only this application's owned resources after a durable terminal transition.
     /// The caller must retain swap recovery records and replay protection independently.
     pub fn complete_scope(&self, peer: &str, scope: &str, eligible_after: u64) -> Result<()> {
