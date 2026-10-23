@@ -218,6 +218,21 @@ fn check_parameters(
              for both legs",
         )),
     }
+    match crate::validate_fund_within(config) {
+        Ok(()) => report.push(Check::pass(
+            "fund-within",
+            format!(
+                "{}s after the owner's funding is final",
+                config.fund_within_secs
+            ),
+        )),
+        Err(e) => report.push(Check::fail(
+            "fund-within",
+            e.to_string(),
+            "set --fund-within-secs to how long this provider takes to fund its leg, at most \
+             3600",
+        )),
+    }
     if let Some(network) = network {
         match crate::validate_mainnet_safety(config, network) {
             Ok(()) => report.push(Check::pass("mainnet-safety", "parameters are safe")),
@@ -500,6 +515,7 @@ mod diagnose_tests {
         // Parameters and the data directory are checkable without touching the network, so they
         // pass here: this is a config that is incomplete, not one that is wrong.
         assert_eq!(named("timelocks").map(|c| c.status), Some(Status::Pass));
+        assert_eq!(named("fund-within").map(|c| c.status), Some(Status::Pass));
         assert_eq!(named("data-dir").map(|c| c.status), Some(Status::Pass));
 
         // And every failure carries a remedy, which is the invariant the whole report exists for.

@@ -434,7 +434,7 @@ async fn run_negotiation<P: Channel, F: Channel>(
         println!(
             "QUOTE provider={} direction={} amount_sat={} fee_sat={} service_fee_sat={} \
              onchain_fee_sat={} fee_rate_sat_vb={} total_sat={} timeout_blocks={} \
-             confirmations={} valid_until_unix={} quote_id={}",
+             confirmations={} valid_until_unix={} fund_within_secs={} quote_id={}",
             config.provider_pkarr,
             config.direction.as_str(),
             quote.amount_sat,
@@ -446,6 +446,7 @@ async fn run_negotiation<P: Channel, F: Channel>(
             quote.htlc_timeout_blocks,
             required_confirmations,
             quote.valid_until_unix,
+            quote.fund_within_secs,
             quote.quote_id
         );
         return Ok(());

@@ -614,6 +614,18 @@ fn negotiation_only_providers_do_not_advertise_execution_capabilities() {
         .any(|feature| feature == "dm-retention-v1"));
 }
 
+#[test]
+fn offers_carry_the_configured_fund_within() {
+    let config = ProviderConfig {
+        fund_within_secs: 120,
+        ..Default::default()
+    };
+    for capable in [false, true] {
+        let offer = build_offer(&config, "provider", Network::Regtest, None, 2, capable).unwrap();
+        assert_eq!(offer.fund_within_secs, 120);
+    }
+}
+
 #[cfg(feature = "iroh")]
 mod direct_requests {
     use super::*;
@@ -790,6 +802,10 @@ mod direct_requests {
             panic!("expected a quote, got {reply:?}");
         };
         assert_eq!(issued.request_id, request_id);
+        assert_eq!(
+            issued.fund_within_secs,
+            ProviderConfig::default().fund_within_secs
+        );
         assert!(same_pubky_quote(&ctx, issued.quote_id, &client).await);
 
         // A request naming somebody else's key is refused.

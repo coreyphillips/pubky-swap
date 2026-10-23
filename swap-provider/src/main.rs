@@ -146,6 +146,12 @@ struct Cli {
     #[arg(long)]
     quote_ttl: Option<u64>,
 
+    /// Seconds this provider declares it takes to fund its leg once the owner's funding is
+    /// final: the hold invoice accepted (reverse) or the lockup confirmed (submarine). Advertised
+    /// on offers and quotes, not enforced. 1 to 3600.
+    #[arg(long)]
+    fund_within_secs: Option<u64>,
+
     /// JSON access policy file, reloaded for new quotes and swaps without a restart.
     #[arg(long)]
     access_policy_file: Option<String>,
@@ -255,6 +261,8 @@ struct Overrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     quote_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    fund_within_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     access_policy_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data_dir: Option<String>,
@@ -315,6 +323,7 @@ impl Cli {
             max_new_swaps_per_peer_per_hour: self.max_new_swaps_per_peer_per_hour,
             allow_unsafe: flag(self.allow_unsafe),
             quote_ttl_secs: self.quote_ttl,
+            fund_within_secs: self.fund_within_secs,
             access_policy_file: self.access_policy_file.clone(),
             data_dir: self.data_dir.clone(),
             wallet_backend: self.wallet.clone(),

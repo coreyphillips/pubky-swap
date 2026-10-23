@@ -163,6 +163,7 @@ mod tests {
             htlc_timeout_blocks: 144,
             lightning_node_id: None,
             valid_until_unix: 0,
+            fund_within_secs: 300,
             onchain_fee_sat,
             fee_rate_sat_vb: 5,
             protocol_version: swap_common::messages::PROTOCOL_VERSION,
