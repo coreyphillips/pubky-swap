@@ -676,15 +676,57 @@ mod direct_requests {
 
     /// Send one request as `remote_key` would arrive over the direct protocol.
     async fn ask(ctx: &ExecCtx, remote_key: &str, message: SwapMessage) -> Option<SwapMessage> {
+        ask_with(ctx, offer(), remote_key, message).await
+    }
+
+    async fn ask_with(
+        ctx: &ExecCtx,
+        offer: SharedOffer,
+        remote_key: &str,
+        message: SwapMessage,
+    ) -> Option<SwapMessage> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let request = DirectRpc {
             remote_key: remote_key.into(),
             message: serde_json::to_value(message).unwrap(),
             reply,
         };
-        handle_direct_request(ctx.clone(), offer(), request).await;
+        handle_direct_request(ctx.clone(), offer, request).await;
         let bytes = answer.await.ok()?;
         Some(serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The refusal a request got, which must carry a code this build knows.
+    fn refusal(reply: Option<SwapMessage>) -> (RejectCode, Reject) {
+        match reply {
+            Some(SwapMessage::Reject(reject)) => {
+                let code = reject.code().expect("every refusal carries a known code");
+                (code, reject)
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A provider that can start swaps. Each start below is refused before it needs anything
+    /// past the chain watcher.
+    fn executing(ctx: ExecCtx) -> ExecCtx {
+        ExecCtx {
+            chain: Some(Arc::new(swap_common::chain::mock::MockChain::new())),
+            capable: true,
+            ..ctx
+        }
+    }
+
+    fn quote_request(client: &str, direction: SwapDirection, amount_sat: u64) -> QuoteRequest {
+        QuoteRequest {
+            request_id: Some(Uuid::new_v4()),
+            offer_id: Uuid::nil(),
+            client_pkarr: client.into(),
+            direction,
+            amount_sat,
+            protocol_version: PROTOCOL_VERSION,
+            features: Vec::new(),
+        }
     }
 
     fn owned_record(owner: &str) -> SwapRecord {
@@ -888,7 +930,7 @@ mod direct_requests {
             req.client_pkarr = device.clone();
             handle_message(
                 &session,
-                offer().read().await.as_ref().unwrap(),
+                offer().read().await.as_ref(),
                 &device,
                 SwapMessage::QuoteRequest(req),
             )
@@ -897,6 +939,229 @@ mod direct_requests {
             let message: SwapMessage = serde_json::from_slice(&answer.await.unwrap()).unwrap();
             assert_eq!(matches!(message, SwapMessage::Quote(_)), expected);
         }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quote_refusals_name_their_code_and_the_bound_that_was_missed() {
+        let directory = std::env::temp_dir().join(format!("quote-codes-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let ctx = context(store, Uuid::new_v4());
+        let client = pubky_transport::identity_from_secret(&[46; 32]);
+        let current = offer().read().await.clone().unwrap();
+        let min = current.effective_min_amount_sat();
+        let max = current.max_amount_sat;
+
+        let below = quote_request(&client, SwapDirection::Reverse, min - 1);
+        let (code, reject) =
+            refusal(ask(&ctx, &client, SwapMessage::QuoteRequest(below.clone())).await);
+        assert_eq!(code, RejectCode::AmountBelowMinimum);
+        assert!(
+            reject.reason.contains(&min.to_string()),
+            "{}",
+            reject.reason
+        );
+        assert_eq!(reject.request_id, below.request_id);
+
+        let above = quote_request(&client, SwapDirection::Reverse, max + 1);
+        let (code, reject) = refusal(ask(&ctx, &client, SwapMessage::QuoteRequest(above)).await);
+        assert_eq!(code, RejectCode::AmountAboveMaximum);
+        assert!(
+            reject.reason.contains(&max.to_string()),
+            "{}",
+            reject.reason
+        );
+
+        let mut stale = quote_request(&client, SwapDirection::Reverse, 100_000);
+        stale.offer_id = Uuid::new_v4();
+        let (code, _) = refusal(ask(&ctx, &client, SwapMessage::QuoteRequest(stale)).await);
+        assert_eq!(code, RejectCode::OfferStale);
+
+        let mut future = quote_request(&client, SwapDirection::Reverse, 100_000);
+        future.protocol_version = PROTOCOL_VERSION + 1;
+        let (code, _) = refusal(ask(&ctx, &client, SwapMessage::QuoteRequest(future)).await);
+        assert_eq!(code, RejectCode::UnsupportedProtocol);
+
+        let impostor = quote_request("somebody-else", SwapDirection::Reverse, 100_000);
+        let (code, _) = refusal(ask(&ctx, &client, SwapMessage::QuoteRequest(impostor)).await);
+        assert_eq!(code, RejectCode::InvalidRequest);
+
+        let reverse_only = build_offer(
+            &ProviderConfig {
+                directions: vec![SwapDirection::Reverse],
+                ..Default::default()
+            },
+            &pubky_transport::identity_from_secret(&[40; 32]),
+            Network::Regtest,
+            None,
+            2,
+            true,
+        )
+        .unwrap();
+        let submarine = quote_request(&client, SwapDirection::Submarine, 100_000);
+        let reply = ask_with(
+            &ctx,
+            Arc::new(RwLock::new(Some(reverse_only))),
+            &client,
+            SwapMessage::QuoteRequest(submarine),
+        )
+        .await;
+        assert_eq!(refusal(reply).0, RejectCode::UnsupportedRoute);
+
+        // Before the first offer is priced, offer and quote requests are answered rather than
+        // left to time out. A status query needs no offer and is served as usual.
+        let unpriced = || Arc::new(RwLock::new(None));
+        let request_id = Some(Uuid::new_v4());
+        let reply = ask_with(
+            &ctx,
+            unpriced(),
+            &client,
+            SwapMessage::OfferRequest(OfferRequest { request_id }),
+        )
+        .await;
+        let (code, reject) = refusal(reply);
+        assert_eq!(code, RejectCode::PricingUnavailable);
+        assert_eq!(reject.request_id, request_id);
+        let quote = quote_request(&client, SwapDirection::Reverse, 100_000);
+        let reply = ask_with(&ctx, unpriced(), &client, SwapMessage::QuoteRequest(quote)).await;
+        assert_eq!(refusal(reply).0, RejectCode::PricingUnavailable);
+        let status = SwapStatusRequest {
+            request_id,
+            swap_id: Some(Uuid::new_v4()),
+            quote_id: None,
+        };
+        let reply = ask_with(
+            &ctx,
+            unpriced(),
+            &client,
+            SwapMessage::SwapStatusRequest(status),
+        )
+        .await;
+        assert_eq!(refusal(reply).0, RejectCode::NotFound);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn creation_refusals_name_their_code() {
+        let directory = std::env::temp_dir().join(format!("creation-codes-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let client = pubky_transport::identity_from_secret(&[47; 32]);
+        let creation = || owned_record(&client).swap_request.unwrap();
+
+        // A negotiation-only provider quotes but cannot start anything.
+        let idle = context(store.clone(), Uuid::new_v4());
+        let unknown = creation();
+        let reply = ask(&idle, &client, SwapMessage::SwapRequest(unknown.clone())).await;
+        let (code, reject) = refusal(reply);
+        assert_eq!(code, RejectCode::UnsupportedRoute);
+        assert_eq!(reject.quote_id, Some(unknown.quote_id));
+
+        let mut ctx = executing(context(store.clone(), Uuid::new_v4()));
+        let reply = ask(&ctx, &client, SwapMessage::SwapRequest(unknown.clone())).await;
+        let (code, reject) = refusal(reply);
+        assert_eq!(code, RejectCode::QuoteExpired);
+        assert_eq!(reject.quote_id, Some(unknown.quote_id));
+
+        // Quoted while there was room, redeemed once there was none.
+        let quote = quote_request(&client, SwapDirection::Reverse, 100_000);
+        let Some(SwapMessage::Quote(quote)) =
+            ask(&ctx, &client, SwapMessage::QuoteRequest(quote)).await
+        else {
+            panic!("expected a quote");
+        };
+        ctx.risk = risk::RiskManager::new(risk::RiskLimits {
+            max_total_exposure_sat: 0,
+            ..risk_limits(&ProviderConfig::default())
+        });
+        let mut redeem = creation();
+        redeem.quote_id = quote.quote_id;
+        let (code, _) = refusal(ask(&ctx, &client, SwapMessage::SwapRequest(redeem)).await);
+        assert_eq!(code, RejectCode::LiquidityUnavailable);
+        assert!(store.load_all_checked().unwrap().is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Capacity and rate limits answer a quote request, which is the step a Paykit intent
+    /// refusal maps to, and still bind when the quote is redeemed.
+    #[tokio::test]
+    async fn risk_limits_refuse_at_quote_time_and_again_at_creation() {
+        let directory = std::env::temp_dir().join(format!("risk-codes-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let client = pubky_transport::identity_from_secret(&[48; 32]);
+        let mut ctx = executing(context(store.clone(), Uuid::new_v4()));
+        let quote =
+            || SwapMessage::QuoteRequest(quote_request(&client, SwapDirection::Reverse, 100_000));
+
+        ctx.risk = risk::RiskManager::new(risk::RiskLimits {
+            max_concurrent_swaps: 0,
+            max_concurrent_per_peer: 0,
+            max_total_exposure_sat: 0,
+            max_exposure_per_peer_sat: 0,
+            ..risk_limits(&ProviderConfig::default())
+        });
+        let (code, reject) = refusal(ask(&ctx, &client, quote()).await);
+        assert_eq!(code, RejectCode::LiquidityUnavailable);
+        assert!(reject.reason.contains("limit is 0"), "{}", reject.reason);
+
+        ctx.risk = risk::RiskManager::new(risk_limits(&ProviderConfig {
+            max_new_swaps_per_peer_per_hour: 5,
+            ..Default::default()
+        }));
+        for _ in 0..4 {
+            drop(ctx.risk.reserve(&client, Uuid::new_v4(), 1_000).unwrap());
+        }
+        // Asking for quotes does not use up starts.
+        for _ in 0..3 {
+            assert!(matches!(
+                ask(&ctx, &client, quote()).await,
+                Some(SwapMessage::Quote(_))
+            ));
+        }
+        let Some(SwapMessage::Quote(issued)) = ask(&ctx, &client, quote()).await else {
+            panic!("expected a quote");
+        };
+        // The fifth start lands elsewhere, so redeeming this quote would be the sixth.
+        drop(ctx.risk.reserve(&client, Uuid::new_v4(), 1_000).unwrap());
+        let mut redeem = owned_record(&client).swap_request.unwrap();
+        redeem.quote_id = issued.quote_id;
+        let (code, reject) = refusal(ask(&ctx, &client, SwapMessage::SwapRequest(redeem)).await);
+        assert_eq!(code, RejectCode::RateLimited);
+        assert_eq!(reject.quote_id, Some(issued.quote_id));
+        assert!(store.load_all_checked().unwrap().is_empty());
+        let (code, _) = refusal(ask(&ctx, &client, quote()).await);
+        assert_eq!(code, RejectCode::RateLimited);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Clients match these strings today, so they stay byte-identical.
+    #[tokio::test]
+    async fn status_refusals_keep_their_strings() {
+        let directory = std::env::temp_dir().join(format!("status-codes-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let owner = pubky_transport::identity_from_secret(&[49; 32]);
+        let mut record = invoice_intent();
+        record.peer = owner.clone();
+        record.swap_request.as_mut().unwrap().client_pkarr = owner.clone();
+        store.put(&record).unwrap();
+        let ctx = context(store, record.swap_id);
+        let status = |swap_id, quote_id| {
+            SwapMessage::SwapStatusRequest(SwapStatusRequest {
+                request_id: Some(Uuid::new_v4()),
+                swap_id,
+                quote_id,
+            })
+        };
+
+        let (_, reject) = refusal(ask(&ctx, &owner, status(Some(record.swap_id), None)).await);
+        assert_eq!(reject.code.as_deref(), Some("pending"));
+        let (_, reject) = refusal(ask(&ctx, &owner, status(Some(Uuid::new_v4()), None)).await);
+        assert_eq!(reject.code.as_deref(), Some("not_found"));
+        let quote_id = record.swap_request.as_ref().unwrap().quote_id;
+        let both = status(Some(record.swap_id), Some(quote_id));
+        assert_eq!(
+            refusal(ask(&ctx, &owner, both).await).0,
+            RejectCode::InvalidRequest
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

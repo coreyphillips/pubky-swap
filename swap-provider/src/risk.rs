@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use swap_common::messages::RejectCode;
 use swap_common::store::SwapRecord;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -64,6 +65,21 @@ pub enum RejectReason {
     PeerExposureExceeded { committed_sat: u64, max_sat: u64 },
     RateLimited { started: u32, max_per_hour: u32 },
     AlreadyReserved,
+}
+
+impl RejectReason {
+    /// What the client is told. The `Display` text stays the reason, for whoever reads it.
+    pub fn code(&self) -> RejectCode {
+        match self {
+            Self::AtCapacity { .. }
+            | Self::PeerAtCapacity { .. }
+            | Self::ExposureExceeded { .. }
+            | Self::PeerExposureExceeded { .. } => RejectCode::LiquidityUnavailable,
+            Self::RateLimited { .. } => RejectCode::RateLimited,
+            // Another request for this very swap holds it, and is still admitting it.
+            Self::AlreadyReserved => RejectCode::Pending,
+        }
+    }
 }
 
 impl std::fmt::Display for RejectReason {
@@ -251,6 +267,61 @@ impl RiskManager {
         amount_sat: u64,
     ) -> std::result::Result<ReservationGuard, RejectReason> {
         self.reserve_inner(peer, swap_id, amount_sat, ReservationMode::Pending)
+    }
+
+    /// Whether [`reserve`](Self::reserve) would admit a new swap for `peer` now, without
+    /// reserving anything or recording a start.
+    ///
+    /// Asked at quote time, which is the step a Paykit intent refusal answers, so capacity and
+    /// rate limits can refuse an intent rather than only a quote's redemption. Advisory: the
+    /// counters can move before the `SwapRequest`, whose reservation is the one that binds. Keep
+    /// the checks and their order in step with `reserve_inner`.
+    pub fn admissible(&self, peer: &str, amount_sat: u64) -> std::result::Result<(), RejectReason> {
+        let inner = self.locked();
+        let now = Instant::now();
+        let hour = Duration::from_secs(3600);
+        let (started, in_flight, committed_sat) =
+            inner.peers.get(peer).map_or((0, 0, 0), |state| {
+                let started = state
+                    .recent_starts
+                    .iter()
+                    .filter(|t| now.duration_since(**t) < hour)
+                    .count() as u32;
+                (started, state.in_flight, state.committed_sat)
+            });
+        if started >= self.limits.max_new_swaps_per_peer_per_hour {
+            return Err(RejectReason::RateLimited {
+                started,
+                max_per_hour: self.limits.max_new_swaps_per_peer_per_hour,
+            });
+        }
+        if in_flight >= self.limits.max_concurrent_per_peer {
+            return Err(RejectReason::PeerAtCapacity {
+                in_flight,
+                max: self.limits.max_concurrent_per_peer,
+            });
+        }
+        let would_commit = committed_sat.saturating_add(amount_sat);
+        if would_commit > self.limits.max_exposure_per_peer_sat {
+            return Err(RejectReason::PeerExposureExceeded {
+                committed_sat: would_commit,
+                max_sat: self.limits.max_exposure_per_peer_sat,
+            });
+        }
+        if inner.total_in_flight >= self.limits.max_concurrent_swaps {
+            return Err(RejectReason::AtCapacity {
+                in_flight: inner.total_in_flight,
+                max: self.limits.max_concurrent_swaps,
+            });
+        }
+        let would_commit = inner.total_committed_sat.saturating_add(amount_sat);
+        if would_commit > self.limits.max_total_exposure_sat {
+            return Err(RejectReason::ExposureExceeded {
+                committed_sat: would_commit,
+                max_sat: self.limits.max_total_exposure_sat,
+            });
+        }
+        Ok(())
     }
 
     fn reserve_inner(
@@ -526,6 +597,105 @@ mod tests {
         );
         // An honest peer is unaffected.
         assert!(m.reserve("alice", Uuid::new_v4(), 1_000).is_ok());
+    }
+
+    #[test]
+    fn each_refusal_reaches_the_client_as_its_code() {
+        let cases = [
+            (
+                RejectReason::AtCapacity {
+                    in_flight: 3,
+                    max: 3,
+                },
+                RejectCode::LiquidityUnavailable,
+            ),
+            (
+                RejectReason::PeerAtCapacity {
+                    in_flight: 2,
+                    max: 2,
+                },
+                RejectCode::LiquidityUnavailable,
+            ),
+            (
+                RejectReason::ExposureExceeded {
+                    committed_sat: 2,
+                    max_sat: 1,
+                },
+                RejectCode::LiquidityUnavailable,
+            ),
+            (
+                RejectReason::PeerExposureExceeded {
+                    committed_sat: 2,
+                    max_sat: 1,
+                },
+                RejectCode::LiquidityUnavailable,
+            ),
+            (
+                RejectReason::RateLimited {
+                    started: 5,
+                    max_per_hour: 5,
+                },
+                RejectCode::RateLimited,
+            ),
+            (RejectReason::AlreadyReserved, RejectCode::Pending),
+        ];
+        for (reason, code) in cases {
+            assert_eq!(reason.code(), code, "{reason}");
+        }
+    }
+
+    /// The quote-time check answers what a reservation would, and leaves no trace: a client
+    /// asking for quotes must not use up its own hourly starts.
+    #[test]
+    fn admissible_predicts_a_new_reservation_without_making_one() {
+        let m = RiskManager::new(limits());
+        let _alice = m.reserve("alice", Uuid::new_v4(), 300_000).unwrap();
+        for _ in 0..10 {
+            assert_eq!(m.admissible("bob", 50_000), Ok(()));
+        }
+        assert_eq!(m.in_flight(), 1);
+        assert_eq!(m.committed_sat(), 300_000);
+        assert!(m.per_peer().iter().all(|p| p.peer != "bob"));
+
+        let _bob = [
+            m.reserve("bob", Uuid::new_v4(), 50_000).unwrap(),
+            m.reserve("bob", Uuid::new_v4(), 50_000).unwrap(),
+        ];
+        // Alice's own ceiling, Bob's own concurrency, then the provider's concurrency.
+        for (peer, amount) in [("alice", 200_000), ("bob", 1), ("carol", 1)] {
+            let predicted = m.admissible(peer, amount);
+            assert!(predicted.is_err(), "{peer} {amount}");
+            assert_eq!(
+                m.reserve(peer, Uuid::new_v4(), amount).err(),
+                predicted.err(),
+                "{peer} {amount}"
+            );
+        }
+
+        let m = RiskManager::new(RiskLimits {
+            max_total_exposure_sat: 500_000,
+            ..limits()
+        });
+        let _alice = m.reserve("alice", Uuid::new_v4(), 300_000).unwrap();
+        let predicted = m.admissible("carol", 300_000);
+        assert!(matches!(
+            predicted,
+            Err(RejectReason::ExposureExceeded { .. })
+        ));
+        assert_eq!(
+            m.reserve("carol", Uuid::new_v4(), 300_000).err(),
+            predicted.err()
+        );
+
+        let m = RiskManager::new(limits());
+        for _ in 0..limits().max_new_swaps_per_peer_per_hour {
+            drop(m.reserve("griefer", Uuid::new_v4(), 1_000).unwrap());
+        }
+        assert!(matches!(
+            m.admissible("griefer", 1_000),
+            Err(RejectReason::RateLimited { .. })
+        ));
+        assert_eq!(m.admissible("alice", 1_000), Ok(()));
     }
 
     /// Exposure belongs to the swaps that exist, not to this process's uptime.

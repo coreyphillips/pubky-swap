@@ -402,14 +402,134 @@ pub struct CoopSignature {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reject {
-    /// Machine-readable recovery outcome, when available.
+    /// A [`RejectCode`] as its string. Kept a string on the wire so a code added later still
+    /// parses on an older client; read it through [`Reject::code`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<Uuid>,
     pub swap_id: Option<Uuid>,
     pub quote_id: Option<Uuid>,
+    /// For a person. Its wording is not part of the protocol.
     pub reason: String,
+}
+
+impl Reject {
+    /// The refusal's code. `None` when the provider sent none, which every provider from before
+    /// the vocabulary does, or sent one this build does not know.
+    pub fn code(&self) -> Option<RejectCode> {
+        self.code.as_deref()?.parse().ok()
+    }
+}
+
+/// Why a provider refused a request, so a client can act on it without parsing `reason`.
+///
+/// Closed: a provider sends nothing outside this set. The first three predate it and keep their
+/// strings. The next eight are the Paykit Intents draft's refusal reasons. The last four are local
+/// cases the draft has no word for, which an adapter reports as its generic decline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectCode {
+    /// A status lookup found no swap this sender owns.
+    NotFound,
+    /// The swap is admitted but not yet ready to describe, or another request is admitting it.
+    Pending,
+    /// The provider's access policy refuses this sender.
+    AccessDenied,
+    /// The provider does not offer this direction, or cannot execute swaps at all.
+    UnsupportedRoute,
+    /// Below the offer's effective minimum, which `reason` states.
+    AmountBelowMinimum,
+    /// Above the offer's maximum, which `reason` states.
+    AmountAboveMaximum,
+    /// The provider's capacity, exposure limits or wallet cannot take this swap now.
+    LiquidityUnavailable,
+    /// This sender has started too many swaps recently.
+    RateLimited,
+    /// The provider has not priced its offer yet.
+    PricingUnavailable,
+    /// The quote is unknown to the provider or has expired.
+    QuoteExpired,
+    /// The submarine invoice cannot be paid on the quoted terms.
+    InvalidDestination,
+    /// The request is malformed or contradicts itself or an earlier one.
+    InvalidRequest,
+    /// The sender's protocol version is outside what the provider speaks.
+    UnsupportedProtocol,
+    /// The request names an offer that is no longer current.
+    OfferStale,
+    /// The provider failed for a reason of its own.
+    InternalError,
+}
+
+impl RejectCode {
+    pub const ALL: [Self; 15] = [
+        Self::NotFound,
+        Self::Pending,
+        Self::AccessDenied,
+        Self::UnsupportedRoute,
+        Self::AmountBelowMinimum,
+        Self::AmountAboveMaximum,
+        Self::LiquidityUnavailable,
+        Self::RateLimited,
+        Self::PricingUnavailable,
+        Self::QuoteExpired,
+        Self::InvalidDestination,
+        Self::InvalidRequest,
+        Self::UnsupportedProtocol,
+        Self::OfferStale,
+        Self::InternalError,
+    ];
+
+    /// The string sent in [`Reject::code`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::Pending => "pending",
+            Self::AccessDenied => "access_denied",
+            Self::UnsupportedRoute => "unsupported_route",
+            Self::AmountBelowMinimum => "amount_below_minimum",
+            Self::AmountAboveMaximum => "amount_above_maximum",
+            Self::LiquidityUnavailable => "liquidity_unavailable",
+            Self::RateLimited => "rate_limited",
+            Self::PricingUnavailable => "pricing_unavailable",
+            Self::QuoteExpired => "quote_expired",
+            Self::InvalidDestination => "invalid_destination",
+            Self::InvalidRequest => "invalid_request",
+            Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::OfferStale => "offer_stale",
+            Self::InternalError => "internal_error",
+        }
+    }
+}
+
+impl std::fmt::Display for RejectCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A string that is not a [`RejectCode`] this build knows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownRejectCode;
+
+impl std::fmt::Display for UnknownRejectCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unknown reject code")
+    }
+}
+
+impl std::error::Error for UnknownRejectCode {}
+
+impl std::str::FromStr for RejectCode {
+    type Err = UnknownRejectCode;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|code| code.as_str() == value)
+            .ok_or(UnknownRejectCode)
+    }
 }
 
 #[cfg(test)]
@@ -675,6 +795,57 @@ mod tests {
             })
             .delivery_scope()
         );
+    }
+
+    #[test]
+    fn every_reject_code_round_trips_as_its_snake_case_string() {
+        for code in RejectCode::ALL {
+            let text = code.as_str();
+            assert!(text.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+            assert_eq!(serde_json::to_value(code).unwrap(), text);
+            assert_eq!(
+                serde_json::from_value::<RejectCode>(text.into()).unwrap(),
+                code
+            );
+            assert_eq!(text.parse::<RejectCode>(), Ok(code));
+            let reject = Reject {
+                code: Some(text.into()),
+                request_id: None,
+                swap_id: None,
+                quote_id: None,
+                reason: String::new(),
+            };
+            assert_eq!(reject.code(), Some(code));
+        }
+        // Clients already match on these, so they must not change.
+        assert_eq!(RejectCode::NotFound.as_str(), "not_found");
+        assert_eq!(RejectCode::Pending.as_str(), "pending");
+        assert_eq!(RejectCode::AccessDenied.as_str(), "access_denied");
+    }
+
+    /// A code from a newer provider, or from none at all, reads as absent rather than failing
+    /// the whole message.
+    #[test]
+    fn an_unknown_or_absent_reject_code_reads_as_none() {
+        let json = serde_json::json!({
+            "type": "Reject",
+            "code": "bogus",
+            "swap_id": null,
+            "quote_id": null,
+            "reason": "from the future"
+        });
+        let SwapMessage::Reject(reject) = serde_json::from_value(json.clone()).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(reject.code.as_deref(), Some("bogus"));
+        assert_eq!(reject.code(), None);
+
+        let mut older = json;
+        older.as_object_mut().unwrap().remove("code");
+        let SwapMessage::Reject(reject) = serde_json::from_value(older).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(reject.code(), None);
     }
 
     #[test]

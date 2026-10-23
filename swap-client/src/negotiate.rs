@@ -748,10 +748,12 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
                     info!("recovered swap {} by its quote", snapshot.accept.swap_id);
                     return Ok(snapshot.accept);
                 }
-                Ok(SwapMessage::Reject(Reject {
-                    code, request_id, ..
-                })) if request_id == query.request_id
-                    && !matches!(code.as_deref(), Some("not_found" | "pending")) =>
+                Ok(SwapMessage::Reject(reject))
+                    if reject.request_id == query.request_id
+                        && !matches!(
+                            reject.code(),
+                            Some(RejectCode::NotFound | RejectCode::Pending)
+                        ) =>
                 {
                     return Err(cause);
                 }
@@ -814,9 +816,30 @@ async fn negotiation_deadline<T>(
         })?
 }
 
+/// A provider's refusal. Negotiation errors carry it, so a caller can downcast to act on the code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rejected {
+    /// `None` from a provider that predates refusal codes, or with a code this build does not
+    /// know.
+    pub code: Option<RejectCode>,
+    pub reason: String,
+}
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "provider rejected: {}", self.reason)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
 fn rejection(reply: SwapMessage) -> Error {
     match reply {
-        SwapMessage::Reject(reject) => anyhow!("provider rejected: {}", reject.reason),
+        SwapMessage::Reject(reject) => Rejected {
+            code: reject.code(),
+            reason: reject.reason,
+        }
+        .into(),
         _ => anyhow!("provider replied with an unexpected message"),
     }
 }
@@ -948,8 +971,8 @@ mod tests {
         /// Refuse a creation whose quote was already spent, as a provider still admitting the
         /// first attempt does when the resend races it.
         refuse_replays: AtomicBool,
-        /// Status queries answered `pending` before the admitted swap is reported.
-        pending_status_replies: AtomicUsize,
+        /// Codes status queries are refused with, in order, before the swap is reported.
+        status_refusals: Mutex<VecDeque<RejectCode>>,
     }
 
     impl Provider {
@@ -961,7 +984,7 @@ mod tests {
                         if original == request && !self.refuse_replays.load(Ordering::SeqCst) {
                             return SwapMessage::SwapAccept(accept.clone());
                         }
-                        return reject("unknown or expired quote");
+                        return coded(RejectCode::QuoteExpired, None, "unknown or expired quote");
                     }
                     self.creations.fetch_add(1, Ordering::SeqCst);
                     let accept = acceptance(request.quote_id);
@@ -969,16 +992,8 @@ mod tests {
                     SwapMessage::SwapAccept(accept)
                 }
                 SwapMessage::SwapStatusRequest(query) => {
-                    let pending = &self.pending_status_replies;
-                    if pending.load(Ordering::SeqCst) > 0 {
-                        pending.fetch_sub(1, Ordering::SeqCst);
-                        return SwapMessage::Reject(Reject {
-                            code: Some("pending".into()),
-                            request_id: None,
-                            swap_id: None,
-                            quote_id: None,
-                            reason: "invoice creation is pending".into(),
-                        });
+                    if let Some(code) = self.status_refusals.lock().unwrap().pop_front() {
+                        return coded(code, query.request_id, "refused by the test");
                     }
                     let accepted = self.accepted.lock().unwrap();
                     match query.quote_id.and_then(|id| accepted.get(&id)) {
@@ -995,7 +1010,7 @@ mod tests {
                             updated_at_unix: 0,
                             observed_at_unix: 0,
                         }),
-                        None => reject("unknown swap"),
+                        None => coded(RejectCode::NotFound, query.request_id, "unknown swap"),
                     }
                 }
                 SwapMessage::QuoteRequest(request) => SwapMessage::Quote(Quote {
@@ -1020,10 +1035,21 @@ mod tests {
         }
     }
 
+    /// A refusal as a provider from before refusal codes sends it.
     fn reject(reason: &str) -> SwapMessage {
         SwapMessage::Reject(Reject {
             code: None,
             request_id: None,
+            swap_id: None,
+            quote_id: None,
+            reason: reason.into(),
+        })
+    }
+
+    fn coded(code: RejectCode, request_id: Option<Uuid>, reason: &str) -> SwapMessage {
+        SwapMessage::Reject(Reject {
+            code: Some(code.as_str().into()),
+            request_id,
             swap_id: None,
             quote_id: None,
             reason: reason.into(),
@@ -1260,7 +1286,11 @@ mod tests {
     async fn a_lost_reply_on_every_transport_is_recovered_through_status() {
         let provider = Arc::new(Provider::default());
         provider.refuse_replays.store(true, Ordering::SeqCst);
-        provider.pending_status_replies.store(1, Ordering::SeqCst);
+        provider
+            .status_refusals
+            .lock()
+            .unwrap()
+            .push_back(RejectCode::Pending);
         let negotiator = negotiator(
             &provider,
             [Fault::LostReply, Fault::LostReply],
@@ -1323,8 +1353,75 @@ mod tests {
             error.to_string().contains("unknown or expired quote"),
             "{error}"
         );
+        assert_eq!(
+            error.downcast_ref::<Rejected>().and_then(|r| r.code),
+            Some(RejectCode::QuoteExpired)
+        );
         assert_eq!(negotiator.preferred().unwrap().0.seen().len(), 2);
         assert!(negotiator.fallback().unwrap().0.seen().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_error_carries_its_code_when_there_is_one() {
+        let refused = |reply: SwapMessage| rejection(reply).downcast::<Rejected>().ok();
+        assert_eq!(
+            refused(coded(RejectCode::RateLimited, None, "slow down")),
+            Some(Rejected {
+                code: Some(RejectCode::RateLimited),
+                reason: "slow down".into(),
+            })
+        );
+        // A provider from before codes, and a code from a provider newer than this build.
+        assert_eq!(refused(reject("no")).unwrap().code, None);
+        let SwapMessage::Reject(mut newer) = reject("no") else {
+            unreachable!()
+        };
+        newer.code = Some("bogus".into());
+        assert_eq!(refused(SwapMessage::Reject(newer)).unwrap().code, None);
+        assert!(refused(SwapMessage::SwapAccept(acceptance(Uuid::new_v4()))).is_none());
+    }
+
+    /// `not_found` and `pending` only mean "not yet" while a creation may still land. Any other
+    /// correlated refusal of the status query ends recovery at once, with the creation's own
+    /// refusal as the error.
+    #[tokio::test(start_paused = true)]
+    async fn recovery_waits_out_not_found_and_pending_and_stops_at_any_other_code() {
+        let provider = Arc::new(Provider::default());
+        provider.refuse_replays.store(true, Ordering::SeqCst);
+        provider
+            .status_refusals
+            .lock()
+            .unwrap()
+            .extend([RejectCode::NotFound, RejectCode::Pending]);
+        let negotiator = negotiator(&provider, [Fault::LostReply], Some(vec![]));
+        let request = swap_request(Uuid::new_v4());
+        let accept = negotiator.create(&request).await.unwrap();
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            accept.swap_id,
+            provider.accepted.lock().unwrap()[&request.quote_id]
+                .1
+                .swap_id
+        );
+
+        let provider = Arc::new(Provider::default());
+        provider.refuse_replays.store(true, Ordering::SeqCst);
+        provider
+            .status_refusals
+            .lock()
+            .unwrap()
+            .push_back(RejectCode::InternalError);
+        let refused = self::negotiator(&provider, [Fault::LostReply], Some(vec![]));
+        let started = Instant::now();
+        let error = refused
+            .create(&swap_request(Uuid::new_v4()))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < RECOVERY_POLL, "nothing was waited out");
+        assert_eq!(
+            error.downcast_ref::<Rejected>().and_then(|r| r.code),
+            Some(RejectCode::QuoteExpired)
+        );
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@
 //! Lightning payment costs it nothing on-chain.
 
 use crate::reverse::{OnchainWallet, ProgressSink, Resume};
+use crate::Refusal;
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::SecretKey;
 use bitcoin::{Network, OutPoint, PublicKey, ScriptBuf, Txid};
@@ -25,6 +26,7 @@ use swap_common::chain::{
 };
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::{build_htlc_script, htlc_p2wsh_address, payment_hash, PaymentHash};
+use swap_common::messages::RejectCode;
 use swap_common::onchain::{
     build_claim_tx, estimate_spend_fee, extract_preimage, fee_rate_cap, spend_vsize,
     ABSOLUTE_MAX_FEE_RATE_SAT_VB, CLAIM_FEE_TARGET_BLOCKS, DEFAULT_MAX_FEE_BPS,
@@ -83,19 +85,22 @@ pub async fn init_submarine_swap(
         .await
         .map_err(|e| anyhow!("decode invoice: {e}"))?;
     let payment_hash = decoded.payment_hash;
+    let refuse = |reason: String| -> anyhow::Error {
+        Refusal::new(RejectCode::InvalidDestination, reason).into()
+    };
     // An amountless invoice lets the payer choose what to send, which is not a swap. Reject it
     // rather than deriving an on-chain amount from a zero.
     if !decoded.amount_is_explicit {
-        return Err(anyhow!(
-            "the client's invoice carries no amount; a swap needs an amount-bearing invoice"
+        return Err(refuse(
+            "the client's invoice carries no amount; a swap needs an amount-bearing invoice".into(),
         ));
     }
     // A sub-satoshi remainder would be paid over Lightning but never charged on-chain.
     if decoded.amount_msat % 1000 != 0 {
-        return Err(anyhow!(
+        return Err(refuse(format!(
             "invoice amount {} msat is not a whole number of satoshis",
             decoded.amount_msat
-        ));
+        )));
     }
     let invoice_amount_sat = decoded.amount_msat / 1000;
     // The quote is what was priced, rate-limited and reserved against the risk limits; the
@@ -104,10 +109,10 @@ pub async fn init_submarine_swap(
     // charged on the small number and the exposure was booked on it too, while the provider
     // committed to paying the large one.
     if invoice_amount_sat != quoted_amount_sat {
-        return Err(anyhow!(
+        return Err(refuse(format!(
             "the client's invoice is for {invoice_amount_sat} sat but the quote is for \
              {quoted_amount_sat} sat"
-        ));
+        )));
     }
     // The outgoing Lightning HTLC has to end early enough to still claim on chain afterwards.
     // This refuses an invoice that could never fit before a payment is attempted; the `cltv_limit`
@@ -118,9 +123,9 @@ pub async fn init_submarine_swap(
         decoded.min_final_cltv_expiry,
         &timelock,
     ) {
-        return Err(anyhow!(
+        return Err(refuse(format!(
             "the client's invoice demands too much final CLTV: {violation}"
-        ));
+        )));
     }
     let onchain_amount_sat = invoice_amount_sat
         .checked_add(provider_fee_sat)
@@ -771,6 +776,7 @@ mod tests {
             err.to_string().contains("but the quote is for"),
             "got: {err}"
         );
+        assert_eq!(crate::refusal_code(&err), RejectCode::InvalidDestination);
     }
 
     /// The submarine theft condition, and the mirror of the one fixed in #9.
@@ -814,6 +820,7 @@ mod tests {
             err.to_string().contains("too much final CLTV"),
             "got: {err}"
         );
+        assert_eq!(crate::refusal_code(&err), RejectCode::InvalidDestination);
     }
 
     /// And the payment itself carries the bound, because the invoice's own demand is only the
