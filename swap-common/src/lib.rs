@@ -30,4 +30,4 @@ pub mod wallet;
 pub use error::{Result, SwapError};
 pub use keys::{random_keypair, random_secret_key};
 pub use messages::*;
-pub use swap::{NetworkSpec, SwapDirection, SwapState};
+pub use swap::{LegStatus, NetworkSpec, SwapDirection, SwapState};
