@@ -575,6 +575,15 @@ fn legacy_creation_messages_default_to_p2wsh() {
     let accept: SwapAccept = serde_json::from_value(accept).unwrap();
     assert_eq!(accept.script_type, SwapScript::P2wsh);
     assert!(accept.swap_tree.is_none());
+
+    // The script and address follow from the rest, so an acceptance may leave them out.
+    let mut compact = serde_json::to_value(&accept).unwrap();
+    compact.as_object_mut().unwrap().remove("htlc_script_hex");
+    compact.as_object_mut().unwrap().remove("htlc_address");
+    let compact: SwapAccept = serde_json::from_value(compact).unwrap();
+    assert!(compact.htlc_script_hex.is_empty());
+    assert!(compact.htlc_address.is_empty());
+    assert_eq!(compact.provider_pubkey_hex, accept.provider_pubkey_hex);
 }
 
 #[test]

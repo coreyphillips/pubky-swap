@@ -521,7 +521,7 @@ async fn run_negotiation<P: Channel, F: Channel>(
     let accept = negotiator.create(&sreq).await?;
     store::record_creation_reply(store, client_swap_id, &accept)?;
     negotiator.acknowledge(&SwapMessage::SwapRequest(sreq.clone()))?;
-    info!("Provider locked HTLC at {}", accept.htlc_address);
+    info!("Provider accepted swap {}", accept.swap_id);
 
     // 5a) Check the numbers the provider chose against the quote we agreed to. The script check
     //     below binds the payment hash, both pubkeys, and the timeout height, but it cannot bind
@@ -533,27 +533,13 @@ async fn run_negotiation<P: Channel, F: Channel>(
     }
 
     // 5b) Independently verify the HTLC the provider built actually pays OUR claim key under OUR
-    //    payment hash before we pay anything. Rebuild the expected redeem script and compare.
-    let provider_refund_pk = parse_pubkey(&accept.provider_pubkey_hex)?;
-    let expected_script = build_htlc_script(
-        &ph,
-        &claim_pk,
-        &provider_refund_pk,
-        accept.timeout_block_height,
+    //    payment hash before we pay anything.
+    let (expected_script, htlc_spk) =
+        verify_p2wsh_contract(&accept, SwapDirection::Reverse, &ph, &claim_pk, network)?;
+    info!(
+        "Verified the HTLC at {} pays our claim key under our payment hash",
+        htlc_p2wsh_address(&expected_script, network)
     );
-    if hex::encode(expected_script.as_bytes()) != accept.htlc_script_hex {
-        return Err(anyhow!(
-            "provider HTLC script does not match the expected reverse-swap script; aborting"
-        ));
-    }
-    let htlc_address = htlc_p2wsh_address(&expected_script, network);
-    if htlc_address.to_string() != accept.htlc_address {
-        return Err(anyhow!(
-            "provider HTLC address {} does not match the verified script; aborting",
-            accept.htlc_address
-        ));
-    }
-    info!("Verified HTLC script and address match our claim key and payment hash");
 
     // 6) Execute, if the client is configured to (own LND + Electrum + a claim destination — either
     //    an explicit --claim-address or `--wallet lnd`, which sweeps into LND's own wallet).
@@ -628,12 +614,13 @@ async fn run_negotiation<P: Channel, F: Channel>(
         store,
         client_swap_id,
         &accept,
+        &expected_script,
         hex::encode(dest_spk.as_bytes()),
     )?;
 
     let claim = ReverseClaim {
         htlc_script: expected_script,
-        htlc_spk: htlc_address.script_pubkey(),
+        htlc_spk,
         // Checked equal to `quote.amount_sat` above; use our own number regardless.
         onchain_amount_sat: quote.amount_sat,
         timeout_height: accept.timeout_block_height,
@@ -777,27 +764,11 @@ async fn run_submarine<P: Channel, F: Channel>(
 
     // 5b) Verify the HTLC pays the provider's claim key under OUR payment hash and is refundable
     //    by OUR key, before funding anything.
-    let provider_claim_pk = parse_pubkey(&accept.provider_pubkey_hex)?;
-    let expected_script = build_htlc_script(
-        &ph,
-        &provider_claim_pk,
-        &refund_pk,
-        accept.timeout_block_height,
-    );
-    if hex::encode(expected_script.as_bytes()) != accept.htlc_script_hex {
-        return Err(anyhow!(
-            "provider HTLC script does not match the expected submarine-swap script; aborting"
-        ));
-    }
-    let htlc_address = htlc_p2wsh_address(&expected_script, network);
-    if htlc_address.to_string() != accept.htlc_address {
-        return Err(anyhow!(
-            "provider HTLC address {} does not match the verified script; aborting",
-            accept.htlc_address
-        ));
-    }
+    let (expected_script, htlc_spk) =
+        verify_p2wsh_contract(&accept, SwapDirection::Submarine, &ph, &refund_pk, network)?;
     info!(
-        "Verified submarine HTLC; funding {} sat on-chain",
+        "Verified submarine HTLC at {}; funding {} sat on-chain",
+        htlc_p2wsh_address(&expected_script, network),
         quote.total_sat
     );
 
@@ -825,11 +796,12 @@ async fn run_submarine<P: Channel, F: Channel>(
         store,
         client_swap_id,
         &accept,
+        &expected_script,
         hex::encode(dest_spk.as_bytes()),
     )?;
     let funding = SubmarineFunding {
         htlc_script: expected_script,
-        htlc_spk: htlc_address.script_pubkey(),
+        htlc_spk,
         // Checked equal to `accept.onchain_amount_sat` above. Funding our own number rather than
         // the provider's echo means a provider-supplied amount can never reach the wallet.
         onchain_amount_sat: quote.total_sat,
@@ -857,6 +829,36 @@ async fn run_submarine<P: Channel, F: Channel>(
         warn!("could not record the swap outcome: {e}");
     }
     Ok(())
+}
+
+/// Check an acceptance's contract against our own key and payment hash, and return the redeem
+/// script and output script to execute against.
+///
+/// This client executes only P2WSH contracts, so it refuses any other type, including one a
+/// provider substitutes for the P2WSH it was asked for. Spending and resume need the redeem script,
+/// which the verifier does not return, so it is rebuilt here from the same inputs.
+pub(crate) fn verify_p2wsh_contract(
+    accept: &SwapAccept,
+    direction: SwapDirection,
+    payment_hash: &[u8; 32],
+    our_key: &PublicKey,
+    network: Network,
+) -> Result<(ScriptBuf, ScriptBuf)> {
+    if accept.script_type != SwapScript::P2wsh {
+        return Err(anyhow!(
+            "provider answered with a {:?} contract, and this client executes only P2WSH",
+            accept.script_type
+        ));
+    }
+    let htlc_spk = validate::verify_contract(accept, direction, payment_hash, our_key, network)
+        .map_err(|e| anyhow!("refusing the provider's HTLC: {e}"))?;
+    let provider = parse_pubkey(&accept.provider_pubkey_hex)?;
+    let (claim, refund) = match direction {
+        SwapDirection::Reverse => (our_key, &provider),
+        SwapDirection::Submarine => (&provider, our_key),
+    };
+    let script = build_htlc_script(payment_hash, claim, refund, accept.timeout_block_height);
+    Ok((script, htlc_spk))
 }
 
 fn parse_pubkey(hex_str: &str) -> Result<PublicKey> {

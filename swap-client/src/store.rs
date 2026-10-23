@@ -158,15 +158,19 @@ pub fn record_creation_reply(
 }
 
 /// Mark the validated contract ready for execution, before any funds move.
+///
+/// `htlc_script` is the redeem script the client derived, which resume rebuilds the HTLC from.
+/// The acceptance may have left its own copy out.
 pub fn record_accept(
     store: &dyn SwapStore,
     swap_id: Uuid,
     accept: &SwapAccept,
+    htlc_script: &bitcoin::Script,
     dest_spk_hex: String,
 ) -> Result<()> {
     record_creation_reply(store, swap_id, accept)?;
     let mut rec = load(store, swap_id)?;
-    rec.htlc_script_hex = accept.htlc_script_hex.clone();
+    rec.htlc_script_hex = hex::encode(htlc_script.as_bytes());
     rec.timeout_height = accept.timeout_block_height;
     rec.onchain_amount_sat = accept.onchain_amount_sat;
     rec.dest_spk_hex = Some(dest_spk_hex);

@@ -11,9 +11,12 @@
 //! amount the client acts on is taken from the quote it already agreed to, and the provider's
 //! echo of that amount is compared against it rather than used.
 
-use crate::messages::{Quote, QuoteRequest, SwapAccept};
+use crate::htlc::{build_htlc_script, htlc_p2wsh_address, PaymentHash};
+use crate::messages::{Quote, QuoteRequest, SwapAccept, SwapScript};
 use crate::swap::SwapDirection;
+use crate::taproot::BoltzTaprootSwap;
 use crate::timelock::{self, TimelockParams, TimelockViolation};
+use bitcoin::{Network, PublicKey, ScriptBuf};
 use std::fmt;
 
 /// How long a quote may claim to be valid for. A provider offering an implausibly long window is
@@ -142,6 +145,12 @@ pub enum ValidationError {
         slack: u32,
     },
     Timelock(TimelockViolation),
+    /// A contract field the acceptance sent disagrees with the contract built from our own keys.
+    ContractMismatch {
+        field: &'static str,
+    },
+    /// The acceptance names a contract that cannot be built, such as an unparseable provider key.
+    InvalidContract(String),
     PaymentHashMismatch,
     InvoiceAmountMismatch {
         got_msat: u64,
@@ -233,6 +242,13 @@ impl fmt::Display for ValidationError {
                  (tolerance {slack} blocks)"
             ),
             Self::Timelock(v) => write!(f, "{v}"),
+            Self::ContractMismatch { field } => write!(
+                f,
+                "the acceptance's {field} does not match the contract built from our keys"
+            ),
+            Self::InvalidContract(reason) => {
+                write!(f, "the acceptance does not describe a valid contract: {reason}")
+            }
             Self::PaymentHashMismatch => {
                 write!(f, "the invoice is not locked to our payment hash")
             }
@@ -392,8 +408,8 @@ pub fn validate_quote(
 
 /// Check an acceptance against the quote it answers.
 ///
-/// The HTLC script itself is verified separately by rebuilding it from our own key material; this
-/// covers everything a script comparison cannot.
+/// The contract itself is verified separately by [`verify_contract`]; this covers everything a
+/// script comparison cannot.
 ///
 /// `tip` is optional so a client that is only negotiating (no chain access configured) still gets
 /// the amount and quote-binding checks. The height-relative checks are skipped in that case, and
@@ -458,6 +474,65 @@ pub fn validate_accept(
         }
     }
     Ok(())
+}
+
+/// Rebuild the contract an acceptance describes from our own key and payment hash, and return its
+/// output script.
+///
+/// `htlc_script_hex`, `swap_tree` and `htlc_address` all follow from the provider's key and the
+/// timeout, so each is compared when present and derived when absent. Nothing the provider sent
+/// for them is used, which is what lets a size-limited carrier leave them out.
+/// `provider_pubkey_hex` cannot be derived and is always required.
+///
+/// The contract type is read from `accept.script_type`. The caller checks that it is the type it
+/// asked for.
+pub fn verify_contract(
+    accept: &SwapAccept,
+    direction: SwapDirection,
+    payment_hash: &PaymentHash,
+    client_pubkey: &PublicKey,
+    network: Network,
+) -> Result<ScriptBuf, ValidationError> {
+    if accept.direction != direction {
+        return Err(ValidationError::DirectionMismatch);
+    }
+    let provider: PublicKey = accept.provider_pubkey_hex.parse().map_err(|error| {
+        ValidationError::InvalidContract(format!("provider_pubkey_hex: {error}"))
+    })?;
+    let (claim, refund) = match direction {
+        SwapDirection::Reverse => (client_pubkey, &provider),
+        SwapDirection::Submarine => (&provider, client_pubkey),
+    };
+    let timeout = accept.timeout_block_height;
+    // A P2WSH contract has no tree and a Taproot one has no redeem script, so a value sent for
+    // the field the contract lacks cannot match.
+    let (script_hex, tree, address) = match accept.script_type {
+        SwapScript::P2wsh => {
+            let script = build_htlc_script(payment_hash, claim, refund, timeout);
+            let address = htlc_p2wsh_address(&script, network);
+            (hex::encode(script.as_bytes()), None, address)
+        }
+        SwapScript::TaprootBoltz => {
+            let contract = BoltzTaprootSwap::new(direction, payment_hash, claim, refund, timeout)
+                .map_err(|error| ValidationError::InvalidContract(error.to_string()))?;
+            (
+                String::new(),
+                Some(contract.swap_tree()),
+                contract.address(network),
+            )
+        }
+    };
+    let mismatch = |field| Err(ValidationError::ContractMismatch { field });
+    if !accept.htlc_script_hex.is_empty() && accept.htlc_script_hex != script_hex {
+        return mismatch("htlc_script_hex");
+    }
+    if accept.swap_tree.is_some() && accept.swap_tree != tree {
+        return mismatch("swap_tree");
+    }
+    if !accept.htlc_address.is_empty() && accept.htlc_address != address.to_string() {
+        return mismatch("htlc_address");
+    }
+    Ok(address.script_pubkey())
 }
 
 /// The decoded facts about a hold invoice that the client checks before paying it.
@@ -821,6 +896,203 @@ mod tests {
         assert!(matches!(
             validate_accept(&a, &q, Some(TIP), &policy()),
             Err(ValidationError::SwapIdMissing)
+        ));
+    }
+
+    const HASH: PaymentHash = [5; 32];
+    const CONTRACT_TIMEOUT: u32 = TIP + 144;
+    const CONTRACTS: [(SwapScript, SwapDirection); 4] = [
+        (SwapScript::P2wsh, SwapDirection::Reverse),
+        (SwapScript::P2wsh, SwapDirection::Submarine),
+        (SwapScript::TaprootBoltz, SwapDirection::Reverse),
+        (SwapScript::TaprootBoltz, SwapDirection::Submarine),
+    ];
+
+    fn key(scalar: u8) -> PublicKey {
+        let mut bytes = [0; 32];
+        bytes[31] = scalar;
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&bytes).unwrap();
+        PublicKey::new(secret.public_key(&bitcoin::secp256k1::Secp256k1::new()))
+    }
+
+    /// An acceptance built the way the provider builds one around `client`, with every derivable
+    /// field filled in, and the output script it commits to.
+    fn contract_accept(
+        script_type: SwapScript,
+        direction: SwapDirection,
+        client: &PublicKey,
+    ) -> (SwapAccept, ScriptBuf) {
+        let provider = key(2);
+        let (claim, refund) = match direction {
+            SwapDirection::Reverse => (client, &provider),
+            SwapDirection::Submarine => (&provider, client),
+        };
+        let (script, swap_tree, address) = match script_type {
+            SwapScript::P2wsh => {
+                let script = build_htlc_script(&HASH, claim, refund, CONTRACT_TIMEOUT);
+                let address = htlc_p2wsh_address(&script, Network::Bitcoin);
+                (script, None, address)
+            }
+            SwapScript::TaprootBoltz => {
+                let contract =
+                    BoltzTaprootSwap::new(direction, &HASH, claim, refund, CONTRACT_TIMEOUT)
+                        .unwrap();
+                let tree = Some(contract.swap_tree());
+                (ScriptBuf::new(), tree, contract.address(Network::Bitcoin))
+            }
+        };
+        let output = address.script_pubkey();
+        let built = SwapAccept {
+            script_type,
+            swap_tree,
+            htlc_script_hex: hex::encode(script.as_bytes()),
+            htlc_address: address.to_string(),
+            timeout_block_height: CONTRACT_TIMEOUT,
+            provider_pubkey_hex: hex::encode(provider.to_bytes()),
+            ..accept(&quote(direction))
+        };
+        (built, output)
+    }
+
+    fn without_derivable_fields(accept: SwapAccept) -> SwapAccept {
+        SwapAccept {
+            htlc_script_hex: String::new(),
+            htlc_address: String::new(),
+            swap_tree: None,
+            ..accept
+        }
+    }
+
+    #[test]
+    fn verify_contract_accepts_an_honest_contract_with_or_without_derivable_fields() {
+        let ours = key(1);
+        for (script_type, direction) in CONTRACTS {
+            let (full, output) = contract_accept(script_type, direction, &ours);
+            assert_eq!(
+                verify_contract(&full, direction, &HASH, &ours, Network::Bitcoin),
+                Ok(output.clone())
+            );
+            let compact = without_derivable_fields(full);
+            assert_eq!(
+                verify_contract(&compact, direction, &HASH, &ours, Network::Bitcoin),
+                Ok(output)
+            );
+        }
+    }
+
+    /// A contract built around someone else's key fails on the first field it sends. Left out,
+    /// those fields are derived from our key, so the output we would fund or watch is still ours.
+    #[test]
+    fn verify_contract_derives_from_our_key_and_never_uses_a_sent_value() {
+        let ours = key(1);
+        for (script_type, direction) in CONTRACTS {
+            let (theirs, their_output) = contract_accept(script_type, direction, &key(3));
+            let (_, our_output) = contract_accept(script_type, direction, &ours);
+            assert!(matches!(
+                verify_contract(&theirs, direction, &HASH, &ours, Network::Bitcoin),
+                Err(ValidationError::ContractMismatch { .. })
+            ));
+            let derived = verify_contract(
+                &without_derivable_fields(theirs),
+                direction,
+                &HASH,
+                &ours,
+                Network::Bitcoin,
+            )
+            .unwrap();
+            assert_eq!(derived, our_output);
+            assert_ne!(derived, their_output);
+        }
+    }
+
+    #[test]
+    fn verify_contract_names_the_field_that_disagrees() {
+        let ours = key(1);
+        for (script_type, direction) in CONTRACTS {
+            let (honest, _) = contract_accept(script_type, direction, &ours);
+            // Well-formed values for a contract that is not ours. A P2WSH contract has no tree and
+            // a Taproot one has no script, so any value sent for those fails too.
+            let stranger = |script_type| contract_accept(script_type, direction, &key(3)).0;
+            let cases = [
+                (
+                    "htlc_script_hex",
+                    SwapAccept {
+                        htlc_script_hex: stranger(SwapScript::P2wsh).htlc_script_hex,
+                        ..honest.clone()
+                    },
+                ),
+                (
+                    "swap_tree",
+                    SwapAccept {
+                        swap_tree: stranger(SwapScript::TaprootBoltz).swap_tree,
+                        ..honest.clone()
+                    },
+                ),
+                (
+                    "htlc_address",
+                    SwapAccept {
+                        htlc_address: stranger(script_type).htlc_address,
+                        ..honest.clone()
+                    },
+                ),
+            ];
+            for (field, accept) in cases {
+                assert_eq!(
+                    verify_contract(&accept, direction, &HASH, &ours, Network::Bitcoin),
+                    Err(ValidationError::ContractMismatch { field }),
+                    "{script_type:?} {direction}"
+                );
+            }
+            // The right contract, addressed for another network.
+            assert_eq!(
+                verify_contract(&honest, direction, &HASH, &ours, Network::Regtest),
+                Err(ValidationError::ContractMismatch {
+                    field: "htlc_address"
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn verify_contract_requires_a_provider_key_and_the_expected_direction() {
+        let ours = key(1);
+        let invalid_point = "00".repeat(33);
+        for (script_type, direction) in CONTRACTS {
+            let (honest, _) = contract_accept(script_type, direction, &ours);
+            for garbage in ["", "zz", "02", invalid_point.as_str()] {
+                let accept = SwapAccept {
+                    provider_pubkey_hex: garbage.into(),
+                    ..without_derivable_fields(honest.clone())
+                };
+                assert!(matches!(
+                    verify_contract(&accept, direction, &HASH, &ours, Network::Bitcoin),
+                    Err(ValidationError::InvalidContract(_))
+                ));
+            }
+            let other = match direction {
+                SwapDirection::Reverse => SwapDirection::Submarine,
+                SwapDirection::Submarine => SwapDirection::Reverse,
+            };
+            assert_eq!(
+                verify_contract(&honest, other, &HASH, &ours, Network::Bitcoin),
+                Err(ValidationError::DirectionMismatch)
+            );
+        }
+        // Taproot needs two distinct keys, which a P2WSH script does not check.
+        let (honest, _) = contract_accept(SwapScript::TaprootBoltz, SwapDirection::Reverse, &ours);
+        let reused = SwapAccept {
+            provider_pubkey_hex: hex::encode(ours.to_bytes()),
+            ..without_derivable_fields(honest)
+        };
+        assert!(matches!(
+            verify_contract(
+                &reused,
+                SwapDirection::Reverse,
+                &HASH,
+                &ours,
+                Network::Bitcoin
+            ),
+            Err(ValidationError::InvalidContract(_))
         ));
     }
 
