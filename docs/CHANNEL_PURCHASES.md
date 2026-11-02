@@ -29,12 +29,12 @@ This records the Phase 1 decisions for [#84](https://github.com/coreyphillips/pu
 | D4 | Channel sales are their own domain service, sharing transport, identity, the LND client and one reservation ledger with swaps. |
 | D5 | Orders live in a new SQLite store. |
 | D6 | An order belongs to the authenticated Pubky, and the buyer proves its Lightning node with a signed challenge. |
-| D7 | LND funds through the PSBT flow, and the signed funding transaction is persisted before any broadcast. |
+| D7 | LND funds through the PSBT flow. The signed funding transaction is persisted before any broadcast, and a retry spends every input of the attempts before it. |
 | D8 | Swaps and channel sales reserve inputs and liquidity in one ledger. |
 | D9 | Limits come from the protocol, the peers, liquidity and the operator, never from a product cap. |
 | D10 | The API is `channel.*.v1`, with a required idempotency key. Quotes reserve nothing. |
 | D11 | Purchase, payment, funding, channel and refund each keep their own state. |
-| D12 | Refunds go on chain to the address given at create, through a persisted refund intent. |
+| D12 | Refunds go on chain to the address given at create, computed from what was received, through a persisted refund intent. |
 | D13 | Bitkit trusts no provider automatically. JIT gets its own decision before Phase 5. |
 | D14 | Sales stay off on a network until its feasibility gate passes. |
 
@@ -52,7 +52,9 @@ What Bitkit's node implies for this release:
 
 - **Channels are private.** Bitkit sets no alias and no listening address, so LDK Node rejects any announced inbound channel ([event.rs](https://github.com/synonymdev/ldk-node/blob/1976754dd49886e102f2b3132d5f700d6aabd8d7/src/event.rs#L1884-L1898)). The provider opens with `private: true`, and an order with `announce_channel: true` is refused before payment.
 - **A channel is usable after 6 confirmations.** LDK's `minimum_depth` defaults to 6 ([config.rs](https://docs.rs/lightning/0.2.7/src/lightning/util/config.rs.html#248)), and Bitkit does not override it. On mainnet, after the payment's own 2 confirmations, that is about 80 minutes from paying to a usable channel. The quote and progress screens must say so.
-- **The anchor reserve is not a blocker.** Bitkit sets `per_channel_reserve_sats` to 1. An untrusted anchor channel then needs 1 sat of spendable on-chain balance for each such channel, and LDK Node counts unconfirmed funds.
+- **The anchor reserve is small, but it can still block an open.** Bitkit sets `per_channel_reserve_sats` to 1, and LDK Node counts unconfirmed funds. LDK Node rejects an untrusted anchor channel unless the wallet keeps at least 1 sat spendable for each untrusted anchor channel, the new one included ([event.rs](https://github.com/synonymdev/ldk-node/blob/1976754dd49886e102f2b3132d5f700d6aabd8d7/src/event.rs#L1900-L1940)). A buyer who pays the order with send-all has no change left, so the provider's open is rejected.
+  - Bitkit must never pay an order with send-all. The payment must leave at least that reserve as change, and the quote states how much.
+  - A rejected open is retried until the order's open deadline, then refunded (D11).
 
 ### D2. Protocol revisions
 
@@ -141,8 +143,10 @@ Consequences:
 
 ### D6. Ownership and node proof
 
-- **Owner.** An order belongs to the authenticated Pubky: the root key over `direct/1`, or the account plus its delegated key over `session/2`. Status, list, cancel and any change of refund address require that same owner.
-- **Session scope.** The authorization document of a scoped session names the channel-purchase scope, so a swap authorization can neither create nor read orders.
+- **Owner.** An order belongs to the authenticated account: the root key over `direct/1`, or the account behind a scoped session over `session/2`.
+  - The delegated key only authenticates the request. It is recorded for audit but is not part of ownership, so a restored device or a renewed session keeps access to its orders (#84 journey 4).
+  - Status, list, cancel and any change of refund address require that same account.
+- **Session scope.** The authorization document of a scoped session must name the channel-purchase scope. A swap-only authorization can neither create nor read orders.
 - **Node proof.** The buyer proves its Lightning node with LDK Node's `sign_message`, which produces the zbase32 "Lightning Signed Message" format.
   - The signed challenge binds these:
     - the domain `pubky-swap/channel-node-proof/v1`
@@ -156,7 +160,7 @@ Consequences:
 
 ### D7. Funding flow (LND PSBT)
 
-An order has at most one funding attempt in flight. LND's own publish step is used, not `no_publish`. LND persists the pending channel first, broadcasts only after the buyer's `funding_signed` arrives, and rebroadcasts after a restart ([psbt.md](https://github.com/lightningnetwork/lnd/blob/f8832ca776501c068195bf3865d45e643076bfad/docs/psbt.md)).
+The provider drives at most one funding attempt per order at a time. LND's own publish step is used, not `no_publish`. LND persists the pending channel first, broadcasts only after the buyer's `funding_signed` arrives, and rebroadcasts after a restart ([psbt.md](https://github.com/lightningnetwork/lnd/blob/f8832ca776501c068195bf3865d45e643076bfad/docs/psbt.md)).
 
 Each attempt goes through these steps:
 
@@ -174,18 +178,26 @@ Each attempt goes through these steps:
 4. **Call `psbt_verify`.** Nothing is broadcast.
 5. **Sign with `FinalizePsbt`.** Every input is SegWit, so the txid is already fixed. Persist the signed transaction and its channel point, then never modify it.
 6. **Call `psbt_finalize`** with that transaction. This is the first call after which LND may broadcast, so step 5 must be durable first.
-7. **On `chan_pending`**, record that the funding is published.
+7. **On `chan_pending`**, record that LND holds the pending channel. This is not proof of publication: LND emits it even when its own broadcast failed. Watch the chain for the transaction. If it doesn't appear within a few minutes, publish the persisted signed transaction with `PublishTransaction`, which is safe now that LND holds the channel.
 8. **Mark the channel ready** only after checking the peer, outpoint, capacity, balances, private flag, and that it reached the agreed depth.
 
-Recovery starts from the persisted channel point and signed transaction:
+A funding that sits unconfirmed is bumped by CPFP on its change output (`BumpFee`), never by RBF, which would change the channel point.
 
-- **LND reports a pending or open channel at that point:** continue watching it.
-- **LND has no channel there:** if the transaction is in no mempool and not on chain, the attempt died before `funding_signed`. LND keeps PSBT flows only in memory, so an LND restart kills them too.
-  - Release the leases.
-  - Check every input is unspent.
-  - Start a fresh attempt for the same order.
-- **LND has no channel there, but the transaction is in a mempool or on chain:** that means LND lost state. Stop the order and flag it for operator recovery. Never fund it again.
-- **Never broadcast the signed transaction yourself** while LND has no pending channel for it. Its output would be a 2-of-2 with no commitment transaction to recover the funds.
+Recovery starts from every attempt's persisted channel point and signed transaction:
+
+- **Look the channel point up everywhere:** `PendingChannels`, `ListChannels` and `ClosedChannels`.
+  - If the channel is pending or open, continue watching it.
+  - If it is closed, the order was funded and then closed before it was marked ready. Flag it for the operator, and never fund it again.
+- **Retire what can be retired.** A retry may start only once an attempt has no `chan_pending` after the funding flow's timeout. First cancel its flow with `FundingStateStep { shim_cancel { pending_chan_id } }`. That drops LND's PSBT intent, but leaves the provider's own leases on its inputs in place.
+
+  That cancel is not proof the flow is dead. After `psbt_finalize`, LND can still complete it if the buyer's `funding_signed` arrives late. A provider-only restart is exactly that case, because LND keeps the flow in memory.
+- **So a retry must conflict with every earlier attempt:**
+  - The earlier attempt's inputs stay leased under the channel-sales lock id. They are never released to swaps.
+  - The retry's PSBT template spends every one of them, adding inputs only if the fee needs more.
+  - The two transactions double-spend each other, so at most one can ever confirm. The order is funded by whichever one does.
+  - An earlier attempt is dead only once a conflicting transaction reaches the agreed depth. Only then are its leftover leases released.
+- **LND has no channel at the point, but the transaction is in a mempool or on chain:** that means LND lost state. Stop the order and flag it for operator recovery. Never fund it again.
+- **Never broadcast a signed transaction yourself** while LND has no pending channel for it. Its output would be a 2-of-2 with no commitment transaction to recover the funds.
 - **Finish `psbt_fund` to `psbt_finalize` quickly:** within the funding flow's timeout, which is 10 minutes against an LND peer.
 - **A timed-out RPC never proves that nothing was funded.**
 - **The `memo` is for operators.** It is visible only once LND persists the channel, and it is not the correlation key.
@@ -195,10 +207,19 @@ Recovery starts from the persisted channel point and signed transaction:
 Swaps and channel sales share one ledger. Sellable liquidity is the confirmed wallet balance minus:
 
 - the exposure of swaps in flight;
+- the provider balance and funding fee of every order accepted but not yet funded;
 - inputs leased to pending channel funding;
 - refunds owed;
 - a fee reserve;
 - LND's own anchor reserve.
+
+An accepted order's reservation is taken at `create`, atomically with the check that the ledger still covers it. That is the same way a reverse swap claims its funding ([#110](https://github.com/coreyphillips/pubky-swap/pull/110)). Its lifetime:
+
+- It lasts while the order waits for payment and confirmation.
+- It turns into input leases at `FundPsbt`.
+- It ends when the order expires unpaid, is cancelled, or is refunded.
+
+Quotes reserve nothing.
 
 Each subsystem leases inputs under its own LND lock id. Leases survive LND restarts, and leased outputs are excluded from LND's coin selection, so a swap's `SendOutputs` can't spend coins leased to a channel funding.
 
@@ -253,34 +274,51 @@ The methods are `channel.info.v1`, `channel.quote.v1`, `channel.create.v1`, `cha
 - **`status` and `list`** are scoped to the owner. `list` pages with opaque cursors, and an old order resolves against its recorded provider and network.
 - **`cancel`** works only before any payment is seen. A transport timeout is never a cancellation.
 
-Errors carry these typed codes:
+Errors reuse the swaps' `RejectCode` strings where one fits, so clients keep a single vocabulary:
+
+- `amount_below_minimum` and `amount_above_maximum`, naming the binding limit (D9)
+- `liquidity_unavailable`
+- `rate_limited`
+- `quote_expired`
+- `invalid_request`: a malformed body, or a refund address for another network
+- `not_found`: no order this owner holds. Another owner's order gets the same answer, so an order id never reveals that it exists.
+- `pending`
+- `access_denied`
+- `unsupported_protocol`
+- `internal_error`
+
+Channel orders add these:
 
 - `unsupported_network`
 - `unsupported_feature`
-- `quote_expired`
 - `terms_changed`
-- `liquidity_unavailable`
-- `wrong_owner`
 - `idempotency_conflict`
 - `peer_unavailable`
 - `node_proof_invalid`
 - `payment_mismatch`
 - `recovery_pending`
 - `refund_action_required`
-- `rate_limited`
-- `access_denied`
-- `internal_error`
 
 ### D11. State model
 
 Each order keeps separate purchase, payment, funding, channel and refund state, as #84 sets out. LSPS1's `order_state` (`CREATED`, `COMPLETED`, `FAILED`) and its on-chain payment states are derived from these. They never replace them.
 
 - Only an unpaid order with no liability can expire or be cancelled.
+- A paid order becomes `refund_due` only while no funding attempt is live or unresolved (D7), and only when one of these holds:
+  - **Its open deadline passes.** That is `funding_confirms_within_blocks` from the quote, counted from the payment's confirmation, with no funding confirmed. Until then the provider keeps retrying an offline buyer (`peer_unavailable`) and a rejected open (D1).
+  - **The buyer cancels** after paying but before any funding attempt starts.
+- A payment that arrives after an order is complete, refunded or expired is refunded on its own.
 - An order is complete once its channel is verified as usable, or once its refund is fully accounted for.
 
 ### D12. Refunds
 
-Refunds go on chain, to the address given at `create`. They follow LSPS1's terms: the order total minus the refund transaction's fee, with a fee bump after 6 hours. The quote states these terms before the buyer pays.
+Refunds go on chain, to the address given at `create`. They are computed from what was actually received, never from the quoted total:
+
+- **An order that is never funded** refunds every receipt on its payment address, less the refund transaction's fee.
+- **An order that is funded** refunds only what was received beyond its order total.
+- **LSPS1's figure** (the order total less the fee) is the same number only when the buyer paid exactly the total.
+
+Fees are bumped after 6 hours, as in LSPS1. The quote states these terms before the buyer pays.
 
 - Persist the refund intent, its inputs and the signed transaction before broadcasting.
 - Replace a refund only by RBF, under the same refund id.
@@ -335,6 +373,8 @@ Lightning reachability is reported separately from Pubky transport availability.
   - observing the confirmation.
 
   Every run must end with exactly one funding or exactly one refund. No signed funding transaction may ever be published without a pending channel.
+- **A provider-only restart** while LND waits for a delayed `funding_signed`: the late flow and any retry can never both confirm.
+- **Refund triggers:** an offline buyer and a rejected open are each refunded at the open deadline, never while a funding attempt is unresolved. A send-all payment is refused by the wallet before it is sent.
 - **Concurrency:**
   - Two creates with the same key produce one order.
   - A changed body is refused.
@@ -347,6 +387,7 @@ Lightning reachability is reported separately from Pubky transport availability.
 - **Clearnet reachability.** Whether Umbrel's LND advertises a clearnet address by default, or only Tor. If it is Tor-only, an operator must enable clearnet before D14 can pass.
 - **The 6-confirmation depth.** Whether it is acceptable for the first channel, or Bitkit's fork should expose and lower `minimum_depth` for chosen providers. Lowering it is a trust decision, not a default.
 - **LND's sweeper.** Whether it can pull leased channel-sales coins into a `BumpFee` for a swap claim or refund. Leases should exclude them, and the spike confirms it.
+- **Retry templates.** Whether `FundPsbt` accepts a template whose inputs are already leased under the same `custom_lock_id`, which a retry depends on (D7). If not, the provider builds the retry's PSBT itself.
 
 ## References
 
