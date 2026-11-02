@@ -1,0 +1,16 @@
+[package]
+name = "paykit-identity-homeserver-test"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A workspace of its own. pubky-testnet 0.16 needs rusqlite 0.32 through http-relay, bdk_wallet
+# holds the main workspace on 0.31, and both link sqlite3, which one resolution allows once.
+[workspace]
+
+[dev-dependencies]
+paykit-identity = { path = ".." }
+paykit-lib = { git = "https://github.com/pubky/paykit-rs", rev = "01de5dd232d2b22f132d066697cce041700e7136" }
+pubky = "=0.16.2"
+pubky-testnet = { version = "=0.16.2", features = ["docker-postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

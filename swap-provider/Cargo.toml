@@ -21,7 +21,10 @@ beignet = ["dep:beignet-backend"]
 # Everything needed to actually execute swaps end-to-end, and to be reached by someone who has
 # only been handed your pubky. `iroh` is in here rather than opt-in because without it a provider
 # can only receive from pubkys it already follows: see the doorbell note on `rendezvous_iroh`.
-full = ["lnd", "bdk-wallet", "chain", "status", "iroh"]
+full = ["lnd", "bdk-wallet", "chain", "status", "iroh", "paykit"]
+# The provider as a Paykit peer: `--paykit-setup` and the doctor's `paykit` line. Needs `iroh`
+# for the identity secret, which pubky-transport only exposes there.
+paykit = ["dep:paykit-identity", "iroh"]
 # Learn interested client pubkys over the iroh P2P rendezvous (doorbell) instead of only the
 # follow graph. See pubky-transport's `p2p` module.
 iroh = ["pubky-transport/iroh"]
@@ -32,6 +35,7 @@ swap-common.workspace = true
 swap-config.workspace = true
 lightning-backend.workspace = true
 beignet-backend = { workspace = true, optional = true }
+paykit-identity = { workspace = true, optional = true }
 bitcoin.workspace = true
 tokio.workspace = true
 clap.workspace = true

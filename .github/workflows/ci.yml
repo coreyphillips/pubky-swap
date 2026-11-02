@@ -30,7 +30,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Format
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          cargo fmt --manifest-path paykit-identity/homeserver-test/Cargo.toml --check
 
       - name: Clippy (default + all feature combos)
         run: |
@@ -61,3 +63,10 @@ jobs:
           cargo test -p pubky-transport --features iroh --lib
           cargo test -p swap-provider --features full --lib
           cargo test -p swap-client --features full --lib
+
+      # Its own workspace, because pubky-testnet 0.16 and bdk_wallet need different rusqlite
+      # versions. The homeserver's Postgres runs in Docker, which the runner has.
+      - name: Paykit identity against a local homeserver
+        run: |
+          cargo clippy --manifest-path paykit-identity/homeserver-test/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path paykit-identity/homeserver-test/Cargo.toml

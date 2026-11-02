@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "paykit-identity",
     "beignet-backend",
     "swap-config",
     "pubky-transport",
@@ -9,6 +10,8 @@ members = [
     "swap-client",
 ]
 resolver = "2"
+# Its own workspace and lockfile: see its manifest.
+exclude = ["paykit-identity/homeserver-test"]
 
 [workspace.package]
 version = "0.1.0"
@@ -63,3 +66,4 @@ lightning-backend = { path = "lightning" }
 beignet-backend = { path = "beignet-backend" }
 swap-client = { path = "swap-client" }
 swap-config = { path = "swap-config" }
+paykit-identity = { path = "paykit-identity" }
