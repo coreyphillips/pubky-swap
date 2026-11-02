@@ -1053,6 +1053,7 @@ mod tests {
             let progress = crate::StoreProgress {
                 store: store.clone(),
                 record: std::sync::Mutex::new(rec),
+                risk: None,
             };
             match drive_submarine_swap(
                 &ln,
@@ -1205,6 +1206,7 @@ mod tests {
                 let progress = crate::StoreProgress {
                     store,
                     record: std::sync::Mutex::new(rec),
+                    risk: None,
                 };
                 drive_submarine_swap(
                     ln,

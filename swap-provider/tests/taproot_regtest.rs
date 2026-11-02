@@ -496,3 +496,20 @@ async fn taproot_submarine_funding_payment_and_provider_claim() {
     assert!(extract_preimage(&claim, &outpoint, &invoice.payment_hash).is_some());
     assert!(claim.output[0].value.to_sat() < AMOUNT + SERVICE_FEE);
 }
+
+/// The provider's reverse-swap preflight reads this wallet through LND's `WalletBalance` (#108).
+/// Before that, `LndWallet` reported no balance at all and the preflight never ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires two funded LND nodes, Bitcoin Core and Electrum"]
+async fn the_lnd_wallet_reports_its_spendable_balance() {
+    let _serial = REGTEST_LOCK.lock().await;
+    let wallet = LndWallet::connect(lnd_config("A"), FEE_RATE).await.unwrap();
+    let spendable = run_blocking(|| wallet.spendable_balance_sat())
+        .expect("WalletBalance answers")
+        .expect("an LND wallet reports a balance");
+    // The reverse tests in this binary fund their HTLCs from this node, so it holds at least that.
+    assert!(
+        spendable >= AMOUNT,
+        "LND A reports {spendable} sat spendable"
+    );
+}

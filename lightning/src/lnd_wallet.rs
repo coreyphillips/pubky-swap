@@ -95,6 +95,24 @@ impl OnchainWallet for LndWallet {
         self.receive_spk.clone()
     }
 
+    fn spendable_balance_sat(&self) -> Result<Option<u64>> {
+        // Without this the trait's default `None` read as "cannot say", and the provider's
+        // reverse-swap preflight let every swap through. A short wallet was then found only at
+        // funding time, after the client's Lightning payment was already held, and a failed
+        // funding call is indistinguishable from a lost reply, so the payment stayed held until
+        // the HTLC timed out.
+        //
+        // Confirmed funds only, as `fund_htlc` spends them, and net of the anchor reserve.
+        let backend = self.backend.clone();
+        block_on(async move {
+            backend
+                .spendable_onchain_sat()
+                .await
+                .map(Some)
+                .map_err(|e| SwapError::transient("LND wallet balance", e))
+        })
+    }
+
     fn cpfp_bump(&self, parent: OutPoint, fee_rate_sat_vb: u64) -> Result<Option<Txid>> {
         // The claim and refund transactions are built and signed by the swap engine, not by LND,
         // so LND cannot replace them. It can spend their output at a high fee and pull them in,
