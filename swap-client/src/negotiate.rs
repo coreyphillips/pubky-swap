@@ -165,6 +165,84 @@ impl Channel for IrohChannel {
     }
 }
 
+/// Requests over iroh `direct/1` in the `paykit-cap.*` kinds for `swap/1`.
+///
+/// Quotes and contracts come back signed, and are checked against the provider's key before the
+/// engine sees them. A commit for a quote this channel did not see signed, and every kind the
+/// profile has no word for, goes as a plain [`SwapMessage`].
+#[cfg(feature = "iroh")]
+pub struct CapChannel {
+    client: pubky_transport::p2p::DirectRpcClient,
+    cap: Mutex<swap_common::paykit_cap::CapClient>,
+}
+
+#[cfg(feature = "iroh")]
+impl CapChannel {
+    pub async fn new(secret: [u8; 32], provider: &str) -> Result<Self> {
+        let signer = *pubky_transport::p2p::pubky_to_endpoint_id(provider)?.as_bytes();
+        let client = pubky_transport::p2p::DirectRpcClient::new(secret, provider).await?;
+        Ok(Self {
+            client,
+            cap: Mutex::new(swap_common::paykit_cap::CapClient::new(Some(signer))),
+        })
+    }
+}
+
+#[cfg(feature = "iroh")]
+impl Channel for CapChannel {
+    const NAME: &'static str = "paykit-cap";
+    async fn close(&self) {
+        self.client.close().await;
+    }
+    async fn exchange(
+        &self,
+        request: &SwapMessage,
+        expected: fn(&SwapMessage) -> bool,
+    ) -> std::result::Result<SwapMessage, ExchangeError> {
+        use pubky_transport::TransportError;
+        let cap = self
+            .cap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .request(request);
+        let message = match &cap {
+            Some(cap) => serde_json::to_value(cap),
+            None => serde_json::to_value(request),
+        }
+        .map_err(|error| ExchangeError::NotSent(error.into()))?;
+        let envelope = pubky_transport::p2p::DirectRequest { message };
+        let bytes = match self.client.request(&envelope).await {
+            Ok(bytes) => bytes,
+            Err(error @ TransportError::NotSent(_)) => {
+                return Err(ExchangeError::NotSent(error.into()))
+            }
+            Err(error) => return Err(ExchangeError::Uncertain(error.into())),
+        };
+        let unreadable =
+            |error: String| ExchangeError::Uncertain(anyhow!("unreadable reply: {error}"));
+        let reply = if cap.is_some() {
+            let reply: swap_common::paykit_cap::CapMessage =
+                serde_json::from_slice(&bytes).map_err(|error| unreadable(error.to_string()))?;
+            self.cap
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .reply(request, reply)
+                .map_err(|error| unreadable(error.to_string()))?
+        } else {
+            serde_json::from_slice(&bytes).map_err(|error| unreadable(error.to_string()))?
+        };
+        if reply_matches(request, &reply)
+            && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
+        {
+            Ok(reply)
+        } else {
+            Err(ExchangeError::Uncertain(anyhow!(
+                "provider replied with an unexpected message"
+            )))
+        }
+    }
+}
+
 /// Requests over encrypted Pubky DMs, polling the conversation for the reply.
 pub struct DmChannel {
     transport: Transport,

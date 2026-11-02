@@ -219,6 +219,66 @@ statuses come from polling `SwapStatusRequest`.
 An adapter must obtain transaction contents and confirmation depth independently before emitting
 a status that promises on-chain confirmation or advising a client to reveal its preimage.
 
+## Paykit Capabilities kinds over direct/1
+
+A provider built with `iroh` answers the `paykit-cap.*` kinds for `swap/1` on `direct/1`. A request
+is `{"kind": "paykit-cap.<name>", "body": {...}}` in the `message` of a `DirectRequest`. Any other
+message is still read as a `SwapMessage`, so offer and list requests are unchanged.
+
+| `paykit-cap` | pubky-swap |
+| --- | --- |
+| `rfq` | `QuoteRequest` |
+| `quote` | `Quote`, signed |
+| `commit` | `SwapRequest` |
+| `contract` | `SwapAccept`, signed |
+| `status` | `SwapStatusUpdate`, or the reply to `status_request` |
+| `status_request` | `SwapStatusRequest`, answered from `SwapStatusSnapshot` |
+| `refusal` | `Reject` with its `RejectCode` string |
+
+Neither `rfq` nor `commit` has a `client_pkarr`. The owner is the key that authenticated the
+connection. A commit gets `pending` as a `status` while another request is still admitting the
+same swap: ask again, it is not a decline. Every refusal code passes through, so a commit can get
+`liquidity_unavailable`, `rate_limited` or `access_denied`.
+
+Three hashes chain the agreement. Each is SHA-256 over a domain prefix, then the RFC 8785 (JCS)
+form of a two-member object:
+
+| Hash | Domain prefix | Object |
+| --- | --- | --- |
+| `terms_hash` | `paykit-cap/swap/1/terms_hash\0` | `{"rfq": {offer_id, direction, amount_sat}, "quote": <quote without request_id>}` |
+| `commit_hash` | `paykit-cap/swap/1/commit_hash\0` | `{"terms_hash": <hex>, "commit": <commit body>}` |
+| `contract_hash` | `paykit-cap/swap/1/contract_hash\0` | `{"commit_hash": <hex>, "contract": {"accept": <SwapAccept without invoice>, "invoice_blob_hash": <hex>}}` |
+
+The provider signs `terms_hash` in the quote and `contract_hash` in the contract, with Ed25519
+over the 32 hash bytes. `signer` is the public key as hex. Today it is the provider's root key,
+the one a client dials; whether a delegated subkey replaces it waits on pubky/paykit-rs#229. A
+commit names the `terms_hash` it accepts, and one that differs from the signed quote is refused.
+
+The reverse hold invoice is not in the contract. It is sealed with ChaCha20-Poly1305 under a
+per-swap key and a zero nonce, and the contract signs SHA-256 of the ciphertext. Over `direct/1`
+the key and ciphertext travel beside the signed contract as `invoice_blob`, so the signed bytes
+are the same ones an Encrypted Link will carry.
+
+The signed contract is stored with the swap record. A replayed commit and every `status_request`
+return those bytes, including after a restart. A commit replayed after a restart for a swap with
+no stored contract (created over plain kinds, or a crash between creation and signing) is signed
+over the `terms_hash` the commit names, since the provider no longer holds the quote.
+
+Golden vectors, from `swap-common/src/paykit_cap.rs` (`golden_vectors`), for signer secret `[7; 32]`:
+
+| | Hex |
+| --- | --- |
+| `terms_hash` | `766a45ca9f2aafb59085836d2f8c77153b26eef5461d5c55d18e3ecb495759f6` |
+| `commit_hash` | `a4c7b47b6a9f1e6e2d8bcab2d4046ca0365904972294a032cf5e85898246397f` |
+| `contract_hash` | `e09ffac51ae04cfa914e435282a976cfeb6a82ea5444a102034f4543be6a7a37` |
+| `signer` | `ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c` |
+
+The inputs are the fixtures in that test. `swap_client::negotiate::CapChannel` is the client side:
+it sends these kinds and checks each signature against the provider it dialed.
+
+The rfq, quote, commit and signed contract fit 1,000 bytes with a P2WSH or tree-less contract.
+A `status` reply carries the full snapshot and contract and does not.
+
 ## Amounts and fees
 
 For submarine swaps, `Quote.amount_sat` is the Lightning invoice amount and the expected on-chain

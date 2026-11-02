@@ -197,6 +197,10 @@ pub struct SwapRecord {
     /// Full contract and invoice validation completed before an execution driver may run.
     #[serde(default)]
     pub client_execution_ready: bool,
+    /// The `paykit-cap.contract` signed for this swap, kept so a replayed commit and every
+    /// `status_request` get the same bytes. The first one stored is the one that stands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_contract: Option<crate::paykit_cap::ContractReply>,
 
     // --- diagnostics ---
     /// The lowest height at which a reorg was seen while this swap was in flight.
@@ -360,6 +364,7 @@ impl SwapRecord {
             record_version: RECORD_VERSION,
             swap_id: Uuid::nil(),
             pending_hold_invoice: None,
+            cap_contract: None,
             swap_request: None,
             swap_accept: None,
             taproot: None,
