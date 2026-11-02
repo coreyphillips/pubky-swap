@@ -441,9 +441,12 @@ fn capability_covers(capability: &pubky_session::Capability, scope: &str) -> boo
 /// `SessionClient::connect` validates the credential with the homeserver first.
 pub fn session_account_hint(token: &str) -> Result<String> {
     let mut fields = token.splitn(4, ':');
-    if fields.next() != Some("pubky-grant-credential-v1") {
-        return Err(session_error("unsupported Pubky grant credential"));
-    }
+    // v2 appends a signed approval to v1. `import_grant_secret` accepts both.
+    let with_approval = match fields.next() {
+        Some("pubky-grant-credential-v1") => false,
+        Some("pubky-grant-credential-v2") => true,
+        _ => return Err(session_error("unsupported Pubky grant credential")),
+    };
     let homeserver = fields
         .next()
         .ok_or_else(|| session_error("invalid Pubky grant"))?;
@@ -454,9 +457,15 @@ pub fn session_account_hint(token: &str) -> Result<String> {
     if secret.is_empty() {
         return Err(session_error("invalid Pubky grant"));
     }
-    let grant = fields
+    let mut grant = fields
         .next()
         .ok_or_else(|| session_error("invalid Pubky grant"))?;
+    if with_approval {
+        grant = match grant.split_once(':') {
+            Some((grant, approval)) if !approval.is_empty() => grant,
+            _ => return Err(session_error("invalid Pubky grant")),
+        };
+    }
     let claims = pubky_session::GrantClaims::decode(grant)
         .map_err(|_| session_error("invalid Pubky grant"))?;
     canonical_pubky(&claims.iss.z32())
@@ -514,18 +523,26 @@ mod tests {
             exp: 1,
         };
         let grant = claims.sign(&owner, GRANT_JWS_TYP);
-        let token = format!("pubky-grant-credential-v1:{homeserver}:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:{grant}");
-        assert_eq!(
-            session_account_hint(&token).unwrap(),
-            owner.public_key().z32()
-        );
-        for invalid in [
-            "",
-            "owner:cookie",
-            "pubky-grant-credential-v1:missing",
-            "pubky-grant-credential-v2:unsupported",
+        let secret = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        for token in [
+            format!("pubky-grant-credential-v1:{homeserver}:{secret}:{grant}"),
+            format!("pubky-grant-credential-v2:{homeserver}:{secret}:{grant}:approval"),
         ] {
-            assert!(session_account_hint(invalid).is_err());
+            assert_eq!(
+                session_account_hint(&token).unwrap(),
+                owner.public_key().z32()
+            );
+        }
+        for invalid in [
+            String::new(),
+            "owner:cookie".into(),
+            "pubky-grant-credential-v1:missing".into(),
+            "pubky-grant-credential-v2:missing".into(),
+            "pubky-grant-credential-v3:unsupported".into(),
+            format!("pubky-grant-credential-v2:{homeserver}:{secret}:{grant}"),
+            format!("pubky-grant-credential-v2:{homeserver}:{secret}:{grant}:"),
+        ] {
+            assert!(session_account_hint(&invalid).is_err());
         }
     }
 
@@ -721,7 +738,7 @@ mod tests {
                 AuthorizationVerifier::with_client_factory(
                     move || {
                         let mut pkarr = pkarr_builder(&bootstrap);
-                        pkarr.request_timeout(Duration::from_millis(100));
+                        pkarr.dht_request_timeout(Duration::from_millis(100));
                         pkarr
                     },
                     &self.provider,
