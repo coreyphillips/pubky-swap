@@ -621,13 +621,23 @@ impl CapClient {
                     snapshot, contract, ..
                 } = *status;
                 let mut snapshot = snapshot.ok_or(CapError::Unexpected("status without a swap"))?;
+                if request
+                    .swap_id
+                    .is_some_and(|id| id != snapshot.accept.swap_id)
+                {
+                    return Err(CapError::Unexpected("status for another swap"));
+                }
                 // A swap this client committed to here is recovered only with the contract
-                // signed over that commit. The quote comes from what was asked where it can,
-                // since a reply naming another quote would otherwise skip the check.
-                let quote_id = request
+                // signed over that commit. The quote is the one asked about, or the one a
+                // contract bound the asked swap to, and a reply naming any other is refused,
+                // since it would otherwise skip the check.
+                let asked = request
                     .quote_id
-                    .or_else(|| request.swap_id.and_then(|id| self.swaps.get(&id).copied()))
-                    .unwrap_or(snapshot.accept.quote_id);
+                    .or_else(|| request.swap_id.and_then(|id| self.swaps.get(&id).copied()));
+                if asked.is_some_and(|id| id != snapshot.accept.quote_id) {
+                    return Err(CapError::Unexpected("status for another quote"));
+                }
+                let quote_id = snapshot.accept.quote_id;
                 match (&contract, self.commits.get(&quote_id)) {
                     (None, Some((_, commit))) => {
                         return Err(CapError::MissingContract(Box::new(commit.clone())))
@@ -647,6 +657,8 @@ impl CapClient {
                     if unsigned != contract.signed.contract.accept {
                         return Err(CapError::HashMismatch("contract"));
                     }
+                    // A later query by swap id alone is then checked against this quote too.
+                    self.swaps.insert(accept.swap_id, quote_id);
                     snapshot.accept = accept;
                 }
                 Ok(SwapMessage::SwapStatusSnapshot(snapshot))
@@ -834,6 +846,62 @@ mod tests {
         );
     }
 
+    fn quote_request() -> SwapMessage {
+        SwapMessage::QuoteRequest(QuoteRequest {
+            request_id: quote().request_id,
+            offer_id: rfq().offer_id,
+            client_pkarr: "ignored".into(),
+            direction: rfq().direction,
+            amount_sat: rfq().amount_sat,
+            protocol_version: PROTOCOL_VERSION,
+            features: Vec::new(),
+        })
+    }
+
+    /// What the provider stores for [`accept`], as a status reply carries it with a contract.
+    fn snapshot() -> SwapStatusSnapshot {
+        SwapStatusSnapshot {
+            request_id: None,
+            accept: SwapAccept {
+                invoice: None,
+                ..accept()
+            },
+            network: NetworkSpec::Regtest,
+            state: SwapState::Created,
+            funding_txid_hex: None,
+            funding_vout: None,
+            spend_txid_hex: None,
+            claim_observed_txid_hex: None,
+            required_confirmations: 1,
+            updated_at_unix: 1,
+            observed_at_unix: 1,
+            created_at_unix: 1,
+            payment_hash_hex: "11".repeat(32),
+            owner_ref: None,
+            claimable: false,
+        }
+    }
+
+    fn status(snapshot: SwapStatusSnapshot, contract: Option<ContractReply>) -> CapMessage {
+        CapMessage::Status(Box::new(Status {
+            request_id: None,
+            swap_id: Some(snapshot.accept.swap_id),
+            quote_id: Some(snapshot.accept.quote_id),
+            state: "created".into(),
+            reference: None,
+            snapshot: Some(snapshot),
+            contract,
+        }))
+    }
+
+    fn status_request(swap_id: Option<Uuid>, quote_id: Option<Uuid>) -> SwapMessage {
+        SwapMessage::SwapStatusRequest(SwapStatusRequest {
+            request_id: None,
+            swap_id,
+            quote_id,
+        })
+    }
+
     /// The client turns a full exchange into engine messages, and refuses a quote signed by a
     /// key other than the provider it dialed.
     #[test]
@@ -844,15 +912,7 @@ mod tests {
             .try_into()
             .unwrap();
         let mut client = CapClient::new(Some(key));
-        let quote_request = SwapMessage::QuoteRequest(QuoteRequest {
-            request_id: quote().request_id,
-            offer_id: rfq().offer_id,
-            client_pkarr: "ignored".into(),
-            direction: rfq().direction,
-            amount_sat: rfq().amount_sat,
-            protocol_version: PROTOCOL_VERSION,
-            features: Vec::new(),
-        });
+        let quote_request = quote_request();
         let Some(CapMessage::Rfq(sent)) = client.request(&quote_request) else {
             panic!("a quote request goes as an rfq");
         };
@@ -901,67 +961,89 @@ mod tests {
         assert!(matches!(reply, SwapMessage::Reject(r) if r.code() == Some(RejectCode::Pending)));
 
         // A status reply carries the stored contract, and the invoice comes back from its blob.
-        let status_request = SwapMessage::SwapStatusRequest(SwapStatusRequest {
-            request_id: None,
-            swap_id: Some(uuid(3)),
-            quote_id: None,
-        });
-        let snapshot = SwapStatusSnapshot {
-            request_id: None,
-            accept: SwapAccept {
-                invoice: None,
-                ..accept()
-            },
-            network: NetworkSpec::Regtest,
-            state: SwapState::Created,
-            funding_txid_hex: None,
-            funding_vout: None,
-            spend_txid_hex: None,
-            claim_observed_txid_hex: None,
-            required_confirmations: 1,
-            updated_at_unix: 1,
-            observed_at_unix: 1,
-            created_at_unix: 1,
-            payment_hash_hex: "11".repeat(32),
-            owner_ref: None,
-            claimable: false,
-        };
-        let status = |contract| {
-            CapMessage::Status(Box::new(Status {
-                request_id: None,
-                swap_id: Some(uuid(3)),
-                quote_id: Some(uuid(2)),
-                state: "created".into(),
-                reference: None,
-                snapshot: Some(snapshot.clone()),
-                contract,
-            }))
-        };
+        let status_request = status_request(Some(uuid(3)), None);
         let reply = client
-            .reply(&status_request, status(Some(contract)))
+            .reply(&status_request, status(snapshot(), Some(contract)))
             .unwrap();
         assert!(matches!(reply, SwapMessage::SwapStatusSnapshot(s) if s.accept == accept()));
 
         // Recovering the committed swap needs the contract signed over that commit. Without one,
         // the client gets the commit to send again.
-        assert!(client.reply(&status_request, status(Some(wrong))).is_err());
+        assert!(client
+            .reply(&status_request, status(snapshot(), Some(wrong)))
+            .is_err());
         assert_eq!(
-            client.reply(&status_request, status(None)).unwrap_err(),
+            client
+                .reply(&status_request, status(snapshot(), None))
+                .unwrap_err(),
             CapError::MissingContract(Box::new(sent.clone()))
         );
         // A reply naming another quote is still checked against the swap's commit.
-        let mut moved = snapshot.clone();
+        let mut moved = snapshot();
         moved.accept.quote_id = uuid(4);
-        let moved = CapMessage::Status(Box::new(Status {
-            request_id: None,
-            swap_id: Some(uuid(3)),
-            quote_id: Some(uuid(4)),
-            state: "created".into(),
-            reference: None,
-            snapshot: Some(moved),
-            contract: None,
-        }));
-        assert!(client.reply(&status_request, moved).is_err());
+        assert!(client.reply(&status_request, status(moved, None)).is_err());
+    }
+
+    /// A swap first seen through status, as recovery after a lost contract sees it, is bound to
+    /// its commit like one whose contract came back at commit: a later query by swap id alone
+    /// still needs the contract signed over that commit.
+    #[test]
+    fn a_swap_recovered_through_status_stays_bound_to_its_commit() {
+        let provider = signer();
+        let key: [u8; 32] = hex::decode(provider.public_key_hex())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut client = CapClient::new(Some(key));
+        let quote_request = quote_request();
+        client.request(&quote_request).unwrap();
+        let signed = sign_quote(&provider, &rfq(), &quote()).unwrap();
+        client
+            .reply(&quote_request, CapMessage::Quote(signed.clone()))
+            .unwrap();
+        let swap_request = SwapMessage::SwapRequest(commit().into_request("owner"));
+        let Some(CapMessage::Commit(sent)) = client.request(&swap_request) else {
+            panic!("a commit follows a signed quote");
+        };
+        // The contract reply is lost, so the swap is first seen through status by quote id.
+        let contract = sign_contract(&provider, &signed.terms_hash, &commit(), &accept()).unwrap();
+        let reply = client
+            .reply(
+                &status_request(None, Some(uuid(2))),
+                status(snapshot(), Some(contract.clone())),
+            )
+            .unwrap();
+        assert!(matches!(reply, SwapMessage::SwapStatusSnapshot(s) if s.accept == accept()));
+
+        // By swap id alone, a reply naming another quote with other terms and no contract is
+        // refused rather than taken at its word.
+        let by_swap = status_request(Some(uuid(3)), None);
+        let mut moved = snapshot();
+        moved.accept.quote_id = uuid(4);
+        moved.accept.onchain_amount_sat += 1;
+        moved.accept.invoice = Some("lnbcrt1other".into());
+        assert_eq!(
+            client.reply(&by_swap, status(moved, None)).unwrap_err(),
+            CapError::Unexpected("status for another quote")
+        );
+        // The same quote without its contract gets the commit to send again.
+        assert_eq!(
+            client
+                .reply(&by_swap, status(snapshot(), None))
+                .unwrap_err(),
+            CapError::MissingContract(Box::new(sent))
+        );
+        // A reply for another swap does not answer this one.
+        let mut other = snapshot();
+        other.accept.swap_id = uuid(5);
+        assert_eq!(
+            client.reply(&by_swap, status(other, None)).unwrap_err(),
+            CapError::Unexpected("status for another swap")
+        );
+        let reply = client
+            .reply(&by_swap, status(snapshot(), Some(contract)))
+            .unwrap();
+        assert!(matches!(reply, SwapMessage::SwapStatusSnapshot(s) if s.accept == accept()));
     }
 
     /// Paykit Event Messages carry at most 1,000 bytes. A signed contract is left out: with the

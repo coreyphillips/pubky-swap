@@ -277,8 +277,8 @@ The inputs are the fixtures in that test. `swap_client::negotiate::CapChannel` i
 it sends these kinds and checks each signature against the provider it dialed.
 
 The rfq, quote and commit fit 1,000 bytes. A signed contract does not yet: with the P2WSH
-script or Taproot tree the provider always sends, it is over. A `status` reply carries the full snapshot and contract, and is
-larger still.
+script or Taproot tree the provider always sends, it is over. A `status` reply carries the full
+snapshot and contract, and is larger still.
 
 ## Amounts and fees
 
