@@ -5,14 +5,17 @@
 //! peer wake with it (`POST /v1/peer/wakes`). The gateway turns that into a silent background
 //! push, bound by the owner's quota, and never learns who sent it.
 //!
-//! The token is a bearer secret. It is held in memory only, never logged or echoed, and dropped
-//! when the wake is sent or the swap ends. A restart drops it too: the owner then learns the swap
-//! is claimable the way it always could, from a status query on its next launch.
+//! The token is a bearer secret. It is never logged or echoed, and is dropped when the wake is
+//! sent or the swap ends. It is kept in an owner-only file of its own, so a grant survives a
+//! restart. Not in the swap record: the driver rewrites that from its own copy, and would drop a
+//! grant written beside it.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use swap_common::messages::{WakeCapability, SWAP_WAKE_TOPIC, WAKE_TOKEN_MAX_LEN};
+use tracing::warn;
 use uuid::Uuid;
 
 /// How long one peer wake may take before it is abandoned. The swap never waits on it.
@@ -25,6 +28,7 @@ const CAPABILITY_VERSION: u16 = 1;
 pub(crate) struct Waker {
     allowlist: Vec<String>,
     held: Mutex<HashMap<Uuid, WakeCapability>>,
+    file: Option<PathBuf>,
     http: reqwest::Client,
 }
 
@@ -72,6 +76,23 @@ pub(crate) fn allowlist_usable(allowlist: &[String]) -> bool {
         .any(|url| normalized(url).starts_with("https://"))
 }
 
+/// Replace `path` with `bytes`, readable by this user only from the moment the file exists.
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
 /// A gateway URL in the one form the allowlist compares: no trailing slash.
 fn normalized(url: &str) -> &str {
     url.trim().trim_end_matches('/')
@@ -105,7 +126,35 @@ impl Waker {
         Self {
             allowlist,
             held: Mutex::new(HashMap::new()),
+            file: None,
             http,
+        }
+    }
+
+    /// Keep held capabilities in `path`, and take back the ones a previous run held.
+    pub(crate) fn persisted_at(mut self, path: PathBuf) -> Self {
+        let held = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                warn!("ignoring unreadable wake grants in {}", path.display());
+                HashMap::new()
+            }),
+            Err(_) => HashMap::new(),
+        };
+        self.held = Mutex::new(held);
+        self.file = Some(path);
+        self
+    }
+
+    /// Best effort: a grant that fails to save still wakes, unless the process restarts first.
+    fn save(&self, held: &HashMap<Uuid, WakeCapability>) {
+        let Some(path) = &self.file else {
+            return;
+        };
+        let written = serde_json::to_vec(held)
+            .map_err(std::io::Error::from)
+            .and_then(|bytes| write_owner_only(path, &bytes));
+        if let Err(e) = written {
+            warn!("could not save wake grants to {}: {e}", path.display());
         }
     }
 
@@ -169,6 +218,7 @@ impl Waker {
             Some(_) => Err(Refused::AlreadyHeld),
             None => {
                 held.insert(swap_id, capability);
+                self.save(&held);
                 Ok(())
             }
         }
@@ -176,12 +226,17 @@ impl Waker {
 
     /// Hand over the capability for `swap_id`, leaving none behind.
     pub(crate) fn take(&self, swap_id: Uuid) -> Option<WakeCapability> {
-        self.held().remove(&swap_id)
+        let mut held = self.held();
+        let taken = held.remove(&swap_id);
+        if taken.is_some() {
+            self.save(&held);
+        }
+        taken
     }
 
     /// Forget the capability for a swap that has ended.
     pub(crate) fn forget(&self, swap_id: Uuid) {
-        self.held().remove(&swap_id);
+        self.take(swap_id);
     }
 
     #[cfg(test)]
@@ -297,6 +352,25 @@ mod tests {
         assert_eq!(waker.hold(swap_id, other, 1_000), Err(Refused::AlreadyHeld));
         assert!(waker.take(swap_id).is_some());
         assert!(waker.take(swap_id).is_none());
+    }
+
+    #[test]
+    fn a_held_capability_survives_a_restart_until_taken() {
+        let dir = std::env::temp_dir().join(format!("wake-grants-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wake-grants.json");
+        let restart = || Waker::new(&[GATEWAY.into()]).persisted_at(path.clone());
+        let swap_id = Uuid::new_v4();
+        restart().hold(swap_id, capability(), 1_000).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(restart().take(swap_id), Some(capability()));
+        assert!(!restart().holds(swap_id));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A gateway on loopback that answers every request with `status` and keeps what it was sent.

@@ -1284,7 +1284,10 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
         homeserver: config.homeserver,
-        wake: Arc::new(wake::Waker::new(&config.wake_gateways)),
+        wake: Arc::new(
+            wake::Waker::new(&config.wake_gateways)
+                .persisted_at(std::path::Path::new(&config.data_dir).join("wake-grants.json")),
+        ),
     };
     // The daemon has worked out what it can do; tell anything watching.
     ready.store(capable, std::sync::atomic::Ordering::Relaxed);
@@ -2314,11 +2317,24 @@ fn accept_wake_capability(
         return Err(Refusal::new(RejectCode::InvalidRequest, "the swap has ended").into());
     }
     let now = now_unix();
-    if record.claimable_at_unix.is_none() {
+    let record = if record.claimable_at_unix.is_none() {
         ctx.wake
             .hold(record.swap_id, offer.capability, now)
             .map_err(|refused| Refusal::new(RejectCode::InvalidRequest, refused.to_string()))?;
-    }
+        // The driver marks a swap claimable before it takes the grant, and does so once. Read
+        // again after holding: a swap claimable now may have fired before this grant was held.
+        // Its owner is online and learns from this reply instead.
+        let record = ctx
+            .store
+            .get(offer.swap_id)?
+            .ok_or(SwapLookupError::NotFound)?;
+        if record.claimable_at_unix.is_some() {
+            ctx.wake.forget(record.swap_id);
+        }
+        record
+    } else {
+        record
+    };
     record
         .status_snapshot(offer.request_id, now)
         .ok_or_else(|| anyhow!("this older swap has no persisted acceptance"))
@@ -3585,6 +3601,7 @@ fn customer_request(message: serde_json::Value) -> Option<SwapMessage> {
             | SwapMessage::SwapRequest(_)
             | SwapMessage::SwapStatusRequest(_)
             | SwapMessage::SwapListRequest(_)
+            | SwapMessage::SwapWakeCapability(_)
     )
     .then_some(message)
 }
