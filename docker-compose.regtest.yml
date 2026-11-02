@@ -51,7 +51,7 @@ services:
       - "60001:60001"
 
   lnd-a:
-    image: polarlightning/lnd:0.18.5-beta
+    image: polarlightning/lnd:0.20.0-beta
     container_name: lnd-a
     depends_on:
       - bitcoin
@@ -75,7 +75,7 @@ services:
       - "10011:10009"
 
   lnd-b:
-    image: polarlightning/lnd:0.18.5-beta
+    image: polarlightning/lnd:0.20.0-beta
     container_name: lnd-b
     depends_on:
       - bitcoin
