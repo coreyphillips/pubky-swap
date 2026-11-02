@@ -43,6 +43,9 @@ pub enum SwapMessage {
     SwapListRequest(SwapListRequest),
     /// Provider returns one page of the sender's own swaps.
     SwapList(SwapList),
+    /// Owner → provider, after `SwapAccept`: a wake gateway grant for this one swap. Needs
+    /// `swap-wake-v1`.
+    SwapWakeCapability(SwapWakeCapability),
     /// Either party → counterparty: cooperative signature material.
     /// Reserved for phase-2 Taproot cooperative (key-path) spends.
     CoopSignature(CoopSignature),
@@ -87,6 +90,9 @@ impl SwapMessage {
                 ephemeral("list-request", request.request_id.unwrap_or_default())
             }
             Self::SwapList(list) => ephemeral("list", list.request_id.unwrap_or_default()),
+            Self::SwapWakeCapability(offer) => {
+                ephemeral("wake-capability", offer.request_id.unwrap_or(offer.swap_id))
+            }
             Self::Reject(rejection) => ephemeral(
                 "reject",
                 rejection
@@ -134,6 +140,27 @@ pub const PAYKIT_EVENT_MAX_BYTES: usize = 1_000;
 /// The offer feature of a provider that answers [`SwapListRequest`] and keeps
 /// [`SwapRequest::owner_ref`].
 pub const SWAP_LIST_FEATURE: &str = "swap-list-v1";
+
+/// The feature of a side that sends, or wants, the claimable hint.
+///
+/// A provider advertising it, sent a [`QuoteRequest`] that lists it, tells the owner of a reverse
+/// swap when its lockup reaches the quote's `required_confirmations`: one [`SwapStatusUpdate`] in
+/// `lockup_confirmed` whose reference is the funding outpoint (`txid:vout`), and
+/// [`SwapStatusSnapshot::claimable`] from then on. Only DM owners get the update; session owners
+/// read the snapshot. Neither authorizes a claim: the owner checks the lockup on its own chain
+/// view before revealing the preimage.
+pub const CLAIMABLE_HINT_FEATURE: &str = "claimable-hint-v1";
+
+/// The offer feature of a provider that accepts a [`SwapWakeCapability`] and wakes the owner
+/// through it when the claimable hint fires. Advertised only with [`CLAIMABLE_HINT_FEATURE`] and a
+/// non-empty gateway allowlist.
+pub const SWAP_WAKE_FEATURE: &str = "swap-wake-v1";
+
+/// The wake gateway peer topic a swap grant covers.
+pub const SWAP_WAKE_TOPIC: &str = "swap.claimable";
+
+/// The longest wake grant token a provider keeps.
+pub const WAKE_TOKEN_MAX_LEN: usize = 256;
 
 /// Snapshots on a [`SwapList`] page when the request names no limit.
 pub const SWAP_LIST_DEFAULT_PAGE: u32 = 10;
@@ -448,6 +475,10 @@ pub struct SwapStatusSnapshot {
     /// What the owner put in [`SwapRequest::owner_ref`], if anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_ref: Option<String>,
+    /// The reverse lockup has reached `required_confirmations`, as the provider saw it. Set only
+    /// for owners that asked for [`CLAIMABLE_HINT_FEATURE`]. A hint, never an authorization.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claimable: bool,
 }
 
 /// Ask for the swaps the authenticated sender owns at this provider, newest first.
@@ -492,6 +523,48 @@ pub struct SwapStatusUpdate {
     pub state: SwapState,
     /// Optional txid / preimage / invoice reference for this transition.
     pub reference: Option<String>,
+}
+
+/// A wake gateway grant the owner issued for one swap, in the shape the gateway's anti-spam
+/// notes propose for Paykit.
+///
+/// The token is a bearer secret, so `Debug` redacts it and a provider never logs it, echoes it or
+/// keeps it past the swap.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeCapability {
+    pub v: u16,
+    /// The gateway's base URL. A provider calls only gateways on its own allowlist.
+    pub gateway: String,
+    pub topics: Vec<String>,
+    /// The `wkg_` grant token.
+    pub token: String,
+    /// Unix seconds after which the grant is dead.
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for WakeCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WakeCapability")
+            .field("v", &self.v)
+            .field("gateway", &self.gateway)
+            .field("topics", &self.topics)
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Owner → provider: wake me through this grant when the swap becomes claimable.
+///
+/// Sent once, after `SwapAccept`, and only to a provider advertising [`SWAP_WAKE_FEATURE`]: an
+/// older provider cannot parse the kind. Accepted with the swap's [`SwapStatusSnapshot`],
+/// refused with a [`Reject`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwapWakeCapability {
+    #[serde(default)]
+    pub request_id: Option<Uuid>,
+    pub swap_id: Uuid,
+    pub capability: WakeCapability,
 }
 
 /// Cooperative signature material (phase-2 Taproot key-path spends). The encoding is
@@ -839,6 +912,7 @@ mod tests {
             created_at_unix: 1,
             payment_hash_hex: "00".repeat(32),
             owner_ref: None,
+            claimable: false,
         });
         assert!(status
             .delivery_scope()
@@ -869,6 +943,7 @@ mod tests {
             created_at_unix: 1,
             payment_hash_hex: "00".repeat(32),
             owner_ref: Some("index:7".into()),
+            claimable: false,
         };
         let mut json = serde_json::to_value(&snapshot).unwrap();
         let fields = json.as_object_mut().unwrap();
@@ -978,6 +1053,7 @@ mod tests {
             created_at_unix: u64::MAX,
             payment_hash_hex: "ab".repeat(32),
             owner_ref: Some("r".repeat(OWNER_REF_MAX_LEN)),
+            claimable: true,
         };
         let page = SwapMessage::SwapList(SwapList {
             request_id: Some(Uuid::new_v4()),

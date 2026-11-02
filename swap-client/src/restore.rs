@@ -298,6 +298,7 @@ mod tests {
                 created_at_unix: 4,
                 payment_hash_hex: hex::encode(hash),
                 owner_ref: Some("index:3".into()),
+                claimable: false,
             },
             claim_key,
             preimage,

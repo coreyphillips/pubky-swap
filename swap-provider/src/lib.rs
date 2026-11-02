@@ -35,6 +35,7 @@ pub use swap_common::store;
 #[cfg(test)]
 mod compatibility_tests;
 pub mod submarine;
+mod wake;
 #[cfg(feature = "bdk-wallet")]
 pub mod wallet;
 
@@ -184,6 +185,12 @@ pub struct ProviderConfig {
     /// is the only way in, and the `iroh` feature has to be built. Settings that only mean
     /// something over DMs are refused at startup rather than ignored.
     pub homeserver: bool,
+    /// Wake gateways (base URLs, `https` only) this provider may call with an owner's grant.
+    ///
+    /// Empty, which is the default until a production gateway exists, means no wakes: the offer
+    /// does not advertise `swap-wake-v1` and capabilities are refused. An owner can only name a
+    /// gateway on this list, so it cannot make the provider call an arbitrary URL.
+    pub wake_gateways: Vec<String>,
 }
 
 impl ProviderConfig {
@@ -240,6 +247,7 @@ impl Default for ProviderConfig {
             rendezvous_iroh: true,
             homeserver: true,
             status_addr: None,
+            wake_gateways: Vec::new(),
         }
     }
 }
@@ -557,6 +565,8 @@ struct IssuedQuote {
     onchain_fee_sat: u64,
     /// Unix seconds after which this quote is no longer honoured (0 = never).
     expires_at_unix: u64,
+    /// A reverse quote whose owner listed `claimable-hint-v1`.
+    claimable_hint: bool,
 }
 
 /// The advertised offer, which does not exist for the first moments of a run.
@@ -591,6 +601,8 @@ struct ExecCtx {
     /// False when the provider runs without a Pubky homeserver. Every DM path checks it, because
     /// the messenger signs in on its own the first time one is used.
     homeserver: bool,
+    /// Owners' wake capabilities, and the gateways they may name.
+    wake: Arc<wake::Waker>,
 }
 
 /// Per-swap exclusion over the step that turns a persisted admission into a running driver.
@@ -816,6 +828,92 @@ impl ProgressSink for StoreProgress {
     }
 }
 
+/// A reverse driver's [`ProgressSink`]: the store, plus the claimable hint and wake.
+struct ReverseProgress {
+    store: Arc<StoreProgress>,
+    ctx: ExecCtx,
+}
+
+impl ProgressSink for ReverseProgress {
+    fn funding_intent(&self, tip: u32) -> anyhow::Result<()> {
+        self.store.funding_intent(tip)
+    }
+    fn funded(&self, outpoint: OutPoint) {
+        self.store.funded(outpoint)
+    }
+    fn invoice_pay_started(&self) -> anyhow::Result<()> {
+        self.store.invoice_pay_started()
+    }
+    fn invoice_paid(&self) {
+        self.store.invoice_paid()
+    }
+    fn claim_observed(&self, txid: Txid) {
+        self.store.claim_observed(txid)
+    }
+    fn spend_broadcast(&self, txid: Txid) {
+        self.store.spend_broadcast(txid)
+    }
+    fn wants_claimable(&self) -> bool {
+        let rec = self.store.snapshot();
+        rec.claimable_hint && rec.claimable_at_unix.is_none()
+    }
+    fn claimable(&self, outpoint: OutPoint) {
+        // Written first, so the status query that a wake prompts already says claimable.
+        self.store
+            .update("claimable", |rec| rec.claimable_at_unix = Some(now_unix()));
+        let record = self.store.snapshot();
+        let capability = self.ctx.wake.take(record.swap_id);
+        let ctx = self.ctx.clone();
+        // Off the driver's path: a slow gateway or homeserver must not hold up the claim watch.
+        tokio::spawn(async move { announce_claimable(&ctx, &record, outpoint, capability).await });
+    }
+}
+
+/// Tell a reverse swap's owner its lockup is at depth: one peer wake through its grant, if it
+/// sent one, and one status update over DMs, if that is how it talks to us. Session owners read
+/// the snapshot, which already says claimable. Best effort throughout.
+async fn announce_claimable(
+    ctx: &ExecCtx,
+    record: &SwapRecord,
+    outpoint: OutPoint,
+    capability: Option<WakeCapability>,
+) {
+    let swap_id = record.swap_id;
+    if let Some(capability) = capability {
+        match ctx.wake.wake(&capability, now_unix()).await {
+            wake::WakeOutcome::Accepted => info!("woke the owner of swap {swap_id}"),
+            wake::WakeOutcome::GrantInvalid => {
+                info!("the owner's wake grant for swap {swap_id} is no longer valid; dropped it")
+            }
+            wake::WakeOutcome::RateLimited => {
+                info!("the owner of swap {swap_id} is out of wake quota; skipped the wake")
+            }
+            wake::WakeOutcome::Failed(reason) => {
+                warn!("could not wake the owner of swap {swap_id}: {reason}")
+            }
+        }
+    }
+    if record.peer_account.is_some() || !ctx.homeserver {
+        return;
+    }
+    match delivery::has_dm_history(&ctx.transport, record) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => {
+            warn!("no claimable hint for swap {swap_id}: message history unreadable ({e})");
+            return;
+        }
+    }
+    let message = delivery::claimable_update(record, outpoint);
+    if let Err(e) = ctx
+        .transport
+        .send_with_scope(&record.peer, &message.delivery_scope(), &message)
+        .await
+    {
+        warn!("failed to send the claimable hint for swap {swap_id}: {e}");
+    }
+}
+
 /// How often the reorg monitor samples the chain.
 const REORG_POLL: Duration = Duration::from_secs(30);
 
@@ -890,6 +988,7 @@ async fn finish_driver_run(
 ) {
     match result {
         Ok(state) if state.is_terminal() => {
+            ctx.wake.forget(swap_id);
             progress.set_terminal(state);
             notify_terminal_peer(ctx, progress, peer).await;
         }
@@ -928,6 +1027,7 @@ async fn finish_driver_run(
                     respawn(ctx, rec, reservation, delay);
                 }
                 Recovery::GiveUp => {
+                    ctx.wake.forget(swap_id);
                     error!("swap {swap_id} failed permanently: {e}");
                     progress.set_terminal(SwapState::Failed(e.to_string()));
                     notify_terminal_peer(ctx, progress, peer).await;
@@ -1184,6 +1284,10 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
         homeserver: config.homeserver,
+        wake: Arc::new(
+            wake::Waker::new(&config.wake_gateways)
+                .persisted_at(std::path::Path::new(&config.data_dir).join("wake-grants.json")),
+        ),
     };
     // The daemon has worked out what it can do; tell anything watching.
     ready.store(capable, std::sync::atomic::Ordering::Relaxed);
@@ -1626,7 +1730,11 @@ fn build_offer(
                 "boltz-taproot-v1".into(),
                 "swap-status-v1".into(),
                 SWAP_LIST_FEATURE.into(),
+                CLAIMABLE_HINT_FEATURE.into(),
             ];
+            if wake::allowlist_usable(&config.wake_gateways) {
+                features.push(SWAP_WAKE_FEATURE.into());
+            }
             // Retention is a promise about DMs, which a provider without a homeserver never
             // sends or keeps.
             if config.homeserver {
@@ -1751,6 +1859,37 @@ async fn handle_message(
             }
         }
 
+        SwapMessage::SwapWakeCapability(offer) => {
+            let (request_id, swap_id) = (offer.request_id, offer.swap_id);
+            match accept_wake_capability(ctx, sender, offer) {
+                Ok(snapshot) => {
+                    respond(
+                        &ctx.transport,
+                        sender,
+                        &SwapMessage::SwapStatusSnapshot(snapshot),
+                    )
+                    .await?
+                }
+                Err(error) => {
+                    let code = match error.downcast_ref::<SwapLookupError>() {
+                        Some(SwapLookupError::NotFound) => RejectCode::NotFound,
+                        Some(SwapLookupError::Pending) => RejectCode::Pending,
+                        None => refusal_code(&error),
+                    };
+                    reject(
+                        &ctx.transport,
+                        sender,
+                        request_id,
+                        Some(swap_id),
+                        None,
+                        code,
+                        error.to_string(),
+                    )
+                    .await?
+                }
+            }
+        }
+
         SwapMessage::QuoteRequest(req) => {
             let request_id = req.request_id;
             let refuse = |code: RejectCode, reason: String| {
@@ -1848,6 +1987,8 @@ async fn handle_message(
                     service_fee_sat: fee.service_fee_sat,
                     onchain_fee_sat: fee.onchain_fee_sat,
                     expires_at_unix,
+                    claimable_hint: req.direction == SwapDirection::Reverse
+                        && req.features.iter().any(|f| f == CLAIMABLE_HINT_FEATURE),
                 },
                 now,
             );
@@ -2139,6 +2280,64 @@ fn replay_record(
         return Ok(Some(record));
     }
     Ok(None)
+}
+
+/// Take in an owner's wake capability for one of its open reverse swaps.
+///
+/// Answered with the swap's snapshot, so a swap already claimable says so and needs no wake: its
+/// owner is online, having just sent this. Every refusal is worded without the token.
+fn accept_wake_capability(
+    ctx: &ExecCtx,
+    sender: &str,
+    offer: SwapWakeCapability,
+) -> Result<SwapStatusSnapshot> {
+    if !ctx.wake.enabled() {
+        return Err(
+            Refusal::new(RejectCode::UnsupportedRoute, "this provider sends no wakes").into(),
+        );
+    }
+    let record = ctx
+        .store
+        .get(offer.swap_id)?
+        .ok_or(SwapLookupError::NotFound)?;
+    if !authorized_peer(&record, sender, ctx.transport.authorization()) {
+        return Err(SwapLookupError::NotFound.into());
+    }
+    if record.pending_hold_invoice.is_some() {
+        return Err(SwapLookupError::Pending.into());
+    }
+    if record.direction != SwapDirection::Reverse || !record.claimable_hint {
+        return Err(Refusal::new(
+            RejectCode::InvalidRequest,
+            format!("only a reverse swap quoted with {CLAIMABLE_HINT_FEATURE} takes a wake"),
+        )
+        .into());
+    }
+    if record.state.is_terminal() {
+        return Err(Refusal::new(RejectCode::InvalidRequest, "the swap has ended").into());
+    }
+    let now = now_unix();
+    let record = if record.claimable_at_unix.is_none() {
+        ctx.wake
+            .hold(record.swap_id, offer.capability, now)
+            .map_err(|refused| Refusal::new(RejectCode::InvalidRequest, refused.to_string()))?;
+        // The driver marks a swap claimable before it takes the grant, and does so once. Read
+        // again after holding: a swap claimable now may have fired before this grant was held.
+        // Its owner is online and learns from this reply instead.
+        let record = ctx
+            .store
+            .get(offer.swap_id)?
+            .ok_or(SwapLookupError::NotFound)?;
+        if record.claimable_at_unix.is_some() {
+            ctx.wake.forget(record.swap_id);
+        }
+        record
+    } else {
+        record
+    };
+    record
+        .status_snapshot(offer.request_id, now)
+        .ok_or_else(|| anyhow!("this older swap has no persisted acceptance"))
 }
 
 /// Restrict recovery to the transport-authenticated counterparty and expose only public data.
@@ -2584,6 +2783,7 @@ async fn start_reverse(ctx: &ExecCtx, sender: &str, req: SwapRequest) -> Result<
         funding_txid_hex: None,
         funding_vout: None,
         state: SwapState::Created,
+        claimable_hint: quote.claimable_hint,
         ..SwapRecord::new_progress()
     };
     // The durable intent exists before the invoice RPC, including its owner and immutable hash.
@@ -2643,6 +2843,10 @@ fn spawn_reverse_driver(
         if !delay.is_zero() {
             sleep(delay).await;
         }
+        let sink = ReverseProgress {
+            store: progress.clone(),
+            ctx: ctx2.clone(),
+        };
         let result = drive_reverse_swap(
             ctx2.ln.as_ref(),
             chain.as_ref(),
@@ -2651,7 +2855,7 @@ fn spawn_reverse_driver(
             required_confirmations,
             Duration::from_secs(2),
             &resume,
-            progress.as_ref(),
+            &sink,
         )
         .await;
         if matches!(&result, Ok(state) if state.is_terminal()) {
@@ -3397,6 +3601,7 @@ fn customer_request(message: serde_json::Value) -> Option<SwapMessage> {
             | SwapMessage::SwapRequest(_)
             | SwapMessage::SwapStatusRequest(_)
             | SwapMessage::SwapListRequest(_)
+            | SwapMessage::SwapWakeCapability(_)
     )
     .then_some(message)
 }
@@ -3579,6 +3784,7 @@ fn variant_name(msg: &SwapMessage) -> &'static str {
         SwapMessage::SwapStatusSnapshot(_) => "SwapStatusSnapshot",
         SwapMessage::SwapListRequest(_) => "SwapListRequest",
         SwapMessage::SwapList(_) => "SwapList",
+        SwapMessage::SwapWakeCapability(_) => "SwapWakeCapability",
         SwapMessage::CoopSignature(_) => "CoopSignature",
         SwapMessage::Reject(_) => "Reject",
     }
@@ -3852,6 +4058,7 @@ mod tests {
             service_fee_sat: 500,
             onchain_fee_sat: 200,
             expires_at_unix,
+            claimable_hint: false,
         }
     }
 
