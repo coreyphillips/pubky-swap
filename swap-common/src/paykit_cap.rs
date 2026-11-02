@@ -517,6 +517,9 @@ pub struct CapClient {
     expected_signer: Option<String>,
     /// Signed terms by quote id, which a commit names.
     terms: HashMap<Uuid, String>,
+    /// The `commit_hash` of each commit sent, by quote id. A status reply for that quote must
+    /// carry a contract signed over it.
+    commits: HashMap<Uuid, String>,
 }
 
 impl CapClient {
@@ -524,12 +527,13 @@ impl CapClient {
         Self {
             expected_signer: expected_signer.map(hex::encode),
             terms: HashMap::new(),
+            commits: HashMap::new(),
         }
     }
 
     /// The kind to send for `request`. `None` means send it as a plain [`SwapMessage`]: an offer
     /// or list request, or a commit whose signed quote this client never saw.
-    pub fn request(&self, request: &SwapMessage) -> Option<CapMessage> {
+    pub fn request(&mut self, request: &SwapMessage) -> Option<CapMessage> {
         match request {
             SwapMessage::QuoteRequest(request) => Some(CapMessage::Rfq(Rfq {
                 request_id: request.request_id,
@@ -539,10 +543,10 @@ impl CapClient {
             })),
             SwapMessage::SwapRequest(request) => {
                 let terms_hash = self.terms.get(&request.quote_id)?.clone();
-                Some(CapMessage::Commit(Commit {
-                    terms_hash,
-                    commit: CommitBody::from_request(request),
-                }))
+                let commit = CommitBody::from_request(request);
+                let hash = commit_hash(&terms_hash, &commit).ok()?;
+                self.commits.insert(request.quote_id, hex::encode(hash));
+                Some(CapMessage::Commit(Commit { terms_hash, commit }))
             }
             SwapMessage::SwapStatusRequest(request) => {
                 Some(CapMessage::StatusRequest(request.clone()))
@@ -605,6 +609,17 @@ impl CapClient {
                     snapshot, contract, ..
                 } = *status;
                 let mut snapshot = snapshot.ok_or(CapError::Unexpected("status without a swap"))?;
+                // A swap this client committed to here is recovered only with the contract
+                // signed over that commit.
+                match (&contract, self.commits.get(&snapshot.accept.quote_id)) {
+                    (None, Some(_)) => {
+                        return Err(CapError::Unexpected("status without the signed contract"))
+                    }
+                    (Some(contract), Some(hash)) if contract.signed.commit_hash != *hash => {
+                        return Err(CapError::HashMismatch("commit_hash"))
+                    }
+                    _ => {}
+                }
                 if let Some(contract) = contract {
                     self.check_signer(&contract.signed.signer)?;
                     let accept = contract.open()?;
@@ -852,7 +867,7 @@ mod tests {
         other.owner_ref = None;
         let wrong = sign_contract(&provider, &signed.terms_hash, &other, &accept()).unwrap();
         assert!(client
-            .reply(&swap_request, CapMessage::Contract(wrong))
+            .reply(&swap_request, CapMessage::Contract(wrong.clone()))
             .is_err());
 
         // Pending is not a decline: the engine sees the code it already retries on.
@@ -893,21 +908,30 @@ mod tests {
             payment_hash_hex: "11".repeat(32),
             owner_ref: None,
         };
-        let status = CapMessage::Status(Box::new(Status {
-            request_id: None,
-            swap_id: Some(uuid(3)),
-            quote_id: Some(uuid(2)),
-            state: "created".into(),
-            reference: None,
-            snapshot: Some(snapshot),
-            contract: Some(contract),
-        }));
-        let reply = client.reply(&status_request, status).unwrap();
+        let status = |contract| {
+            CapMessage::Status(Box::new(Status {
+                request_id: None,
+                swap_id: Some(uuid(3)),
+                quote_id: Some(uuid(2)),
+                state: "created".into(),
+                reference: None,
+                snapshot: Some(snapshot.clone()),
+                contract,
+            }))
+        };
+        let reply = client
+            .reply(&status_request, status(Some(contract)))
+            .unwrap();
         assert!(matches!(reply, SwapMessage::SwapStatusSnapshot(s) if s.accept == accept()));
+
+        // Recovering the committed swap needs the contract signed over that commit.
+        for contract in [Some(wrong), None] {
+            assert!(client.reply(&status_request, status(contract)).is_err());
+        }
     }
 
-    /// Paykit Event Messages carry at most 1,000 bytes. Measured, not enforced: the contract
-    /// with a Taproot tree is the one that decides whether the Encrypted Link carrier needs more.
+    /// Paykit Event Messages carry at most 1,000 bytes. A signed contract is left out: with the
+    /// P2WSH script or Taproot tree the provider always sends, it does not fit yet.
     #[test]
     fn rfq_quote_and_commit_fit_a_paykit_event_message() {
         let rfq_message = CapMessage::Rfq(Rfq {
@@ -921,15 +945,9 @@ mod tests {
             terms_hash: "00".repeat(32),
             commit: commit(),
         });
-        let contract = sign_contract(&signer(), &"00".repeat(32), &commit(), &accept()).unwrap();
         for message in [rfq_message, quote_message, commit_message] {
             let size = serde_json::to_vec(&message).unwrap().len();
             assert!(size <= PAYKIT_EVENT_MAX_BYTES, "{size} bytes: {message:?}");
         }
-        let signed = serde_json::to_vec(&contract.signed).unwrap().len();
-        assert!(
-            signed <= PAYKIT_EVENT_MAX_BYTES,
-            "signed contract is {signed} bytes"
-        );
     }
 }

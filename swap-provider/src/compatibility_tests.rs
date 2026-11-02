@@ -932,12 +932,14 @@ mod direct_requests {
             record.swap_accept.clone().unwrap()
         );
         assert_eq!(ask_cap(&ctx, &owner, &commit).await, first);
+        // The driver writes whole records from a snapshot taken before the contract was signed.
+        ctx.store.put(&record).unwrap();
 
         // A restarted provider: a fresh store handle and no terms in memory.
         let ctx = provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
-        assert_eq!(ask_cap(&ctx, &owner, &commit).await, first);
         let stored = ctx.store.get(record.swap_id).unwrap().unwrap().cap_contract;
         assert_eq!(stored.as_ref(), Some(&contract));
+        assert_eq!(ask_cap(&ctx, &owner, &commit).await, first);
 
         let status = CapMessage::StatusRequest(SwapStatusRequest {
             request_id: Some(Uuid::new_v4()),
@@ -949,6 +951,7 @@ mod direct_requests {
             panic!("expected a status: {}", String::from_utf8_lossy(&reply));
         };
         assert_eq!(status.contract.as_ref(), Some(&contract));
+        assert_eq!(status.state, "created");
         assert_eq!(status.snapshot.unwrap().accept.invoice, None);
 
         // The sender is the owner, whatever the body says: a stranger replaying the same commit

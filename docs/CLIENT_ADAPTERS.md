@@ -276,8 +276,9 @@ Golden vectors, from `swap-common/src/paykit_cap.rs` (`golden_vectors`), for sig
 The inputs are the fixtures in that test. `swap_client::negotiate::CapChannel` is the client side:
 it sends these kinds and checks each signature against the provider it dialed.
 
-The rfq, quote, commit and signed contract fit 1,000 bytes with a P2WSH or tree-less contract.
-A `status` reply carries the full snapshot and contract and does not.
+The rfq, quote and commit fit 1,000 bytes. A signed contract does not yet: with the P2WSH
+script or Taproot tree the provider always sends, it is over. A `status` reply carries the full snapshot and contract, and is
+larger still.
 
 ## Amounts and fees
 

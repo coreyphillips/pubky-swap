@@ -204,7 +204,8 @@ mod direct {
                     request_id: snapshot.request_id,
                     swap_id: Some(snapshot.accept.swap_id),
                     quote_id: Some(snapshot.accept.quote_id),
-                    state: serde_json::to_value(&snapshot.state)?
+                    // `SwapState` serializes as `{"state": .., "detail": ..}`.
+                    state: serde_json::to_value(&snapshot.state)?["state"]
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),

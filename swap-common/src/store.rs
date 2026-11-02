@@ -654,14 +654,25 @@ impl JsonFileSwapStore {
 
         // Stamp creation time at the shared persistence boundary. Later writes preserve the
         // existing value even when the caller's snapshot predates its first persisted record.
+        // The signed contract is kept the same way: the driver writes whole records from a
+        // snapshot taken before it was signed.
         let stamped;
-        let rec = if rec.created_at_unix == 0 {
+        let rec = if rec.created_at_unix == 0 || rec.cap_contract.is_none() {
             let existing = self.get(rec.swap_id).ok().flatten();
-            stamped = SwapRecord {
-                created_at_unix: existing
+            let created_at_unix = match rec.created_at_unix {
+                0 => existing
+                    .as_ref()
                     .map(|e| e.created_at_unix)
                     .filter(|t| *t > 0)
                     .unwrap_or_else(now_unix),
+                created => created,
+            };
+            stamped = SwapRecord {
+                created_at_unix,
+                cap_contract: rec
+                    .cap_contract
+                    .clone()
+                    .or_else(|| existing.and_then(|e| e.cap_contract)),
                 ..rec.clone()
             };
             &stamped
