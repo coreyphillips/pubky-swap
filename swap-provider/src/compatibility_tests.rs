@@ -627,6 +627,23 @@ fn negotiation_only_providers_do_not_advertise_execution_capabilities() {
         .any(|feature| feature == "dm-retention-v1"));
 }
 
+/// #107: retention is a promise about DMs, so a provider without a homeserver does not make it.
+/// Everything else it can do is still advertised.
+#[test]
+fn a_provider_without_a_homeserver_does_not_advertise_dm_retention() {
+    let config = ProviderConfig {
+        homeserver: false,
+        ..Default::default()
+    };
+    let offer = build_offer(&config, "provider", Network::Regtest, None, 2, true).unwrap();
+    assert!(!offer.features.iter().any(|f| f == "dm-retention-v1"));
+    assert!(offer.features.iter().any(|f| f == "swap-status-v1"));
+    assert_eq!(
+        offer.features.iter().any(|f| f == "direct-rpc-v1"),
+        cfg!(feature = "iroh")
+    );
+}
+
 #[test]
 fn offers_carry_the_configured_fund_within() {
     let config = ProviderConfig {
@@ -667,6 +684,69 @@ mod direct_requests {
             min_onchain_reserve_sat: 0,
             // Nothing new may start: every reply below comes from what is already persisted.
             capable: false,
+            homeserver: true,
+        }
+    }
+
+    /// A Lightning node that issues a hold invoice for any request and reports it open, so a
+    /// creation completes and its driver then waits for a payment that never comes.
+    struct OpenInvoiceLightning;
+
+    #[async_trait::async_trait]
+    impl LightningBackend for OpenInvoiceLightning {
+        async fn node_info(&self) -> lightning_backend::Result<NodeInfo> {
+            unreachable!()
+        }
+        async fn create_hold_invoice(
+            &self,
+            request: HoldInvoiceRequest,
+        ) -> lightning_backend::Result<HoldInvoice> {
+            Ok(HoldInvoice {
+                bolt11: "hold-invoice".into(),
+                payment_hash: request.payment_hash,
+                amount_msat: request.amount_msat,
+            })
+        }
+        async fn lookup_hold_invoice(
+            &self,
+            _: &HoldInvoiceRequest,
+        ) -> lightning_backend::Result<Option<HoldInvoice>> {
+            Ok(None)
+        }
+        async fn create_invoice(
+            &self,
+            _: u64,
+            _: u64,
+            _: &str,
+        ) -> lightning_backend::Result<HoldInvoice> {
+            unreachable!()
+        }
+        async fn invoice_status(&self, _: [u8; 32]) -> lightning_backend::Result<InvoiceStatus> {
+            Ok(InvoiceStatus {
+                state: lightning_backend::InvoiceState::Open,
+                amount_paid_msat: 0,
+                htlcs: Vec::new(),
+            })
+        }
+        async fn settle_hold_invoice(&self, _: [u8; 32]) -> lightning_backend::Result<()> {
+            unreachable!()
+        }
+        async fn cancel_hold_invoice(&self, _: [u8; 32]) -> lightning_backend::Result<()> {
+            Ok(())
+        }
+        async fn pay_invoice(
+            &self,
+            _: &str,
+            _: u64,
+            _: Option<u32>,
+        ) -> lightning_backend::Result<PaymentResult> {
+            unreachable!()
+        }
+        async fn payment_status(&self, _: [u8; 32]) -> lightning_backend::Result<PaymentStatus> {
+            unreachable!()
+        }
+        async fn decode_invoice(&self, _: &str) -> lightning_backend::Result<DecodedInvoice> {
+            unreachable!()
         }
     }
 
@@ -871,6 +951,98 @@ mod direct_requests {
         // Only customer requests are handled; anything else gets no reply at all.
         let reply = ask(&ctx, &client, SwapMessage::Quote(issued)).await;
         assert!(reply.is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// #107: a provider that never signs in to a homeserver still serves the whole negotiation
+    /// over `direct/1`: offer, quote, creation and status. The fixture's transport is unsigned,
+    /// and the only thing that could sign it in is a DM path, none of which runs here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_without_a_homeserver_negotiates_over_direct_requests() {
+        let directory = std::env::temp_dir().join(format!("no-homeserver-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let config = ProviderConfig {
+            homeserver: false,
+            ..Default::default()
+        };
+        let ctx = ExecCtx {
+            ln: Arc::new(OpenInvoiceLightning),
+            homeserver: false,
+            ..executing(context(store.clone(), Uuid::new_v4()))
+        };
+        let advertised = build_offer(
+            &config,
+            &pubky_transport::identity_from_secret(&[40; 32]),
+            Network::Regtest,
+            None,
+            2,
+            true,
+        )
+        .unwrap();
+        let offer: SharedOffer = Arc::new(RwLock::new(Some(advertised)));
+        let client = pubky_transport::identity_from_secret(&[47; 32]);
+        let request_id = Some(Uuid::new_v4());
+
+        let reply = ask_with(
+            &ctx,
+            offer.clone(),
+            &client,
+            SwapMessage::OfferRequest(OfferRequest { request_id }),
+        )
+        .await;
+        let Some(SwapMessage::Offer(current)) = reply else {
+            panic!("expected an offer, got {reply:?}");
+        };
+        assert!(current.features.iter().any(|f| f == "direct-rpc-v1"));
+        assert!(
+            !current.features.iter().any(|f| f == "dm-retention-v1"),
+            "{:?}",
+            current.features
+        );
+
+        let reply = ask_with(
+            &ctx,
+            offer.clone(),
+            &client,
+            SwapMessage::QuoteRequest(quote_request(&client, SwapDirection::Reverse, 100_000)),
+        )
+        .await;
+        let Some(SwapMessage::Quote(quote)) = reply else {
+            panic!("expected a quote, got {reply:?}");
+        };
+
+        let mut creation = owned_record(&client).swap_request.unwrap();
+        creation.quote_id = quote.quote_id;
+        let reply = ask_with(
+            &ctx,
+            offer.clone(),
+            &client,
+            SwapMessage::SwapRequest(creation),
+        )
+        .await;
+        let Some(SwapMessage::SwapAccept(accept)) = reply else {
+            panic!("expected an acceptance, got {reply:?}");
+        };
+        assert_eq!(accept.quote_id, quote.quote_id);
+
+        let status = SwapStatusRequest {
+            request_id,
+            swap_id: Some(accept.swap_id),
+            quote_id: None,
+        };
+        let reply = ask_with(&ctx, offer, &client, SwapMessage::SwapStatusRequest(status)).await;
+        let Some(SwapMessage::SwapStatusSnapshot(snapshot)) = reply else {
+            panic!("expected a status snapshot, got {reply:?}");
+        };
+        assert_eq!(snapshot.accept.swap_id, accept.swap_id);
+
+        // Evicting an idle peer touches the poll set and nothing else: an unfollow would be the
+        // messenger's first homeserver write.
+        let idle = pubky_transport::identity_from_secret(&[48; 32]);
+        ctx.transport.register_peer(&idle, false).unwrap();
+        assert!(ctx.transport.get_known_peers().contains(&idle));
+        evict_peer_if_idle(&ctx, &idle).await;
+        assert!(!ctx.transport.get_known_peers().contains(&idle));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

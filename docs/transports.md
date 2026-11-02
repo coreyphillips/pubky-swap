@@ -23,6 +23,11 @@ Neither replaces the other, and no swap state depends on which one carried a req
   sessions do not work while that homeserver is unavailable.
 - Pubky DMs need both homeservers: the sender writes, and the receiver polls.
 - Provider discovery and resolving where a homeserver lives use Pubky and the DHT.
+- A provider started with `--no-homeserver` (`homeserver = false`) never signs in. It restores
+  its identity locally and serves `direct/1` and session requests only: no follow-graph
+  discovery, no offer broadcast, no DM polling or delivery, and no `dm-retention-v1` in its
+  offer. It refuses `broadcast_offer`, `rendezvous_iroh = false` and a build without `iroh` at
+  startup, because each would leave it doing less than asked or reachable by nobody.
 
 ## Selection and fallback
 
@@ -220,10 +225,11 @@ receipt. Completion schedules cleanup through `complete_scope` and `process_outb
 
 ## Operational limits
 
-A root-key direct request needs no per-request homeserver access. Current provider startup still
-signs in and publishes/discovers through Pubky before serving, so a fresh boot is not independent
-of homeserver availability. Scoped-session requests still check the account's live authorization
-on every request. Neither path removes Bitcoin confirmation or Lightning settlement requirements.
+A root-key direct request needs no per-request homeserver access. By default the provider still
+signs in and discovers through Pubky before serving, so a fresh boot depends on the homeserver;
+with `--no-homeserver` it does not, at the cost of every DM path. Scoped-session requests still
+check the account's live authorization on every request. Neither path removes Bitcoin
+confirmation or Lightning settlement requirements.
 
 Each public CLI negotiation operation has one 60-second deadline covering connection retries,
 fallback, queue wait and status recovery. Cancellation preserves ambiguous creation intent.

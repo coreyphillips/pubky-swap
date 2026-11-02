@@ -173,6 +173,15 @@ pub struct ProviderConfig {
     ///
     /// Set it false to run as a private provider that serves only counterparties it follows.
     pub rendezvous_iroh: bool,
+    /// Sign in to this identity's Pubky homeserver at startup and serve Pubky DMs: follow-graph
+    /// discovery, the offer broadcast, DM polling and DM delivery.
+    ///
+    /// Off, the identity is restored locally and the provider serves iroh `direct/1` and session
+    /// requests only. Nothing it does then touches a homeserver, so it runs without a Pubky
+    /// account at all. The doorbell (`rendezvous_iroh`) has to stay on, because without DMs it
+    /// is the only way in, and the `iroh` feature has to be built. Settings that only mean
+    /// something over DMs are refused at startup rather than ignored.
+    pub homeserver: bool,
 }
 
 impl ProviderConfig {
@@ -227,6 +236,7 @@ impl Default for ProviderConfig {
             wallet_backend: "bdk".to_string(),
             peer_idle_ttl_secs: 3600,
             rendezvous_iroh: true,
+            homeserver: true,
             status_addr: None,
         }
     }
@@ -434,6 +444,70 @@ fn validate_mainnet_safety(c: &ProviderConfig, network: Network) -> Result<()> {
     Ok(())
 }
 
+/// A transport setting that cannot work with the others, and what to change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransportModeError {
+    pub(crate) detail: String,
+    pub(crate) remedy: String,
+}
+
+impl std::fmt::Display for TransportModeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; {}", self.detail, self.remedy)
+    }
+}
+
+impl std::error::Error for TransportModeError {}
+
+/// Refuse settings that only mean something over DMs when the provider has no homeserver.
+///
+/// Ignoring them would start a daemon that quietly skips what it was asked to do, or one that
+/// nothing can reach. Each refusal names the flag to drop.
+fn validate_transport_mode(c: &ProviderConfig) -> std::result::Result<(), TransportModeError> {
+    if c.homeserver {
+        return Ok(());
+    }
+    if c.broadcast_offer {
+        return Err(TransportModeError {
+            detail: "broadcast_offer sends the offer as Pubky DMs, which need a homeserver".into(),
+            remedy: "drop --broadcast-offer, or drop --no-homeserver".into(),
+        });
+    }
+    if !c.rendezvous_iroh {
+        return Err(TransportModeError {
+            detail: "without a homeserver the iroh doorbell is the only way to reach this \
+                     provider, and rendezvous_iroh is off"
+                .into(),
+            remedy: "drop --no-rendezvous-iroh, or drop --no-homeserver".into(),
+        });
+    }
+    if !cfg!(feature = "iroh") {
+        return Err(TransportModeError {
+            detail: "this build has no iroh feature, so nothing could reach a provider without \
+                     a homeserver"
+                .into(),
+            remedy: "rebuild with --features full, or drop --no-homeserver".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Which paths a counterparty can reach this provider over, for `--doctor` and the logs.
+pub(crate) fn describe_transport_mode(c: &ProviderConfig) -> String {
+    let doorbell = cfg!(feature = "iroh") && c.rendezvous_iroh;
+    match (c.homeserver, doorbell) {
+        (true, true) => "Pubky DMs, plus iroh direct/1 and sessions (doorbell on)".into(),
+        (true, false) if cfg!(feature = "iroh") => {
+            "Pubky DMs only (doorbell off: only followed counterparties can reach this provider)"
+                .into()
+        }
+        (true, false) => "Pubky DMs only (this build has no iroh feature)".into(),
+        (false, _) => {
+            "iroh direct/1 and sessions only; homeserver sign-in off, DM fallback off".into()
+        }
+    }
+}
+
 /// Map LND's reported chain network string to a [`Network`]. Returns `None` for networks with no
 /// `bitcoin::Network` equivalent (e.g. `"simnet"`).
 fn lnd_network_to_bitcoin(s: &str) -> Option<Network> {
@@ -512,6 +586,9 @@ struct ExecCtx {
     min_onchain_reserve_sat: u64,
     /// True when the provider can execute swaps (real LN + chain + wallet present).
     capable: bool,
+    /// False when the provider runs without a Pubky homeserver. Every DM path checks it, because
+    /// the messenger signs in on its own the first time one is used.
+    homeserver: bool,
 }
 
 /// Per-swap exclusion over the step that turns a persisted admission into a running driver.
@@ -941,11 +1018,20 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     validate_timelocks(&config)?;
     validate_fund_within(&config)?;
     validate_mainnet_safety(&config, network)?;
+    validate_transport_mode(&config)?;
 
     let identity = config.identity()?;
-    let transport = match identity.method {
-        "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
-        _ => Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?,
+    let transport = if config.homeserver {
+        match identity.method {
+            "file" => Transport::from_recovery_file(&identity.value, &identity.passphrase).await?,
+            _ => {
+                Transport::from_recovery_phrase(&identity.value, Some(&identity.passphrase)).await?
+            }
+        }
+    } else {
+        // The same key, restored without contacting anything. Everything below that would reach
+        // the homeserver is skipped, and the iroh rendezvous serves every request.
+        Transport::unsigned_from_recovery(identity.method, &identity.value, &identity.passphrase)?
     };
     let transport = transport
         .with_receive_journal(std::path::Path::new(&config.data_dir).join("receive-journal.json"))
@@ -1095,6 +1181,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         admissions: Arc::new(AdmissionLocks::default()),
         min_onchain_reserve_sat: config.min_onchain_reserve_sat,
         capable,
+        homeserver: config.homeserver,
     };
     // The daemon has worked out what it can do; tell anything watching.
     ready.store(capable, std::sync::atomic::Ordering::Relaxed);
@@ -1106,7 +1193,9 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     // Sweep terminal swap records once they are old enough to drop. Records are retained
     // rather than deleted on completion, so a driver failure can never take one with it.
     spawn_record_pruner(&ctx);
-    delivery::spawn(&ctx);
+    if config.homeserver {
+        delivery::spawn(&ctx);
+    }
     // Reap idle, unpinned peers so the poll set / follow graph stay bounded as clients come and go.
     spawn_peer_reaper(&ctx, Duration::from_secs(config.peer_idle_ttl_secs));
 
@@ -1148,6 +1237,17 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         lightning_node_id,
         offer.clone(),
     );
+
+    if !config.homeserver {
+        info!(
+            "Provider running without a homeserver: serving iroh direct/1 and session requests \
+             only, no DM fallback"
+        );
+        // The rendezvous task owns every request from here on. Nothing in the DM path below may
+        // run: the messenger would sign in on its own the first time it was asked to send.
+        let never: std::convert::Infallible = std::future::pending().await;
+        match never {}
+    }
 
     if let Err(e) = transport.discover_peers().await {
         warn!("peer discovery failed: {e}");
@@ -1520,11 +1620,12 @@ fn build_offer(
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
         features: if capable {
-            let mut features = vec![
-                "boltz-taproot-v1".into(),
-                "swap-status-v1".into(),
-                "dm-retention-v1".into(),
-            ];
+            let mut features = vec!["boltz-taproot-v1".into(), "swap-status-v1".into()];
+            // Retention is a promise about DMs, which a provider without a homeserver never
+            // sends or keeps.
+            if config.homeserver {
+                features.push("dm-retention-v1".into());
+            }
             if cfg!(feature = "iroh") && config.rendezvous_iroh {
                 features.push("session-rpc-v1".into());
                 features.push("direct-rpc-v1".into());
@@ -3073,6 +3174,13 @@ fn maybe_spawn_iroh_rendezvous(ctx: &ExecCtx, config: &ProviderConfig, offer: Sh
                 while let Some(event) = server.next_event().await {
                     match event {
                         pubky_transport::p2p::RendezvousEvent::Peer(pubky) => {
+                            // The doorbell asks to be polled over DMs, which this provider does
+                            // not do without a homeserver. Registering the peer would only give
+                            // the reaper something to unfollow.
+                            if !ctx.homeserver {
+                                debug!("doorbell from {pubky} ignored: no homeserver, so no DMs");
+                                continue;
+                            }
                             if ctx.transport.register_peer(&pubky, false).is_err() {
                                 warn!("could not persist rendezvous peer; registration will need retry");
                             }
@@ -3199,7 +3307,12 @@ async fn evict_peer_if_idle(ctx: &ExecCtx, peer: &str) {
     if still_active {
         return;
     }
-    ctx.transport.evict_peer(peer).await;
+    if ctx.homeserver {
+        ctx.transport.evict_peer(peer).await;
+    } else {
+        // Dropping the follow is a homeserver write, and the messenger would sign in to make it.
+        ctx.transport.forget_peer(peer);
+    }
     info!("Evicted peer {peer} (no active swaps remaining)");
 }
 
@@ -3229,6 +3342,12 @@ fn spawn_peer_reaper(ctx: &ExecCtx, idle_ttl: Duration) {
 async fn notify_terminal_peer(ctx: &ExecCtx, progress: &StoreProgress, peer: &str) {
     let record = progress.snapshot();
     if record.peer_account.is_some() {
+        return;
+    }
+    // A swap that began over DMs before this provider went homeserver-free gets no final DM:
+    // its owner polls status over iroh, and sending would sign the messenger in.
+    if !ctx.homeserver {
+        evict_peer_if_idle(ctx, peer).await;
         return;
     }
     match delivery::has_dm_history(&ctx.transport, &record) {
@@ -3512,6 +3631,51 @@ mod tests {
             ProviderConfig::default().rendezvous_iroh,
             "the default provider must be reachable by someone who only has its pubky"
         );
+    }
+
+    /// #107: a provider with no homeserver is refused the settings that only work over DMs,
+    /// and told which flag to drop. With a homeserver the same settings are fine.
+    #[test]
+    fn a_provider_without_a_homeserver_refuses_settings_that_need_one() {
+        let without = |adjust: fn(&mut ProviderConfig)| {
+            let mut config = ProviderConfig {
+                homeserver: false,
+                ..Default::default()
+            };
+            adjust(&mut config);
+            config
+        };
+        assert!(validate_transport_mode(&ProviderConfig::default()).is_ok());
+        assert_eq!(
+            validate_transport_mode(&without(|_| {})).is_ok(),
+            cfg!(feature = "iroh"),
+            "the mode needs the iroh feature and nothing else"
+        );
+        let error = validate_transport_mode(&without(|c| c.broadcast_offer = true)).unwrap_err();
+        assert!(error.detail.contains("broadcast_offer"), "{error}");
+        assert!(error.remedy.contains("--no-homeserver"), "{error}");
+        let error = validate_transport_mode(&without(|c| c.rendezvous_iroh = false)).unwrap_err();
+        assert!(error.remedy.contains("--no-rendezvous-iroh"), "{error}");
+        assert!(validate_transport_mode(&ProviderConfig {
+            broadcast_offer: true,
+            rendezvous_iroh: false,
+            ..Default::default()
+        })
+        .is_ok());
+        assert!(describe_transport_mode(&without(|_| {})).contains("DM fallback off"));
+        assert!(describe_transport_mode(&ProviderConfig::default()).contains("Pubky DMs"));
+    }
+
+    /// The refusal comes before the identity is read, so nothing is signed in or probed first.
+    #[tokio::test]
+    async fn run_refuses_a_conflicting_transport_mode_before_touching_anything() {
+        let config = ProviderConfig {
+            homeserver: false,
+            broadcast_offer: true,
+            ..Default::default()
+        };
+        let error = run(config).await.unwrap_err().to_string();
+        assert!(error.contains("broadcast_offer"), "{error}");
     }
 
     fn cfg(confs: u32, fee_floor: u64, allow_unsafe: bool) -> ProviderConfig {

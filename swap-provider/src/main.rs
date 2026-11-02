@@ -180,6 +180,14 @@ struct Cli {
     #[arg(long)]
     no_rendezvous_iroh: bool,
 
+    /// Do not sign in to the Pubky homeserver.
+    ///
+    /// The identity is restored locally and the provider serves iroh `direct/1` and session
+    /// requests only: no follow-graph discovery, no offer broadcast, no DM polling and no DM
+    /// fallback. The doorbell must stay on, and the build needs the `iroh` feature.
+    #[arg(long)]
+    no_homeserver: bool,
+
     /// Serve a read-only status API here, e.g. 127.0.0.1:9737. Off unless set.
     ///
     /// Read-only by design: it exists so a dashboard or a health check can see what the daemon is
@@ -273,6 +281,8 @@ struct Overrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     rendezvous_iroh: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    homeserver: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     status_addr: Option<String>,
 }
 
@@ -332,6 +342,7 @@ impl Cli {
             // configuration layers alone, which is what `flag` exists for, and only `--no-...`
             // has anything to say.
             rendezvous_iroh: self.no_rendezvous_iroh.then_some(false),
+            homeserver: self.no_homeserver.then_some(false),
             status_addr: self.status_addr.clone(),
         })
     }

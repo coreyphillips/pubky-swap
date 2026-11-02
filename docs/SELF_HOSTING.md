@@ -109,8 +109,8 @@ values in the file and override one for a single run.
 swap-provider --doctor
 ```
 
-It reports on the identity, the parameters, the data directory, the Lightning node, the chain
-backend and the wallet, and every failure says what to do about it. When it cannot reach your LND
+It reports on the identity, the transport mode, the parameters, the data directory, the
+Lightning node, the chain backend and the wallet, and every failure says what to do about it. When it cannot reach your LND
 it lists the credentials it *can* find on this machine, with the flags to use them, which on an
 Umbrel is usually the answer. It exits non-zero when the daemon could not run, so it also works as
 a container readiness probe.
@@ -151,6 +151,23 @@ provider then starts polling them. Both sides do this by default and `full` buil
 is nothing to configure. `--no-rendezvous-iroh` turns it off on either side, which makes a
 provider private: it will then serve only counterparties already in its follow graph, and
 `--broadcast-offer` pushes its offer to those followers at startup.
+
+## Run without a homeserver
+
+```bash
+swap-provider --no-homeserver ...
+```
+
+The provider restores its identity locally and never signs in to a Pubky homeserver. It serves
+iroh `direct/1` and session requests only, which is every request a current client sends. What
+it gives up is the DM path: no follow-graph discovery, no offer broadcast, no DM polling, no DM
+delivery of status updates, and no `dm-retention-v1` in its offer. Older clients that negotiate
+over DMs cannot reach it.
+
+The doorbell has to stay on and the build needs `iroh` (which `full` includes), so
+`--no-rendezvous-iroh`, `--broadcast-offer` and a build without `iroh` are refused at startup.
+`--doctor` shows the mode on its `transport` line, and `/status` reports `"homeserver": false`.
+The config file key is `homeserver = false`.
 
 ## Generic: point a provider at your LND
 
