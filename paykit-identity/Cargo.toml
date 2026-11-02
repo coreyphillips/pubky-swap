@@ -1,0 +1,18 @@
+[package]
+name = "paykit-identity"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "The provider's Paykit identity: key derivation, App Registry entry and Noise Key Authorization"
+
+[dependencies]
+# The same tree paykit-rs builds on (docs/BITKIT_HANDOFF.md, "Pubky dependency pins").
+paykit-lib = { git = "https://github.com/pubky/paykit-rs", rev = "01de5dd232d2b22f132d066697cce041700e7136" }
+paykit-sdk = { git = "https://github.com/pubky/paykit-rs", rev = "01de5dd232d2b22f132d066697cce041700e7136" }
+pubky = { version = "=0.16.2", default-features = false }
+anyhow.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

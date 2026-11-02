@@ -169,6 +169,43 @@ The doorbell has to stay on and the build needs `iroh` (which `full` includes), 
 `--doctor` shows the mode on its `transport` line, and `/status` reports `"homeserver": false`.
 The config file key is `homeserver = false`.
 
+## Set up the Paykit identity
+
+A provider becomes a Paykit peer by publishing two records on its homeserver, once:
+
+- an App Registry entry for `pubky-swap`, at `/pub/paykit/v0/app-registry.json`;
+- a Noise Key Authorization at `/pub/paykit-authority/v0/current-key.json`, signed by the
+  provider's Pubky identity, which approves the routing key for one key generation.
+
+```bash
+swap-provider --paykit-setup
+```
+
+It needs the `paykit` feature, which `full` includes, and the same identity configuration as the
+daemon. It signs in to the homeserver, prints the generation and routing key, and says for each
+record whether it was created, updated or left alone. Rerunning it writes nothing.
+
+The routing key is derived from the identity and the generation with paykit-rs's Paykit KDF v1,
+so nothing new needs backing up: the recovery phrase or file restores it. `--doctor` reads both
+records the way any peer does and prints a `paykit` line with the published generation. It fails
+when the published routing key is not the one this identity derives at that generation, and warns
+when nothing is published yet or the App Registry has fallen behind.
+
+### Rotating the key
+
+Rotate when the routing key may have leaked, or when `--doctor` reports a key you did not
+publish. Pass the next generation:
+
+```bash
+swap-provider --paykit-setup --paykit-generation 2
+```
+
+Generations only move forward one at a time. Going back, skipping one, or publishing a different
+key at the published generation is refused. The App Registry moves first and the authorization
+second. Once the authorization is at the new generation, the provider refuses to sign with the
+old one, so anything it published under the old key has to be signed again. Peers that saw the
+old generation reject the old key from then on.
+
 ## Generic: point a provider at your LND
 
 ```bash

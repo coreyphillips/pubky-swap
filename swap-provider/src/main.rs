@@ -195,6 +195,19 @@ struct Cli {
     /// <data-dir>/status.token at 0600.
     #[arg(long)]
     status_addr: Option<String>,
+
+    /// Publish this identity's Paykit App Registry entry and Noise Key Authorization, and exit.
+    ///
+    /// Run once at setup. Rerunning writes nothing. To rotate, pass --paykit-generation with the
+    /// published generation plus one.
+    #[cfg(feature = "paykit")]
+    #[arg(long)]
+    paykit_setup: bool,
+
+    /// The Paykit key generation --paykit-setup publishes. Defaults to the published one, or 1.
+    #[cfg(feature = "paykit")]
+    #[arg(long, requires = "paykit_setup")]
+    paykit_generation: Option<u64>,
 }
 
 /// What the operator typed, in the shape the config layers merge.
@@ -379,8 +392,21 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "paykit")]
+    if cli.paykit_setup {
+        print!(
+            "{}",
+            swap_provider::paykit::setup(&config, cli.paykit_generation).await?
+        );
+        return Ok(());
+    }
+
     if cli.doctor {
-        let report = swap_provider::preflight::diagnose(&config).await;
+        #[allow(unused_mut)]
+        let mut report = swap_provider::preflight::diagnose(&config).await;
+        // Doctor only: the status API runs `diagnose` per request, and this is a network read.
+        #[cfg(feature = "paykit")]
+        swap_provider::paykit::check(&config, &mut report).await;
         print!("{}", report.render());
         // A non-zero exit is what makes this usable from a health check or a container's
         // readiness probe, rather than something a person has to read.

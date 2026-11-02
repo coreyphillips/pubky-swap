@@ -21,6 +21,8 @@ compile_error!(
 pub mod access;
 mod delivery;
 mod dispatch;
+#[cfg(feature = "paykit")]
+pub mod paykit;
 pub mod preflight;
 pub mod pricing;
 pub(crate) mod recovery;
