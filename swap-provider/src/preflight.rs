@@ -172,6 +172,7 @@ pub async fn diagnose(config: &crate::ProviderConfig) -> Report {
         )),
     }
     check_identity(config, &mut report);
+    check_transport(config, &mut report);
     check_parameters(config, network, &mut report);
     check_data_dir(config, &mut report);
     check_lightning(config, network, &mut report).await;
@@ -194,6 +195,18 @@ fn check_identity(config: &crate::ProviderConfig, report: &mut Report) {
              PUBKY_SWAP_RECOVERY_PHRASE__FILE to its path, or pass a recovery file as the first \
              argument. There is deliberately no flag for the phrase itself.",
         )),
+    }
+}
+
+/// Which paths are open, and the refusal `run` would give a homeserver-free provider whose other
+/// settings need a homeserver.
+fn check_transport(config: &crate::ProviderConfig, report: &mut Report) {
+    match crate::validate_transport_mode(config) {
+        Ok(()) => report.push(Check::pass(
+            "transport",
+            crate::describe_transport_mode(config),
+        )),
+        Err(error) => report.push(Check::fail("transport", error.detail, error.remedy)),
     }
 }
 
@@ -528,6 +541,59 @@ mod diagnose_tests {
                 check.name
             );
         }
+    }
+
+    /// #107: the transport line says which paths are open, and a provider without a homeserver
+    /// whose other settings need one is told which flag to drop.
+    #[tokio::test]
+    async fn the_transport_check_names_the_mode_and_what_a_homeserver_free_provider_cannot_keep() {
+        let base = crate::ProviderConfig {
+            data_dir: std::env::temp_dir()
+                .join(format!(
+                    "pubky-swap-doctor-transport-{}",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned(),
+            ..Default::default()
+        };
+        let transport = |report: Report| {
+            report
+                .checks
+                .into_iter()
+                .find(|c| c.name == "transport")
+                .expect("the transport is checked")
+        };
+
+        let check = transport(diagnose(&base).await);
+        assert_eq!(check.status, Status::Pass);
+        assert!(check.detail.contains("Pubky DMs"), "{}", check.detail);
+
+        let off = crate::ProviderConfig {
+            homeserver: false,
+            ..base.clone()
+        };
+        let check = transport(diagnose(&off).await);
+        if cfg!(feature = "iroh") {
+            assert_eq!(check.status, Status::Pass);
+            assert!(check.detail.contains("DM fallback off"), "{}", check.detail);
+        } else {
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.remedy.unwrap_or_default().contains("--features"));
+        }
+
+        let conflicting = crate::ProviderConfig {
+            homeserver: false,
+            broadcast_offer: true,
+            ..base
+        };
+        let check = transport(diagnose(&conflicting).await);
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.contains("broadcast_offer"), "{}", check.detail);
+        assert!(check
+            .remedy
+            .unwrap_or_default()
+            .contains("--broadcast-offer"));
     }
 
     /// A network nobody can serve is caught before anything tries to use it.

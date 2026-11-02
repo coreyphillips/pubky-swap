@@ -199,6 +199,7 @@ anything that fails, including credentials it can find on this machine:
 
 ```
   [ok  ] network                Bitcoin
+  [ok  ] transport              Pubky DMs, plus iroh direct/1 and sessions (doorbell on)
   [FAIL] identity               no Pubky identity configured
          -> put the phrase in a file readable only by this user and set
             PUBKY_SWAP_RECOVERY_PHRASE__FILE to its path
@@ -217,7 +218,7 @@ can see what the daemon is doing without parsing its logs:
 | Endpoint | What it answers |
 |---|---|
 | `/health` | the `--doctor` report, as JSON, with `capable`, plus any swap needing recovery |
-| `/status` | pubky, network, directions, in-flight count, committed sats, swaps needing recovery |
+| `/status` | pubky, network, homeserver mode, directions, in-flight count, committed sats, swaps needing recovery |
 | `/swaps` | live swaps, and the most recent finished ones |
 | `/limits` | exposure and concurrency against their ceilings, and per counterparty |
 | `/offer` | the offer currently being advertised |

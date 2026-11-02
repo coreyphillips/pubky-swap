@@ -593,19 +593,30 @@ impl Transport {
     /// failed `delete_follow` is logged, not propagated, so the peer is always removed from the
     /// poll set. Removes pinned peers too.
     pub async fn evict_peer(&self, pubky: &str) {
+        if !self.forget_peer(pubky) {
+            return;
+        }
+        if let Err(e) = self.messenger.delete_follow(pubky).await {
+            debug!("evict_peer: best-effort unfollow of {pubky} failed: {e}");
+        }
+    }
+
+    /// The local half of [`evict_peer`](Self::evict_peer): drop the peer from the poll set and
+    /// the inbox state without touching the homeserver. For a transport that never signed in,
+    /// this is the whole eviction, because an unfollow is a homeserver write and the messenger
+    /// would sign in to make it. Returns whether the peer was tracked.
+    pub fn forget_peer(&self, pubky: &str) -> bool {
         match self.inboxes.evict(pubky) {
             Ok(true) => {}
-            Ok(false) => return,
+            Ok(false) => return false,
             Err(_) => {
                 warn!("could not persist peer eviction");
-                return;
+                return false;
             }
         }
         self.known_peers.remove(pubky);
         self.poll_waker.changed();
-        if let Err(e) = self.messenger.delete_follow(pubky).await {
-            debug!("evict_peer: best-effort unfollow of {pubky} failed: {e}");
-        }
+        true
     }
 
     /// Discover peers (users *we* follow) from the Pubky follow graph.

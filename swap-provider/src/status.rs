@@ -428,6 +428,8 @@ async fn status(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> R
         "version": env!("CARGO_PKG_VERSION"),
         "protocol_version": swap_common::messages::PROTOCOL_VERSION,
         "capable": api.state.ready.load(Ordering::Relaxed),
+        // False when the daemon runs without a Pubky homeserver: iroh requests only, no DMs.
+        "homeserver": api.state.config.homeserver,
         "directions": directions,
         "in_flight": api.state.risk.in_flight(),
         "committed_sat": api.state.risk.committed_sat(),
