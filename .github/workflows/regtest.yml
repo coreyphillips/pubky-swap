@@ -84,6 +84,9 @@ jobs:
       - name: Reverse swap (two LND nodes)
         run: cargo test -p swap-provider --features full --test full_swap_regtest -- --ignored --nocapture
 
+      - name: Reverse swap restored from a listing (two LND nodes)
+        run: cargo test -p swap-provider --features full --test restore_regtest -- --ignored --nocapture
+
       - name: Submarine swap (two LND nodes)
         run: cargo test -p swap-provider --features full --test submarine_swap_regtest -- --ignored --nocapture
 

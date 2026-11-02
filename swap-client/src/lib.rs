@@ -7,6 +7,7 @@
 
 pub mod negotiate;
 mod negotiation_recovery;
+pub mod restore;
 pub mod resume;
 pub mod reverse;
 pub mod store;
@@ -481,6 +482,7 @@ async fn run_negotiation<P: Channel, F: Channel>(
         client_claim_pubkey_hex: Some(hex::encode(claim_pk.to_bytes())),
         client_refund_pubkey_hex: None,
         invoice: None,
+        owner_ref: None,
     };
     let client_swap_id = Uuid::new_v4();
     store::record_negotiation_intent(
@@ -717,6 +719,7 @@ async fn run_submarine<P: Channel, F: Channel>(
         client_claim_pubkey_hex: None,
         client_refund_pubkey_hex: Some(hex::encode(refund_pk.to_bytes())),
         invoice: Some(invoice.bolt11.clone()),
+        owner_ref: None,
     };
     let client_swap_id = Uuid::new_v4();
     store::record_negotiation_intent(

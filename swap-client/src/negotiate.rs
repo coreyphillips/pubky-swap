@@ -411,6 +411,7 @@ fn read_only_reply(reply: &SwapMessage) -> bool {
             | SwapMessage::Quote(_)
             | SwapMessage::Reject(_)
             | SwapMessage::SwapStatusUpdate(_)
+            | SwapMessage::SwapList(_)
     )
 }
 
@@ -423,6 +424,7 @@ fn request_key(request: &SwapMessage) -> String {
             .quote_id
             .map(|id| format!("quote:{id}"))
             .unwrap_or_else(|| format!("swap:{:?}", r.swap_id)),
+        SwapMessage::SwapListRequest(r) => format!("list:{:?}", r.request_id),
         _ => "unsupported".into(),
     }
 }
@@ -457,9 +459,19 @@ pub fn reply_matches(request: &SwapMessage, reply: &SwapMessage) -> bool {
         (SwapMessage::SwapStatusRequest(r), SwapMessage::Reject(v)) => {
             r.request_id.is_some() && v.request_id == r.request_id
         }
+        (SwapMessage::SwapListRequest(r), SwapMessage::SwapList(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
+        (SwapMessage::SwapListRequest(r), SwapMessage::Reject(v)) => {
+            r.request_id.is_some() && v.request_id == r.request_id
+        }
         _ => false,
     }
 }
+
+/// Pages a listing may run to before it is called endless. Sixteen snapshots a page makes this
+/// more swaps than any one client has had with one provider.
+const MAX_LIST_PAGES: usize = 200;
 
 const DOORBELL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 const DOORBELL_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -802,6 +814,60 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
             other => Err(rejection(other)),
         }
     }
+
+    /// One page of the swaps this client owns at the provider, newest first.
+    ///
+    /// Needs `swap-list-v1` in the provider's offer. An older provider cannot parse the request
+    /// and never answers, so the negotiation deadline is what reports it; check the offer first.
+    /// A missing `request_id` is filled in, since the reply is matched on it.
+    pub async fn list_swaps(&self, request: &SwapListRequest) -> Result<SwapList> {
+        negotiation_deadline(self.list_within_deadline(request)).await
+    }
+
+    async fn list_within_deadline(&self, request: &SwapListRequest) -> Result<SwapList> {
+        let request = SwapListRequest {
+            request_id: request.request_id.or_else(|| Some(Uuid::new_v4())),
+            ..request.clone()
+        };
+        let message = SwapMessage::SwapListRequest(request.clone());
+        let expected = |m: &SwapMessage| matches!(m, SwapMessage::SwapList(_));
+        match self
+            .exchange(&message, expected)
+            .await
+            .map_err(ExchangeError::into_inner)?
+            .reply
+        {
+            SwapMessage::SwapList(list) if list.request_id == request.request_id => Ok(list),
+            SwapMessage::SwapList(_) => Err(anyhow!("listing answers a different request")),
+            other => Err(rejection(other)),
+        }
+    }
+
+    /// Every swap this client owns at the provider, newest first, across as many pages as the
+    /// provider hands back.
+    pub async fn list_all_swaps(&self, active_only: bool) -> Result<Vec<SwapStatusSnapshot>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_LIST_PAGES {
+            let page = self
+                .list_swaps(&SwapListRequest {
+                    request_id: None,
+                    cursor: cursor.clone(),
+                    limit: None,
+                    active_only,
+                })
+                .await?;
+            all.extend(page.snapshots);
+            match page.next_cursor {
+                // A cursor that does not move would page forever.
+                Some(next) if cursor.as_ref() != Some(&next) => cursor = Some(next),
+                _ => return Ok(all),
+            }
+        }
+        Err(anyhow!(
+            "the provider's listing did not end within {MAX_LIST_PAGES} pages"
+        ))
+    }
 }
 
 async fn negotiation_deadline<T>(
@@ -963,11 +1029,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use swap_common::SwapDirection;
 
+    /// Snapshots per page the fake provider hands back, small so paging is exercised.
+    const FAKE_PAGE: usize = 2;
+
     /// A provider that admits one swap per quote and replays it for the same request.
     #[derive(Default)]
     struct Provider {
         accepted: Mutex<HashMap<Uuid, (SwapRequest, SwapAccept)>>,
         creations: AtomicUsize,
+        /// Leave `swap-list-v1` out of the offer, as a provider from before listings does.
+        no_listing: AtomicBool,
         /// Refuse a creation whose quote was already spent, as a provider still admitting the
         /// first attempt does when the resend races it.
         refuse_replays: AtomicBool,
@@ -1009,9 +1080,74 @@ mod tests {
                             required_confirmations: 1,
                             updated_at_unix: 0,
                             observed_at_unix: 0,
+                            created_at_unix: 0,
+                            payment_hash_hex: String::new(),
+                            owner_ref: None,
                         }),
                         None => coded(RejectCode::NotFound, query.request_id, "unknown swap"),
                     }
+                }
+                SwapMessage::OfferRequest(request) => SwapMessage::Offer(SwapOffer {
+                    request_id: request.request_id,
+                    offer_id: Uuid::nil(),
+                    provider_pkarr: "provider".into(),
+                    network: swap_common::NetworkSpec::Regtest,
+                    directions: vec![SwapDirection::Reverse],
+                    min_amount_sat: 1,
+                    max_amount_sat: u64::MAX,
+                    base_fee_sat: 0,
+                    fee_ppm: 0,
+                    required_confirmations: 1,
+                    htlc_timeout_blocks: 144,
+                    lightning_node_id: None,
+                    valid_until_unix: u64::MAX,
+                    fund_within_secs: 300,
+                    onchain_fee_sat: 0,
+                    fee_rate_sat_vb: 1,
+                    protocol_version: PROTOCOL_VERSION,
+                    features: if self.no_listing.load(Ordering::SeqCst) {
+                        vec!["swap-status-v1".into()]
+                    } else {
+                        vec!["swap-status-v1".into(), SWAP_LIST_FEATURE.into()]
+                    },
+                }),
+                SwapMessage::SwapListRequest(query) => {
+                    let accepted = self.accepted.lock().unwrap();
+                    let mut accepts: Vec<&SwapAccept> =
+                        accepted.values().map(|(_, accept)| accept).collect();
+                    accepts.sort_by_key(|accept| accept.swap_id);
+                    let start: usize = query
+                        .cursor
+                        .as_deref()
+                        .map_or(0, |cursor| cursor.parse().unwrap());
+                    let snapshots = accepts
+                        .iter()
+                        .skip(start)
+                        .take(FAKE_PAGE)
+                        .map(|accept| SwapStatusSnapshot {
+                            request_id: None,
+                            accept: (*accept).clone(),
+                            network: swap_common::NetworkSpec::Regtest,
+                            state: swap_common::SwapState::Created,
+                            funding_txid_hex: None,
+                            funding_vout: None,
+                            spend_txid_hex: None,
+                            claim_observed_txid_hex: None,
+                            required_confirmations: 1,
+                            updated_at_unix: 0,
+                            observed_at_unix: 0,
+                            created_at_unix: 0,
+                            payment_hash_hex: String::new(),
+                            owner_ref: None,
+                        })
+                        .collect::<Vec<_>>();
+                    let next_cursor = (start + snapshots.len() < accepts.len())
+                        .then(|| (start + FAKE_PAGE).to_string());
+                    SwapMessage::SwapList(SwapList {
+                        request_id: query.request_id,
+                        snapshots,
+                        next_cursor,
+                    })
                 }
                 SwapMessage::QuoteRequest(request) => SwapMessage::Quote(Quote {
                     request_id: request.request_id,
@@ -1173,6 +1309,7 @@ mod tests {
             client_claim_pubkey_hex: Some("02".repeat(33)),
             client_refund_pubkey_hex: None,
             invoice: None,
+            owner_ref: None,
         }
     }
 
@@ -1457,6 +1594,7 @@ mod tests {
     #[test]
     fn unmatched_read_only_replies_do_not_discard_creation_outcomes() {
         let quote = Provider::default().handle(&SwapMessage::QuoteRequest(quote_request()));
+        assert!(read_only_reply(&SwapMessage::SwapList(SwapList::default())));
         assert!(read_only_reply(&quote));
         assert!(!read_only_reply(&SwapMessage::SwapAccept(acceptance(
             Uuid::new_v4()
@@ -1808,5 +1946,89 @@ mod tests {
         snapshot.accept.onchain_amount_sat += 1;
         assert!(acceptance_conflicts(&first, &second));
         assert!(acceptance_conflicts(&accepted, &second));
+    }
+
+    /// #105: a listing is paged until the provider hands back no cursor, and a cursor that does
+    /// not move ends it rather than looping.
+    #[tokio::test]
+    async fn a_listing_is_paged_until_the_provider_has_no_more() {
+        let provider = Arc::new(Provider::default());
+        let negotiator = negotiator(&provider, [], Some(vec![]));
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(
+                negotiator
+                    .create(&swap_request(Uuid::new_v4()))
+                    .await
+                    .unwrap()
+                    .swap_id,
+            );
+        }
+        ids.sort();
+
+        let first = negotiator
+            .list_swaps(&SwapListRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(first.snapshots.len(), FAKE_PAGE);
+        assert!(first.next_cursor.is_some());
+
+        let all = negotiator.list_all_swaps(false).await.unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.accept.swap_id).collect::<Vec<_>>(),
+            ids
+        );
+        // One page asked for directly, then three for the whole listing: two full, then one.
+        let listings = negotiator
+            .preferred()
+            .unwrap()
+            .0
+            .seen()
+            .iter()
+            .filter(|message| message["type"] == "SwapListRequest")
+            .count();
+        assert_eq!(listings, 1 + 3);
+    }
+
+    /// Restoring asks the offer first, so an older provider is refused with a code before any
+    /// listing is attempted, and a provider that lists hands every swap to the resolver.
+    #[tokio::test]
+    async fn restoring_needs_the_listing_feature_and_hands_every_swap_to_the_resolver() {
+        let provider = Arc::new(Provider::default());
+        let negotiator = negotiator(&provider, [], Some(vec![]));
+        for _ in 0..3 {
+            negotiator
+                .create(&swap_request(Uuid::new_v4()))
+                .await
+                .unwrap();
+        }
+        let directory = std::env::temp_dir().join(format!("restore-{}", Uuid::new_v4()));
+        let store = JsonFileSwapStore::new(&directory).unwrap();
+        let restore = crate::restore::Restore {
+            store: &store,
+            network: bitcoin::Network::Regtest,
+            dest_spk: bitcoin::ScriptBuf::new(),
+            fee_rate_sat_vb: 2,
+        };
+        let offered = std::sync::Mutex::new(Vec::new());
+        let report =
+            crate::restore::restore_from_provider(&negotiator, "provider", &restore, |s| {
+                offered.lock().unwrap().push(s.accept.swap_id);
+                None
+            })
+            .await
+            .unwrap();
+        assert_eq!(offered.lock().unwrap().len(), 3);
+        assert_eq!(report.unresolved.len(), 3);
+        assert!(report.restored.is_empty());
+
+        provider.no_listing.store(true, Ordering::SeqCst);
+        let error =
+            crate::restore::restore_from_provider(&negotiator, "provider", &restore, |_| None)
+                .await
+                .unwrap_err();
+        let refusal = error.downcast_ref::<Rejected>().expect("a coded refusal");
+        assert_eq!(refusal.code, Some(RejectCode::UnsupportedProtocol));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

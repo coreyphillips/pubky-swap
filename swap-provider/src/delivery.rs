@@ -195,6 +195,7 @@ mod tests {
                 client_claim_pubkey_hex: None,
                 client_refund_pubkey_hex: None,
                 invoice: None,
+                owner_ref: None,
             }),
             ..SwapRecord::new_progress()
         }
