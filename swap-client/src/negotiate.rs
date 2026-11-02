@@ -221,13 +221,29 @@ impl Channel for CapChannel {
         let unreadable =
             |error: String| ExchangeError::Uncertain(anyhow!("unreadable reply: {error}"));
         let reply = if cap.is_some() {
-            let reply: swap_common::paykit_cap::CapMessage =
+            use swap_common::paykit_cap::{CapError, CapMessage};
+            let reply: CapMessage =
                 serde_json::from_slice(&bytes).map_err(|error| unreadable(error.to_string()))?;
-            self.cap
+            let reply = self
+                .cap
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .reply(request, reply)
-                .map_err(|error| unreadable(error.to_string()))?
+                .reply(request, reply);
+            match reply {
+                Ok(reply) => reply,
+                // The provider stored the swap but stopped before signing its contract. A
+                // replayed commit gets it signed and stored for the next status query.
+                Err(CapError::MissingContract(commit)) => {
+                    let message = serde_json::to_value(CapMessage::Commit(*commit))
+                        .map_err(|error| unreadable(error.to_string()))?;
+                    let replay = pubky_transport::p2p::DirectRequest { message };
+                    if let Err(error) = self.client.request(&replay).await {
+                        warn!("could not replay the commit for its contract: {error}");
+                    }
+                    return Err(unreadable("status without the signed contract".into()));
+                }
+                Err(error) => return Err(unreadable(error.to_string())),
+            }
         } else {
             serde_json::from_slice(&bytes).map_err(|error| unreadable(error.to_string()))?
         };

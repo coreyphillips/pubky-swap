@@ -44,6 +44,10 @@ pub enum CapError {
     Blob,
     #[error("reply does not answer the request: {0}")]
     Unexpected(&'static str),
+    /// A status reply for a committed swap came back unsigned. Sending this commit again gets
+    /// the contract signed and stored, so the next status query carries it.
+    #[error("status without the signed contract")]
+    MissingContract(Box<Commit>),
 }
 
 /// Whether a carrier message is one of these kinds rather than a plain [`SwapMessage`].
@@ -517,9 +521,12 @@ pub struct CapClient {
     expected_signer: Option<String>,
     /// Signed terms by quote id, which a commit names.
     terms: HashMap<Uuid, String>,
-    /// The `commit_hash` of each commit sent, by quote id. A status reply for that quote must
+    /// Each commit sent and its `commit_hash`, by quote id. A status reply for that quote must
     /// carry a contract signed over it.
-    commits: HashMap<Uuid, String>,
+    commits: HashMap<Uuid, (String, Commit)>,
+    /// The quote id of each swap a contract was opened for, so a status query by swap id is
+    /// checked against the commit without trusting the quote id the reply names.
+    swaps: HashMap<Uuid, Uuid>,
 }
 
 impl CapClient {
@@ -528,6 +535,7 @@ impl CapClient {
             expected_signer: expected_signer.map(hex::encode),
             terms: HashMap::new(),
             commits: HashMap::new(),
+            swaps: HashMap::new(),
         }
     }
 
@@ -542,11 +550,14 @@ impl CapClient {
                 features: request.features.clone(),
             })),
             SwapMessage::SwapRequest(request) => {
-                let terms_hash = self.terms.get(&request.quote_id)?.clone();
-                let commit = CommitBody::from_request(request);
-                let hash = commit_hash(&terms_hash, &commit).ok()?;
-                self.commits.insert(request.quote_id, hex::encode(hash));
-                Some(CapMessage::Commit(Commit { terms_hash, commit }))
+                let commit = Commit {
+                    terms_hash: self.terms.get(&request.quote_id)?.clone(),
+                    commit: CommitBody::from_request(request),
+                };
+                let hash = commit_hash(&commit.terms_hash, &commit.commit).ok()?;
+                self.commits
+                    .insert(request.quote_id, (hex::encode(hash), commit.clone()));
+                Some(CapMessage::Commit(commit))
             }
             SwapMessage::SwapStatusRequest(request) => {
                 Some(CapMessage::StatusRequest(request.clone()))
@@ -591,6 +602,7 @@ impl CapClient {
                 if accept.quote_id != request.quote_id {
                     return Err(CapError::Unexpected("contract for another quote"));
                 }
+                self.swaps.insert(accept.swap_id, accept.quote_id);
                 Ok(SwapMessage::SwapAccept(accept))
             }
             (SwapMessage::SwapRequest(request), CapMessage::Status(status))
@@ -604,18 +616,23 @@ impl CapClient {
                     reason: "the swap is still being admitted".into(),
                 }))
             }
-            (SwapMessage::SwapStatusRequest(_), CapMessage::Status(status)) => {
+            (SwapMessage::SwapStatusRequest(request), CapMessage::Status(status)) => {
                 let Status {
                     snapshot, contract, ..
                 } = *status;
                 let mut snapshot = snapshot.ok_or(CapError::Unexpected("status without a swap"))?;
                 // A swap this client committed to here is recovered only with the contract
-                // signed over that commit.
-                match (&contract, self.commits.get(&snapshot.accept.quote_id)) {
-                    (None, Some(_)) => {
-                        return Err(CapError::Unexpected("status without the signed contract"))
+                // signed over that commit. The quote comes from what was asked where it can,
+                // since a reply naming another quote would otherwise skip the check.
+                let quote_id = request
+                    .quote_id
+                    .or_else(|| request.swap_id.and_then(|id| self.swaps.get(&id).copied()))
+                    .unwrap_or(snapshot.accept.quote_id);
+                match (&contract, self.commits.get(&quote_id)) {
+                    (None, Some((_, commit))) => {
+                        return Err(CapError::MissingContract(Box::new(commit.clone())))
                     }
-                    (Some(contract), Some(hash)) if contract.signed.commit_hash != *hash => {
+                    (Some(contract), Some((hash, _))) if contract.signed.commit_hash != *hash => {
                         return Err(CapError::HashMismatch("commit_hash"))
                     }
                     _ => {}
@@ -924,10 +941,26 @@ mod tests {
             .unwrap();
         assert!(matches!(reply, SwapMessage::SwapStatusSnapshot(s) if s.accept == accept()));
 
-        // Recovering the committed swap needs the contract signed over that commit.
-        for contract in [Some(wrong), None] {
-            assert!(client.reply(&status_request, status(contract)).is_err());
-        }
+        // Recovering the committed swap needs the contract signed over that commit. Without one,
+        // the client gets the commit to send again.
+        assert!(client.reply(&status_request, status(Some(wrong))).is_err());
+        assert_eq!(
+            client.reply(&status_request, status(None)).unwrap_err(),
+            CapError::MissingContract(Box::new(sent.clone()))
+        );
+        // A reply naming another quote is still checked against the swap's commit.
+        let mut moved = snapshot.clone();
+        moved.accept.quote_id = uuid(4);
+        let moved = CapMessage::Status(Box::new(Status {
+            request_id: None,
+            swap_id: Some(uuid(3)),
+            quote_id: Some(uuid(4)),
+            state: "created".into(),
+            reference: None,
+            snapshot: Some(moved),
+            contract: None,
+        }));
+        assert!(client.reply(&status_request, moved).is_err());
     }
 
     /// Paykit Event Messages carry at most 1,000 bytes. A signed contract is left out: with the

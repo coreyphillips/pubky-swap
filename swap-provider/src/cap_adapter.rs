@@ -116,10 +116,13 @@ mod direct {
                     if !pubky_transport::same_pubky(&terms.owner, sender)
                         || terms.terms_hash != commit.terms_hash
                     {
-                        return refusal(
-                            RejectCode::InvalidRequest,
-                            "terms_hash does not match the signed quote",
-                        );
+                        return CapMessage::Refusal(Refusal {
+                            code: RejectCode::InvalidRequest.as_str().into(),
+                            reason: "terms_hash does not match the signed quote".into(),
+                            request_id: None,
+                            quote_id: Some(commit.commit.quote_id),
+                            swap_id: None,
+                        });
                     }
                 }
                 drop(issued);

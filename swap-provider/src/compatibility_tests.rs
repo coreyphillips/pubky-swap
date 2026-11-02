@@ -999,7 +999,8 @@ mod direct_requests {
         });
         let reply = ask_cap(&ctx, &owner, &commit).await;
         assert!(
-            matches!(serde_json::from_slice(&reply).unwrap(), CapMessage::Refusal(r) if r.code == "invalid_request"),
+            matches!(serde_json::from_slice(&reply).unwrap(), CapMessage::Refusal(r)
+                if r.code == "invalid_request" && r.quote_id == Some(request.quote_id)),
             "{}",
             String::from_utf8_lossy(&reply)
         );
