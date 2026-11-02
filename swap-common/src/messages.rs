@@ -9,6 +9,8 @@
 //! Client   <--SwapAccept--       Provider   (HTLC address / hold invoice)
 //! ... funding, lockup, claim ...
 //! both     <--SwapStatusUpdate--> both
+//! Client   --SwapStatusRequest--> Provider   (one swap, by id)
+//! Client   --SwapListRequest-->   Provider   (every swap it owns; `swap-list-v1`)
 //! ```
 
 use crate::swap::{NetworkSpec, SwapDirection, SwapState};
@@ -37,6 +39,10 @@ pub enum SwapMessage {
     SwapStatusRequest(SwapStatusRequest),
     /// Provider returns public recovery data to the authenticated swap owner.
     SwapStatusSnapshot(SwapStatusSnapshot),
+    /// Client asks for every swap it owns at this provider, paged. Needs `swap-list-v1`.
+    SwapListRequest(SwapListRequest),
+    /// Provider returns one page of the sender's own swaps.
+    SwapList(SwapList),
     /// Either party → counterparty: cooperative signature material.
     /// Reserved for phase-2 Taproot cooperative (key-path) spends.
     CoopSignature(CoopSignature),
@@ -77,6 +83,10 @@ impl SwapMessage {
                 "status-snapshot",
                 snapshot.request_id.unwrap_or(snapshot.accept.swap_id),
             ),
+            Self::SwapListRequest(request) => {
+                ephemeral("list-request", request.request_id.unwrap_or_default())
+            }
+            Self::SwapList(list) => ephemeral("list", list.request_id.unwrap_or_default()),
             Self::Reject(rejection) => ephemeral(
                 "reject",
                 rejection
@@ -120,6 +130,29 @@ pub fn protocol_version_supported(version: u16) -> bool {
 /// It binds an adapter that re-encodes these messages over Paykit Encrypted Links, and the test
 /// `negotiation_messages_fit_a_paykit_event_message` measures which ones fit.
 pub const PAYKIT_EVENT_MAX_BYTES: usize = 1_000;
+
+/// The offer feature of a provider that answers [`SwapListRequest`] and keeps
+/// [`SwapRequest::owner_ref`].
+pub const SWAP_LIST_FEATURE: &str = "swap-list-v1";
+
+/// Snapshots on a [`SwapList`] page when the request names no limit.
+pub const SWAP_LIST_DEFAULT_PAGE: u32 = 10;
+
+/// The most snapshots one [`SwapList`] page carries, whatever the request asks for.
+///
+/// Sized so a page of the largest snapshots stays well inside one iroh reply (64 KiB) and one
+/// DM payload. `a_full_page_of_the_largest_snapshots_fits_an_iroh_reply` measures it.
+pub const SWAP_LIST_MAX_PAGE: u32 = 16;
+
+/// The longest [`SwapRequest::owner_ref`] a provider keeps.
+pub const OWNER_REF_MAX_LEN: usize = 128;
+
+/// Whether an `owner_ref` is one a provider keeps: at most [`OWNER_REF_MAX_LEN`] bytes, all
+/// printable ASCII. It reaches logs and listings verbatim, so nothing else is accepted.
+pub fn owner_ref_is_valid(owner_ref: &str) -> bool {
+    owner_ref.len() <= OWNER_REF_MAX_LEN
+        && owner_ref.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+}
 
 /// A provider's advertised swap capabilities and rates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +363,15 @@ pub struct SwapRequest {
     pub client_refund_pubkey_hex: Option<String>,
     /// Submarine only: the Lightning invoice the provider must pay.
     pub invoice: Option<String>,
+    /// An opaque reference the owner chooses, kept verbatim by the provider and echoed in every
+    /// [`SwapStatusSnapshot`] and listing.
+    ///
+    /// A wallet that derives its swap keys from a seed puts the key index here, so a restore from
+    /// the seed alone can rebuild them from the provider's listing instead of scanning. At most
+    /// [`OWNER_REF_MAX_LEN`] printable ASCII characters, never interpreted. Providers from before
+    /// `swap-list-v1` ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +437,53 @@ pub struct SwapStatusSnapshot {
     pub required_confirmations: u32,
     pub updated_at_unix: u64,
     pub observed_at_unix: u64,
+    /// When the provider first wrote the swap down. 0 from a provider before `swap-list-v1`,
+    /// or for a record older than the field.
+    #[serde(default)]
+    pub created_at_unix: u64,
+    /// The swap's payment hash (hex), so a wallet can match a listed swap against the keys it
+    /// can derive without decoding the contract or the invoice. Empty from an older provider.
+    #[serde(default)]
+    pub payment_hash_hex: String,
+    /// What the owner put in [`SwapRequest::owner_ref`], if anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_ref: Option<String>,
+}
+
+/// Ask for the swaps the authenticated sender owns at this provider, newest first.
+///
+/// Answered only by providers advertising [`SWAP_LIST_FEATURE`]. An older provider cannot parse
+/// the kind and never replies, so a client checks the offer before asking.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SwapListRequest {
+    #[serde(default)]
+    pub request_id: Option<Uuid>,
+    /// The `next_cursor` of the previous page. Absent starts from the newest swap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Snapshots wanted on this page. Absent or 0 means [`SWAP_LIST_DEFAULT_PAGE`]; anything
+    /// above [`SWAP_LIST_MAX_PAGE`] is clamped to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Only swaps that have not reached a terminal state.
+    #[serde(default)]
+    pub active_only: bool,
+}
+
+/// One page of the sender's own swaps.
+///
+/// Pages go by creation time, newest first, so a swap changing state never moves between them.
+/// A swap created while paging sorts before the first page and shows up in the next listing.
+/// Each snapshot's `request_id` is empty; the page carries the correlation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SwapList {
+    #[serde(default)]
+    pub request_id: Option<Uuid>,
+    #[serde(default)]
+    pub snapshots: Vec<SwapStatusSnapshot>,
+    /// Present when more swaps follow. Opaque: pass it back as `cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,6 +820,7 @@ mod tests {
             client_claim_pubkey_hex: None,
             client_refund_pubkey_hex: None,
             invoice: None,
+            owner_ref: None,
         };
         let creation = SwapMessage::SwapAccept(accept.clone()).delivery_scope();
         assert_eq!(creation, SwapMessage::SwapRequest(request).delivery_scope());
@@ -746,6 +836,9 @@ mod tests {
             required_confirmations: 1,
             updated_at_unix: 1,
             observed_at_unix: 1,
+            created_at_unix: 1,
+            payment_hash_hex: "00".repeat(32),
+            owner_ref: None,
         });
         assert!(status
             .delivery_scope()
@@ -773,14 +866,130 @@ mod tests {
             required_confirmations: 1,
             updated_at_unix: 1,
             observed_at_unix: 1,
+            created_at_unix: 1,
+            payment_hash_hex: "00".repeat(32),
+            owner_ref: Some("index:7".into()),
         };
         let mut json = serde_json::to_value(&snapshot).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .remove("claim_observed_txid_hex");
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("claim_observed_txid_hex");
+        // The `swap-list-v1` additions are just as optional.
+        fields.remove("created_at_unix");
+        fields.remove("payment_hash_hex");
+        fields.remove("owner_ref");
         let older: SwapStatusSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(older.claim_observed_txid_hex, None);
         assert_eq!(older.funding_txid_hex, snapshot.funding_txid_hex);
+        assert_eq!(older.created_at_unix, 0);
+        assert!(older.payment_hash_hex.is_empty());
+        assert_eq!(older.owner_ref, None);
+    }
+
+    /// #105: a request from before `owner_ref` loads with none, and one that carries it keeps
+    /// it through the wire, while the provider's bound on it keeps logs and listings clean.
+    #[test]
+    fn an_owner_ref_is_optional_on_the_wire_and_bounded_at_the_provider() {
+        let mut json = serde_json::json!({
+            "quote_id": Uuid::new_v4(), "client_pkarr": "c", "direction": "reverse",
+            "payment_hash_hex": "00".repeat(32), "client_claim_pubkey_hex": null,
+            "client_refund_pubkey_hex": null, "invoice": null,
+        });
+        let older: SwapRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(older.owner_ref, None);
+        assert!(!serde_json::to_string(&older).unwrap().contains("owner_ref"));
+        json["owner_ref"] = "index:42".into();
+        let newer: SwapRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(newer.owner_ref.as_deref(), Some("index:42"));
+
+        assert!(owner_ref_is_valid(""));
+        assert!(owner_ref_is_valid("index:42 slot/7"));
+        assert!(owner_ref_is_valid(&"a".repeat(OWNER_REF_MAX_LEN)));
+        assert!(!owner_ref_is_valid(&"a".repeat(OWNER_REF_MAX_LEN + 1)));
+        assert!(!owner_ref_is_valid("line\nbreak"));
+        assert!(!owner_ref_is_valid("tab\t"));
+        assert!(!owner_ref_is_valid("caf\u{e9}"));
+    }
+
+    #[test]
+    fn list_messages_use_their_own_ephemeral_scopes() {
+        let request_id = Some(Uuid::new_v4());
+        let request = SwapMessage::SwapListRequest(SwapListRequest {
+            request_id,
+            ..Default::default()
+        });
+        let page = SwapMessage::SwapList(SwapList {
+            request_id,
+            ..Default::default()
+        });
+        assert!(request
+            .delivery_scope()
+            .starts_with("ephemeral:list-request:"));
+        assert!(page.delivery_scope().starts_with("ephemeral:list:"));
+        assert_ne!(request.delivery_scope(), page.delivery_scope());
+        assert_ne!(
+            page.delivery_scope(),
+            SwapMessage::OfferRequest(OfferRequest { request_id }).delivery_scope()
+        );
+    }
+
+    /// #105: the page cap exists for the carriers, so it is measured against the smallest one.
+    /// Every field is at its longest: a Taproot tree, a bech32m address, a long hold invoice,
+    /// every txid known, and an `owner_ref` at its limit.
+    #[test]
+    fn a_full_page_of_the_largest_snapshots_fits_an_iroh_reply() {
+        // `pubky_transport::p2p::MAX_RPC_BYTES`, which this crate cannot name.
+        const IROH_REPLY_MAX_BYTES: usize = 64 * 1024;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (_, client) = crate::random_keypair(&secp);
+        let (_, provider) = crate::random_keypair(&secp);
+        let contract = crate::taproot::BoltzTaprootSwap::new(
+            SwapDirection::Reverse,
+            &[0xab; 32],
+            &client,
+            &provider,
+            499_999_999,
+        )
+        .unwrap();
+        let largest = SwapStatusSnapshot {
+            request_id: None,
+            accept: SwapAccept {
+                script_type: SwapScript::TaprootBoltz,
+                swap_tree: Some(contract.swap_tree()),
+                quote_id: Uuid::new_v4(),
+                swap_id: Uuid::new_v4(),
+                direction: SwapDirection::Reverse,
+                htlc_script_hex: String::new(),
+                htlc_address: contract.address(bitcoin::Network::Bitcoin).to_string(),
+                onchain_amount_sat: u64::MAX,
+                timeout_block_height: 499_999_999,
+                provider_pubkey_hex: hex::encode(provider.to_bytes()),
+                // A mainnet hold invoice with several route hints.
+                invoice: Some("l".repeat(1_024)),
+            },
+            network: NetworkSpec::Bitcoin,
+            state: SwapState::Failed("x".repeat(200)),
+            funding_txid_hex: Some("aa".repeat(32)),
+            funding_vout: Some(u32::MAX),
+            spend_txid_hex: Some("bb".repeat(32)),
+            claim_observed_txid_hex: Some("cc".repeat(32)),
+            required_confirmations: u32::MAX,
+            updated_at_unix: u64::MAX,
+            observed_at_unix: u64::MAX,
+            created_at_unix: u64::MAX,
+            payment_hash_hex: "ab".repeat(32),
+            owner_ref: Some("r".repeat(OWNER_REF_MAX_LEN)),
+        };
+        let page = SwapMessage::SwapList(SwapList {
+            request_id: Some(Uuid::new_v4()),
+            snapshots: vec![largest; SWAP_LIST_MAX_PAGE as usize],
+            next_cursor: Some("c".repeat(80)),
+        });
+        let len = wire_len(page);
+        println!("a full page of the largest snapshots: {len} bytes");
+        assert!(
+            len <= IROH_REPLY_MAX_BYTES * 3 / 4,
+            "{len} bytes leaves too little of the {IROH_REPLY_MAX_BYTES}-byte iroh reply"
+        );
     }
 
     #[test]
@@ -882,6 +1091,7 @@ mod tests {
         let features: Vec<String> = [
             "boltz-taproot-v1",
             "swap-status-v1",
+            SWAP_LIST_FEATURE,
             "dm-retention-v1",
             "session-rpc-v1",
             "direct-rpc-v1",
@@ -989,6 +1199,7 @@ mod tests {
                     client_claim_pubkey_hex: Some(key_hex(&client)),
                     client_refund_pubkey_hex: Some(key_hex(&client)),
                     invoice: None,
+                    owner_ref: Some("r".repeat(OWNER_REF_MAX_LEN)),
                 })),
             ),
         ];

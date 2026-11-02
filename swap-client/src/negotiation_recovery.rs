@@ -411,6 +411,7 @@ mod tests {
             client_claim_pubkey_hex: Some(hex::encode(public.to_bytes())),
             client_refund_pubkey_hex: None,
             invoice: None,
+            owner_ref: None,
         };
         let new = store::NewClientSwap {
             swap_id: Uuid::new_v4(),

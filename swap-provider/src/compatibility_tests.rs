@@ -353,6 +353,7 @@ fn accepted_record(direction: SwapDirection, script_type: SwapScript) -> SwapRec
         client_claim_pubkey_hex: Some(hex::encode(claim.to_bytes())),
         client_refund_pubkey_hex: Some(hex::encode(refund.to_bytes())),
         invoice: (direction == SwapDirection::Submarine).then(|| "invoice".into()),
+        owner_ref: None,
     };
     let taproot = (script_type == SwapScript::TaprootBoltz)
         .then(|| BoltzTaprootSwap::new(direction, &hash, &claim, &refund, 800_144).unwrap());
@@ -625,6 +626,10 @@ fn negotiation_only_providers_do_not_advertise_execution_capabilities() {
         .features
         .iter()
         .any(|feature| feature == "dm-retention-v1"));
+    assert!(executable
+        .features
+        .iter()
+        .any(|feature| feature == SWAP_LIST_FEATURE));
 }
 
 /// #107: retention is a promise about DMs, so a provider without a homeserver does not make it.
@@ -900,6 +905,206 @@ mod direct_requests {
         let request = record.swap_request.clone().unwrap();
         let reply = ask(&ctx, &key, SwapMessage::SwapRequest(request)).await;
         assert!(matches!(reply, Some(SwapMessage::Reject(_))), "{reply:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn listing(cursor: Option<String>, limit: Option<u32>, active_only: bool) -> SwapMessage {
+        SwapMessage::SwapListRequest(SwapListRequest {
+            request_id: Some(Uuid::new_v4()),
+            cursor,
+            limit,
+            active_only,
+        })
+    }
+
+    /// One page as `key` sees it, correlated to its request.
+    async fn page(
+        ctx: &ExecCtx,
+        key: &str,
+        cursor: Option<String>,
+        limit: Option<u32>,
+        active_only: bool,
+    ) -> SwapList {
+        let request = listing(cursor, limit, active_only);
+        let SwapMessage::SwapListRequest(SwapListRequest { request_id, .. }) = &request else {
+            unreachable!()
+        };
+        let request_id = *request_id;
+        match ask(ctx, key, request).await {
+            Some(SwapMessage::SwapList(list)) => {
+                assert_eq!(list.request_id, request_id);
+                list
+            }
+            other => panic!("expected a page, got {other:?}"),
+        }
+    }
+
+    fn ids(list: &SwapList) -> Vec<Uuid> {
+        list.snapshots.iter().map(|s| s.accept.swap_id).collect()
+    }
+
+    /// #105: an owner pages through its own swaps, newest first, and a page holds still while
+    /// the swaps on it change state. Nobody else sees them, and an admission that is still
+    /// creating its invoice is not yet a swap to list.
+    #[tokio::test]
+    async fn an_owner_pages_through_its_own_swaps_and_nobody_else_sees_them() {
+        let directory = std::env::temp_dir().join(format!("direct-list-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let owner = pubky_transport::identity_from_secret(&[41; 32]);
+        let other = pubky_transport::identity_from_secret(&[42; 32]);
+        let nobody = pubky_transport::identity_from_secret(&[43; 32]);
+        let mut owned = Vec::new();
+        for (index, created_at_unix) in [100u64, 200, 300].into_iter().enumerate() {
+            let mut record = owned_record(&owner);
+            record.created_at_unix = created_at_unix;
+            record.swap_request.as_mut().unwrap().owner_ref = Some(format!("index:{index}"));
+            store.put(&record).unwrap();
+            owned.push(record.swap_id);
+        }
+        store.put(&owned_record(&other)).unwrap();
+        let mut admitting = invoice_intent();
+        admitting.peer = owner.clone();
+        admitting.swap_request.as_mut().unwrap().client_pkarr = owner.clone();
+        store.put(&admitting).unwrap();
+        let ctx = context(store.clone(), Uuid::new_v4());
+
+        let first = page(&ctx, &owner, None, Some(2), false).await;
+        assert_eq!(ids(&first), vec![owned[2], owned[1]]);
+        let newest = &first.snapshots[0];
+        assert_eq!(newest.created_at_unix, 300);
+        assert_eq!(newest.owner_ref.as_deref(), Some("index:2"));
+        assert_eq!(newest.payment_hash_hex, hex::encode(payment_hash(&[9; 32])));
+        assert!(first.snapshots.iter().all(|s| s.request_id.is_none()));
+        let cursor = first.next_cursor.clone().expect("a page follows");
+
+        // The middle swap finishes between pages; the next page is what it would have been.
+        store
+            .mutate(owned[1], &mut |record| record.state = SwapState::Claimed)
+            .unwrap();
+        let second = page(&ctx, &owner, Some(cursor.clone()), Some(2), false).await;
+        assert_eq!(ids(&second), vec![owned[0]]);
+        assert!(second.next_cursor.is_none());
+        let past_the_end = page(&ctx, &owner, Some(cursor), Some(1), false).await;
+        assert_eq!(ids(&past_the_end), vec![owned[0]]);
+
+        let active = page(&ctx, &owner, None, None, true).await;
+        assert_eq!(ids(&active), vec![owned[2], owned[0]]);
+
+        assert_eq!(list_page_limit(None), SWAP_LIST_DEFAULT_PAGE as usize);
+        assert_eq!(list_page_limit(Some(0)), SWAP_LIST_DEFAULT_PAGE as usize);
+        assert_eq!(list_page_limit(Some(1_000)), SWAP_LIST_MAX_PAGE as usize);
+        assert_eq!(list_page_limit(Some(3)), 3);
+
+        // Others see their own, and only their own. No refusal: a listing says nothing about
+        // what exists.
+        let theirs = page(&ctx, &other, None, None, false).await;
+        assert_eq!(theirs.snapshots.len(), 1);
+        assert!(page(&ctx, &nobody, None, None, false)
+            .await
+            .snapshots
+            .is_empty());
+
+        // A cursor this provider did not issue is refused with a code.
+        let (code, reject) = refusal(
+            ask(
+                &ctx,
+                &owner,
+                listing(Some("not-a-cursor".into()), None, false),
+            )
+            .await,
+        );
+        assert_eq!(code, RejectCode::InvalidRequest);
+        assert!(reject.request_id.is_some());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A swap made under a scoped session is listed to that session and never to the root key,
+    /// exactly as a status query treats it.
+    #[tokio::test]
+    async fn a_root_key_cannot_list_swaps_made_under_a_scoped_session() {
+        let directory = std::env::temp_dir().join(format!("list-session-{}", Uuid::new_v4()));
+        let key = pubky_transport::identity_from_secret(&[43; 32]);
+        let mut record = owned_record(&key);
+        record.peer_account = Some("ring-account".into());
+        record.peer_authorization_scope = Some("/pub/bitkit.to/bitkit/wallet/".into());
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        store.put(&record).unwrap();
+        let ctx = context(store, record.swap_id);
+
+        assert!(page(&ctx, &key, None, None, false)
+            .await
+            .snapshots
+            .is_empty());
+
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let mut session = ctx.clone();
+        session.transport = Arc::new(ctx.transport.session(
+            "ring-account".into(),
+            "/pub/bitkit.to/bitkit/wallet/".into(),
+            reply,
+        ));
+        handle_message(&session, None, &key, listing(None, None, false))
+            .await
+            .unwrap();
+        let message: SwapMessage = serde_json::from_slice(&answer.await.unwrap()).unwrap();
+        let SwapMessage::SwapList(list) = message else {
+            panic!("expected a page, got {message:?}");
+        };
+        assert_eq!(ids(&list), vec![record.swap_id]);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// #105: an owner's reference is kept verbatim and echoed by status and listing, and one the
+    /// provider would not keep is refused before the quote is spent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_owner_ref_is_kept_verbatim_and_a_bad_one_is_refused_before_the_quote_is_spent() {
+        let directory = std::env::temp_dir().join(format!("owner-ref-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let ctx = ExecCtx {
+            ln: Arc::new(OpenInvoiceLightning),
+            ..executing(context(store.clone(), Uuid::new_v4()))
+        };
+        let client = pubky_transport::identity_from_secret(&[50; 32]);
+        let reply = ask(
+            &ctx,
+            &client,
+            SwapMessage::QuoteRequest(quote_request(&client, SwapDirection::Reverse, 100_000)),
+        )
+        .await;
+        let Some(SwapMessage::Quote(quote)) = reply else {
+            panic!("expected a quote, got {reply:?}");
+        };
+        let mut creation = owned_record(&client).swap_request.unwrap();
+        creation.quote_id = quote.quote_id;
+
+        creation.owner_ref = Some("x".repeat(OWNER_REF_MAX_LEN + 1));
+        let (code, _) =
+            refusal(ask(&ctx, &client, SwapMessage::SwapRequest(creation.clone())).await);
+        assert_eq!(code, RejectCode::InvalidRequest);
+        assert!(store.load_all_checked().unwrap().is_empty());
+
+        creation.owner_ref = Some("index:7".into());
+        let reply = ask(&ctx, &client, SwapMessage::SwapRequest(creation.clone())).await;
+        let Some(SwapMessage::SwapAccept(accept)) = reply else {
+            panic!("expected an acceptance, got {reply:?}");
+        };
+
+        let status = SwapStatusRequest {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: Some(accept.swap_id),
+            quote_id: None,
+        };
+        let reply = ask(&ctx, &client, SwapMessage::SwapStatusRequest(status)).await;
+        let Some(SwapMessage::SwapStatusSnapshot(snapshot)) = reply else {
+            panic!("expected a snapshot, got {reply:?}");
+        };
+        assert_eq!(snapshot.owner_ref.as_deref(), Some("index:7"));
+        assert_eq!(snapshot.payment_hash_hex, creation.payment_hash_hex);
+        assert!(snapshot.created_at_unix > 0);
+
+        let listed = page(&ctx, &client, None, None, false).await;
+        assert_eq!(ids(&listed), vec![accept.swap_id]);
+        assert_eq!(listed.snapshots[0].owner_ref.as_deref(), Some("index:7"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

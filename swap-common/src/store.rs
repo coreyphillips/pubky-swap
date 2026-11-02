@@ -231,6 +231,40 @@ pub struct SwapRecord {
     pub created_at_unix: u64,
 }
 
+impl SwapRecord {
+    /// The public view of this swap for its owner: what a status query or a listing returns.
+    ///
+    /// `None` for a record with no persisted acceptance, which an admission still creating its
+    /// hold invoice and a record from before acceptances were stored both lack. Never carries
+    /// the branch key or the preimage.
+    pub fn status_snapshot(
+        &self,
+        request_id: Option<Uuid>,
+        observed_at_unix: u64,
+    ) -> Option<crate::messages::SwapStatusSnapshot> {
+        let accept = self.swap_accept.clone()?;
+        Some(crate::messages::SwapStatusSnapshot {
+            request_id,
+            accept,
+            network: self.network,
+            state: self.state.clone(),
+            funding_txid_hex: self.funding_txid_hex.clone(),
+            funding_vout: self.funding_vout,
+            spend_txid_hex: self.spend_txid_hex.clone(),
+            claim_observed_txid_hex: self.claim_observed_txid_hex.clone(),
+            required_confirmations: self.required_confirmations,
+            updated_at_unix: self.updated_at_unix,
+            observed_at_unix,
+            created_at_unix: self.created_at_unix,
+            payment_hash_hex: self.payment_hash_hex.clone(),
+            owner_ref: self
+                .swap_request
+                .as_ref()
+                .and_then(|request| request.owner_ref.clone()),
+        })
+    }
+}
+
 /// Seconds since the epoch.
 ///
 /// Duplicated privately in the provider and the client before this; the store needs one of its own

@@ -69,8 +69,8 @@ types on distinct ALPNs, and a provider resets a stream that sends one on the ot
 
 Every request is sent at most once per attempt. When an attempt fails after it may have reached
 the provider, the client sends the identical request again: once over iroh on a new connection,
-then over DMs if allowed. Offers, quotes and status are read-only, and a spare quote expires
-unused. A repeated `SwapRequest` from the same key returns the original persisted acceptance,
+then over DMs if allowed. Offers, quotes, status and listings are read-only, and a spare quote
+expires unused. A repeated `SwapRequest` from the same key returns the original persisted acceptance,
 including after a provider restart and whichever transport carries it, so it cannot create a
 second swap or change the owner. If the repeat is refused, as it is when the first attempt spent
 the quote while the repeat was racing it, the client queries status by quote and uses the
@@ -184,8 +184,9 @@ database. Cross-file ordering is explicit:
 
 Executable providers advertise `dm-retention-v1`:
 
-- Read-only offer, quote and status exchanges expire after ten minutes from preparation. Changed
-  read-only replies get distinct resources. The client can repeat the query after expiration.
+- Read-only offer, quote, status and listing exchanges expire after ten minutes from
+  preparation. Changed read-only replies get distinct resources. The client can repeat the query
+  after expiration.
 - Creation resources and final notifications become eligible 24 hours after a durably recorded
   `Claimed`, `Refunded`, or an unfunded `Expired` outcome. Generic failure, ambiguous funded expiry
   and a missing terminal timestamp do not authorize deletion.

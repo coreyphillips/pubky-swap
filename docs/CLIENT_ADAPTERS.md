@@ -46,8 +46,9 @@ client's private key. Reverse preimages remain with the original client until it
 omit that value. `QuoteRequest.request_id` is echoed by `Quote` or `Reject`. Request identifiers
 are optional UUIDs for backward compatibility. Concurrent integrations should always set them.
 
-Only providers configured for execution advertise `boltz-taproot-v1` and `swap-status-v1`.
-Capabilities should be checked before requesting a Taproot contract.
+Only providers configured for execution advertise `boltz-taproot-v1`, `swap-status-v1` and
+`swap-list-v1`. Capabilities should be checked before requesting a Taproot contract or a
+listing.
 
 ## Refusal codes
 
@@ -73,7 +74,7 @@ have no Paykit equivalent, and an adapter reports them as its generic decline.
 | `not_found` | A status query names no swap the sender owns | none | See [recovery](#durable-creation-and-recovery) |
 | `pending` | An admission exists and its invoice still needs recovery, or another request is admitting the same swap | none | Query again |
 | `access_denied` | The provider's access policy refuses the sender | generic decline | Other provider |
-| `invalid_request` | The request is malformed, names another pubky, reuses a payment hash, or changes an accepted request | generic decline | Fix the request |
+| `invalid_request` | The request is malformed, names another pubky, reuses a payment hash, changes an accepted request, carries an `owner_ref` the provider will not keep, or a listing cursor it did not issue | generic decline | Fix the request |
 | `unsupported_protocol` | `protocol_version` is outside what the provider speaks | generic decline | Other provider |
 | `offer_stale` | `offer_id` names an offer that is no longer current | generic decline | Fetch the offer, then quote again |
 | `internal_error` | The provider failed for its own reasons | generic decline | Later |
@@ -119,9 +120,55 @@ is `SwapStatusSnapshot`, echoing the request identifier and carrying:
 - `claim_observed_txid_hex` on a reverse swap, once the provider has seen the owner's claim.
   Providers from before this field omit it.
 - `updated_at_unix` for the record and `observed_at_unix` for the response.
+- From `swap-list-v1` providers: `created_at_unix`, the swap's `payment_hash_hex`, and the
+  `owner_ref` the owner sent. Older providers omit all three, which read as 0, empty and absent.
 
 Only the authenticated original counterparty can recover this information. The snapshot excludes
 private keys and preimages. Older records without a stored acceptance cannot provide this response.
+
+## Listing an owner's swaps
+
+Providers advertising `swap-list-v1` answer `SwapListRequest { request_id, cursor, limit,
+active_only }` with `SwapList { request_id, snapshots, next_cursor }`:
+
+- Only the authenticated sender's own swaps are listed, matched exactly as a status query matches
+  them: the transport key, plus the account and scope when a session was used. Anyone else gets an
+  empty page, not a refusal. The listing says nothing about what exists.
+- Pages run newest first by `created_at_unix`, then by `swap_id`, so a swap changing state never
+  moves between pages. A swap created while paging sorts before the first page and shows up in
+  the next listing. `limit` defaults to 10 and is clamped to 16; `next_cursor` is opaque and is
+  passed back as `cursor`. A cursor the provider did not issue is refused with `invalid_request`.
+- `active_only` leaves out swaps in a terminal state. Either way the listing covers the same
+  30-day retention window as status queries. An admission still creating its hold invoice has no
+  acceptance to show and is left out; a status query for its quote answers `pending`.
+- Each snapshot's `request_id` is absent; the page carries the correlation.
+- A provider without the feature cannot parse the request and never answers it. Check the offer
+  before asking.
+
+`SwapRequest.owner_ref` is an opaque string of at most 128 printable ASCII characters that the
+provider keeps verbatim and echoes in every snapshot and listing. It is for the owner's own
+bookkeeping, and is never interpreted. Anything else is refused with `invalid_request` before the
+quote is spent, and a provider from before `swap-list-v1` ignores the field.
+
+## Restoring from the seed
+
+A wallet with only its seed finds its swaps by listing them at each provider it used. It has to
+restore the identity it negotiated with: the same root key, or the same account and scope for a
+session, because that is what the listing is scoped to.
+
+The provider cannot give back the branch key or the preimage, which never left the wallet. A
+wallet that derives them from its seed puts the key index in `owner_ref` when it creates the
+swap, reads it back from the listing, and derives the keys directly. Without an `owner_ref` it
+can scan indices around `created_at_unix` for one whose keys match `payment_hash_hex`.
+
+`swap_client::restore` does the rest: `restore_from_provider` checks the offer for
+`swap-list-v1`, lists every swap, hands each snapshot to a resolver for its keys, checks what
+comes back against the listed contract (`verify_contract`) and the payment hash, and writes a
+record that `resume` drives like any other. Terminal swaps, swaps already in the store, and
+snapshots the resolver cannot key are reported rather than written. Only reverse swaps are
+rebuilt: a submarine refund needs the client's own invoice, which the listing does not carry.
+A restored reverse record carries no saved request, so `resume` asks the node whether the hold
+invoice was already paid before paying it.
 
 The final `SwapStatusUpdate` names the transaction behind its outcome in `reference`, which is
 the `evidence` of a terminal Paykit intent status:

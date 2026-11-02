@@ -1620,7 +1620,11 @@ fn build_offer(
         fee_rate_sat_vb,
         protocol_version: PROTOCOL_VERSION,
         features: if capable {
-            let mut features = vec!["boltz-taproot-v1".into(), "swap-status-v1".into()];
+            let mut features = vec![
+                "boltz-taproot-v1".into(),
+                "swap-status-v1".into(),
+                SWAP_LIST_FEATURE.into(),
+            ];
             // Retention is a promise about DMs, which a provider without a homeserver never
             // sends or keeps.
             if config.homeserver {
@@ -1715,6 +1719,29 @@ async fn handle_message(
                         req.swap_id,
                         req.quote_id,
                         code,
+                        error.to_string(),
+                    )
+                    .await?
+                }
+            }
+        }
+
+        SwapMessage::SwapListRequest(req) => {
+            match swap_list(
+                ctx.store.as_ref(),
+                sender,
+                ctx.transport.authorization(),
+                &req,
+            ) {
+                Ok(list) => respond(&ctx.transport, sender, &SwapMessage::SwapList(list)).await?,
+                Err(error) => {
+                    reject(
+                        &ctx.transport,
+                        sender,
+                        req.request_id,
+                        None,
+                        None,
+                        refusal_code(&error),
                         error.to_string(),
                     )
                     .await?
@@ -1846,6 +1873,20 @@ async fn handle_message(
             };
             if let Err(error) = check_client_pkarr(&req.client_pkarr, sender) {
                 return refuse(RejectCode::InvalidRequest, error.to_string()).await;
+            }
+            // Kept verbatim and echoed in listings, so it is bounded before anything stores it.
+            if req
+                .owner_ref
+                .as_deref()
+                .is_some_and(|owner_ref| !owner_ref_is_valid(owner_ref))
+            {
+                return refuse(
+                    RejectCode::InvalidRequest,
+                    format!(
+                        "owner_ref must be at most {OWNER_REF_MAX_LEN} printable ASCII characters"
+                    ),
+                )
+                .await;
             }
             match replay_record(
                 ctx.store.as_ref(),
@@ -2128,22 +2169,98 @@ fn status_snapshot(
     if record.pending_hold_invoice.is_some() {
         return Err(SwapLookupError::Pending.into());
     }
-    let accept = record
-        .swap_accept
-        .ok_or_else(|| anyhow!("this older swap has no persisted acceptance"))?;
-    Ok(SwapStatusSnapshot {
+    record
+        .status_snapshot(request.request_id, now_unix())
+        .ok_or_else(|| anyhow!("this older swap has no persisted acceptance"))
+}
+
+/// Page through the swaps the authenticated sender owns, newest first.
+///
+/// Ownership is the same three-way match as a status query, so a stranger, or the owner's root
+/// key for a swap made under a session, gets an empty page rather than a refusal: the listing
+/// says nothing about what exists. Admissions still creating their invoice have no acceptance to
+/// show and are left out; a status query for their quote answers `pending`.
+fn swap_list(
+    store: &dyn SwapStore,
+    sender: &str,
+    authorization: Option<(&str, &str)>,
+    request: &SwapListRequest,
+) -> Result<SwapList> {
+    let after = request
+        .cursor
+        .as_deref()
+        .map(decode_list_cursor)
+        .transpose()?;
+    let limit = list_page_limit(request.limit);
+    let mut owned: Vec<SwapRecord> = store
+        .load_all_checked()?
+        .into_iter()
+        .filter(|record| authorized_peer(record, sender, authorization))
+        .filter(|record| record.swap_accept.is_some() && record.pending_hold_invoice.is_none())
+        .filter(|record| !request.active_only || !record.state.is_terminal())
+        .collect();
+    owned.sort_by_key(list_key);
+    let start = after.map_or(0, |cursor| {
+        owned
+            .iter()
+            .position(|record| list_key(record) > cursor)
+            .unwrap_or(owned.len())
+    });
+    let observed_at_unix = now_unix();
+    let snapshots: Vec<SwapStatusSnapshot> = owned
+        .iter()
+        .skip(start)
+        .take(limit)
+        .filter_map(|record| record.status_snapshot(None, observed_at_unix))
+        .collect();
+    let next_cursor = (!snapshots.is_empty() && start + snapshots.len() < owned.len())
+        .then(|| encode_list_cursor(list_key(&owned[start + snapshots.len() - 1])));
+    Ok(SwapList {
         request_id: request.request_id,
-        accept,
-        network: record.network,
-        state: record.state,
-        funding_txid_hex: record.funding_txid_hex,
-        funding_vout: record.funding_vout,
-        spend_txid_hex: record.spend_txid_hex,
-        claim_observed_txid_hex: record.claim_observed_txid_hex,
-        required_confirmations: record.required_confirmations,
-        updated_at_unix: record.updated_at_unix,
-        observed_at_unix: now_unix(),
+        snapshots,
+        next_cursor,
     })
+}
+
+/// A page's position in a listing: newest first, then by id, so paging never depends on a
+/// field that changes while swaps run.
+type ListKey = (std::cmp::Reverse<u64>, Uuid);
+
+fn list_key(record: &SwapRecord) -> ListKey {
+    (std::cmp::Reverse(record.created_at_unix), record.swap_id)
+}
+
+fn list_page_limit(limit: Option<u32>) -> usize {
+    match limit {
+        None | Some(0) => SWAP_LIST_DEFAULT_PAGE,
+        Some(wanted) => wanted.min(SWAP_LIST_MAX_PAGE),
+    }
+    .try_into()
+    .unwrap_or(usize::MAX)
+}
+
+/// The cursor names the last snapshot of its page. Hex rather than plain text so nothing is
+/// tempted to build one; the only valid cursor is one this provider issued.
+fn encode_list_cursor((std::cmp::Reverse(created_at_unix), swap_id): ListKey) -> String {
+    hex::encode(format!("{created_at_unix}:{swap_id}"))
+}
+
+fn decode_list_cursor(cursor: &str) -> Result<ListKey> {
+    let invalid = || {
+        Refusal::new(
+            RejectCode::InvalidRequest,
+            "cursor is not one this provider issued",
+        )
+    };
+    let text = hex::decode(cursor)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid)?;
+    let (created_at_unix, swap_id) = text.split_once(':').ok_or_else(invalid)?;
+    Ok((
+        std::cmp::Reverse(created_at_unix.parse().map_err(|_| invalid())?),
+        swap_id.parse().map_err(|_| invalid())?,
+    ))
 }
 
 #[derive(Debug)]
@@ -3277,6 +3394,7 @@ fn customer_request(message: serde_json::Value) -> Option<SwapMessage> {
             | SwapMessage::QuoteRequest(_)
             | SwapMessage::SwapRequest(_)
             | SwapMessage::SwapStatusRequest(_)
+            | SwapMessage::SwapListRequest(_)
     )
     .then_some(message)
 }
@@ -3457,6 +3575,8 @@ fn variant_name(msg: &SwapMessage) -> &'static str {
         SwapMessage::SwapStatusUpdate(_) => "SwapStatusUpdate",
         SwapMessage::SwapStatusRequest(_) => "SwapStatusRequest",
         SwapMessage::SwapStatusSnapshot(_) => "SwapStatusSnapshot",
+        SwapMessage::SwapListRequest(_) => "SwapListRequest",
+        SwapMessage::SwapList(_) => "SwapList",
         SwapMessage::CoopSignature(_) => "CoopSignature",
         SwapMessage::Reject(_) => "Reject",
     }
