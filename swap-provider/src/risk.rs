@@ -146,6 +146,20 @@ struct Inner {
     peers: HashMap<String, PeerState>,
     /// Which peer each reservation belongs to, so a guard can release the right one.
     reservations: HashMap<Uuid, (String, u64)>,
+    /// Wallet funds promised to reverse swaps that have not funded yet, by swap: the HTLC amount
+    /// plus its funding fee. See [`RiskManager::claim_funding`].
+    funding_claims: HashMap<Uuid, u64>,
+}
+
+/// Why a reverse swap's funding could not be promised.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FundingShortfall {
+    /// What the wallet reported it could spend.
+    pub available_sat: u64,
+    /// How much of that other reverse swaps have already claimed and not yet funded.
+    pub claimed_sat: u64,
+    /// What this swap needs: its funding and fee, plus the reserve kept back.
+    pub needed_sat: u64,
 }
 
 /// Tracks and bounds what is committed.
@@ -192,6 +206,7 @@ impl RiskManager {
                 total_in_flight: 0,
                 peers: HashMap::new(),
                 reservations: HashMap::new(),
+                funding_claims: HashMap::new(),
             }),
         })
     }
@@ -412,6 +427,7 @@ impl RiskManager {
 
     fn release(&self, swap_id: Uuid) {
         let mut inner = self.locked();
+        inner.funding_claims.remove(&swap_id);
         let Some((peer, amount)) = inner.reservations.remove(&swap_id) else {
             return;
         };
@@ -426,6 +442,74 @@ impl RiskManager {
                 inner.peers.remove(&peer);
             }
         }
+    }
+
+    /// Promise `claim_sat` of the wallet to reverse swap `swap_id`, if the wallet still covers it.
+    ///
+    /// A reverse swap takes the client's Lightning payment before it funds its HTLC, so the
+    /// balance check at admission is the last point where refusing costs nobody anything.
+    /// Checking each swap against the whole balance was not enough: two admitted together could
+    /// each pass and jointly overcommit the wallet. A claim stands from admission until the
+    /// funding is broadcast ([`funding_settled`](Self::funding_settled)) or the swap ends, and
+    /// each check subtracts every other claim. The check and the claim are taken under one lock,
+    /// so two admissions racing for the last of the wallet cannot both pass.
+    ///
+    /// `available_sat` of `None` means the wallet cannot report a balance. Nothing is refused
+    /// then, but the claim is still recorded, so a later check that can see a balance counts it.
+    /// Only a reserved swap holds a claim, because its release is what clears the claim again.
+    ///
+    /// This stays a preflight, not a guarantee. The balance is read before this lock is taken,
+    /// nothing locks coins, and the node can spend them on its own before the swap funds.
+    pub fn claim_funding(
+        &self,
+        swap_id: Uuid,
+        claim_sat: u64,
+        available_sat: Option<u64>,
+        reserve_sat: u64,
+    ) -> std::result::Result<(), FundingShortfall> {
+        let mut inner = self.locked();
+        if let Some(available_sat) = available_sat {
+            let claimed_sat = inner
+                .funding_claims
+                .iter()
+                .filter(|(id, _)| **id != swap_id)
+                .fold(0u64, |sum, (_, sat)| sum.saturating_add(*sat));
+            let needed_sat = claim_sat.saturating_add(reserve_sat);
+            if available_sat.saturating_sub(claimed_sat) < needed_sat {
+                return Err(FundingShortfall {
+                    available_sat,
+                    claimed_sat,
+                    needed_sat,
+                });
+            }
+        }
+        if inner.reservations.contains_key(&swap_id) {
+            inner.funding_claims.insert(swap_id, claim_sat);
+        }
+        Ok(())
+    }
+
+    /// Re-record the claim of a reverse swap that was admitted but had not funded when the
+    /// process stopped. Never refused: like [`restore`](Self::restore), the swap already exists.
+    pub fn restore_funding_claim(&self, swap_id: Uuid, claim_sat: u64) {
+        let mut inner = self.locked();
+        if inner.reservations.contains_key(&swap_id) {
+            inner.funding_claims.insert(swap_id, claim_sat);
+        }
+    }
+
+    /// The swap has broadcast its funding or found it on chain. The wallet's balance now reflects
+    /// what it spent, so keeping the claim would count those coins twice.
+    pub fn funding_settled(&self, swap_id: Uuid) {
+        self.locked().funding_claims.remove(&swap_id);
+    }
+
+    /// Wallet funds claimed by reverse swaps that have not funded yet.
+    pub fn claimed_funding_sat(&self) -> u64 {
+        self.locked()
+            .funding_claims
+            .values()
+            .fold(0u64, |sum, sat| sum.saturating_add(*sat))
     }
 
     /// Total committed right now, for logging and the status surface.
@@ -751,5 +835,96 @@ mod tests {
         let guards = m.restore(&[rec]);
         assert_eq!(guards.len(), 1);
         assert_eq!(m.committed_sat(), 999_999);
+    }
+
+    /// Each reverse swap used to be checked against the whole balance, so two admitted together
+    /// could each pass and jointly promise more than the wallet held.
+    #[test]
+    fn a_funding_claim_counts_against_the_next_admission() {
+        let m = RiskManager::new(limits());
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let _a = m.reserve("alice", first, 100_000).unwrap();
+        let _b = m.reserve("bob", second, 100_000).unwrap();
+
+        m.claim_funding(first, 101_000, Some(150_000), 10_000)
+            .unwrap();
+        assert_eq!(m.claimed_funding_sat(), 101_000);
+        assert_eq!(
+            m.claim_funding(second, 101_000, Some(150_000), 10_000),
+            Err(FundingShortfall {
+                available_sat: 150_000,
+                claimed_sat: 101_000,
+                needed_sat: 111_000,
+            })
+        );
+        assert_eq!(
+            m.claimed_funding_sat(),
+            101_000,
+            "a refused admission claims nothing"
+        );
+
+        // Re-checking the same swap does not count its own claim against itself.
+        m.claim_funding(first, 101_000, Some(150_000), 10_000)
+            .unwrap();
+        assert_eq!(m.claimed_funding_sat(), 101_000);
+    }
+
+    /// Once the funding is broadcast the wallet's balance reflects it, so the claim must go:
+    /// keeping it would count the same coins twice and refuse swaps the wallet can fund.
+    #[test]
+    fn a_settled_or_released_claim_stops_counting() {
+        let m = RiskManager::new(limits());
+        let (funded, ended, next) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let _funded = m.reserve("alice", funded, 100_000).unwrap();
+        let ended_guard = m.reserve("bob", ended, 100_000).unwrap();
+        let _next = m.reserve("carol", next, 100_000).unwrap();
+        m.claim_funding(funded, 101_000, Some(300_000), 0).unwrap();
+        m.claim_funding(ended, 101_000, Some(300_000), 0).unwrap();
+        assert_eq!(m.claimed_funding_sat(), 202_000);
+
+        // One swap funded: the wallet dropped by what it spent, and its claim is gone.
+        m.funding_settled(funded);
+        // The other ended without funding: its claim goes with its reservation.
+        drop(ended_guard);
+        assert_eq!(m.claimed_funding_sat(), 0);
+
+        // What is left in the wallet, 300,000 less the first funding, is all available again.
+        m.claim_funding(next, 101_000, Some(199_000), 0).unwrap();
+    }
+
+    /// A wallet that cannot report a balance refuses nothing, but its claims still count once a
+    /// balance can be read. An unreserved swap never holds a claim, because nothing would release
+    /// it.
+    #[test]
+    fn claims_without_a_balance_or_a_reservation() {
+        let m = RiskManager::new(limits());
+        let (reserved, stray) = (Uuid::new_v4(), Uuid::new_v4());
+        let _guard = m.reserve("alice", reserved, 100_000).unwrap();
+
+        m.claim_funding(reserved, 101_000, None, 10_000).unwrap();
+        assert_eq!(m.claimed_funding_sat(), 101_000);
+
+        m.claim_funding(stray, 1_000, Some(1_000_000), 0).unwrap();
+        assert_eq!(m.claimed_funding_sat(), 101_000);
+        m.restore_funding_claim(stray, 1_000);
+        assert_eq!(m.claimed_funding_sat(), 101_000);
+    }
+
+    /// A reverse swap admitted before a restart still owes its funding, and is never refused for
+    /// it.
+    #[test]
+    fn a_restored_claim_is_kept_whatever_the_balance() {
+        let m = RiskManager::new(limits());
+        let mut rec = SwapRecord::new_progress();
+        rec.swap_id = Uuid::new_v4();
+        rec.peer = "alice".into();
+        rec.onchain_amount_sat = 100_000;
+        let _guards = m.restore(&[rec.clone()]);
+        m.restore_funding_claim(rec.swap_id, 101_000);
+        assert_eq!(m.claimed_funding_sat(), 101_000);
+
+        let next = Uuid::new_v4();
+        let _next = m.reserve("bob", next, 100_000).unwrap();
+        assert!(m.claim_funding(next, 101_000, Some(150_000), 0).is_err());
     }
 }

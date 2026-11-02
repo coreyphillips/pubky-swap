@@ -1142,6 +1142,140 @@ mod direct_requests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// A wallet that reports a balance, and never funds anything: the tests below are refused,
+    /// or stop, before any funding.
+    struct BalanceWallet(std::sync::atomic::AtomicU64);
+
+    impl BalanceWallet {
+        fn new(balance_sat: u64) -> Arc<Self> {
+            Arc::new(Self(std::sync::atomic::AtomicU64::new(balance_sat)))
+        }
+
+        fn set(&self, balance_sat: u64) {
+            self.0.store(balance_sat, Ordering::SeqCst);
+        }
+    }
+
+    impl OnchainWallet for BalanceWallet {
+        fn fund_htlc(
+            &self,
+            _htlc_spk: &ScriptBuf,
+            _amount_sat: u64,
+        ) -> swap_common::Result<OutPoint> {
+            Err(swap_common::SwapError::Other(
+                "this test wallet never funds".into(),
+            ))
+        }
+
+        fn receive_destination(&self) -> ScriptBuf {
+            ScriptBuf::new()
+        }
+
+        fn spendable_balance_sat(&self) -> swap_common::Result<Option<u64>> {
+            Ok(Some(self.0.load(Ordering::SeqCst)))
+        }
+    }
+
+    /// A reverse swap takes the client's Lightning payment before it funds, so a wallet that
+    /// cannot fund it must refuse at creation. Before #108 an `--wallet lnd` provider reported no
+    /// balance, skipped this check, and held the client's payment until the HTLC timed out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_underfunded_wallet_refuses_a_reverse_swap_before_any_invoice() {
+        let directory = std::env::temp_dir().join(format!("underfunded-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let client = pubky_transport::identity_from_secret(&[49; 32]);
+        let wallet = BalanceWallet::new(50_000);
+        let ctx = ExecCtx {
+            wallet: Some(wallet.clone()),
+            ..executing(context(store.clone(), Uuid::new_v4()))
+        };
+
+        let quote = quote_request(&client, SwapDirection::Reverse, 100_000);
+        let Some(SwapMessage::Quote(quote)) =
+            ask(&ctx, &client, SwapMessage::QuoteRequest(quote)).await
+        else {
+            panic!("expected a quote");
+        };
+        let mut redeem = owned_record(&client).swap_request.unwrap();
+        redeem.quote_id = quote.quote_id;
+        let (code, reject) = refusal(ask(&ctx, &client, SwapMessage::SwapRequest(redeem)).await);
+        assert_eq!(code, RejectCode::LiquidityUnavailable);
+        assert!(
+            reject.reason.contains("50000 sat available"),
+            "{}",
+            reject.reason
+        );
+        // No record means no hold invoice: the stand-in Lightning node refuses to create one
+        // without a persisted owner.
+        assert!(store.load_all_checked().unwrap().is_empty());
+        assert_eq!(ctx.risk.claimed_funding_sat(), 0);
+        assert_eq!(ctx.risk.in_flight(), 0);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Each reverse swap used to be checked against the whole balance, so two admitted together
+    /// could each pass and jointly promise more than the wallet held. The first now claims its
+    /// funding until it records it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_reverse_admissions_cannot_overcommit_the_wallet() {
+        let directory = std::env::temp_dir().join(format!("overcommit-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let wallet = BalanceWallet::new(150_000);
+        let ctx = ExecCtx {
+            wallet: Some(wallet.clone()),
+            ..executing(context(store.clone(), Uuid::new_v4()))
+        };
+        let claim = funding_claim_sat(&ctx, 100_000);
+        assert!(claim < 150_000 && 2 * claim > 150_000);
+
+        let first = Uuid::new_v4();
+        let _first = reserve_for_swap(&ctx, "alice", first, SwapDirection::Reverse, 100_000)
+            .await
+            .unwrap();
+        assert_eq!(ctx.risk.claimed_funding_sat(), claim);
+
+        let error = reserve_for_swap(&ctx, "bob", Uuid::new_v4(), SwapDirection::Reverse, 100_000)
+            .await
+            .err()
+            .expect("the second swap does not fit beside the first");
+        assert_eq!(refusal_code(&error), RejectCode::LiquidityUnavailable);
+        assert!(
+            error
+                .to_string()
+                .contains("promised to swaps not yet funded"),
+            "{error}"
+        );
+
+        // Submarine swaps are funded by the client and claim nothing from the wallet.
+        let _submarine = reserve_for_swap(
+            &ctx,
+            "carol",
+            Uuid::new_v4(),
+            SwapDirection::Submarine,
+            100_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.risk.claimed_funding_sat(), claim);
+
+        // The first swap funds: its coins leave the wallet, and recording the outpoint ends its
+        // claim, so what is left is counted once rather than twice.
+        let mut record = SwapRecord::new_progress();
+        record.swap_id = first;
+        let progress = StoreProgress {
+            store: store.clone(),
+            record: std::sync::Mutex::new(record),
+            risk: Some(ctx.risk.clone()),
+        };
+        progress.funded(OutPoint::null());
+        wallet.set(150_000 - claim);
+        assert_eq!(ctx.risk.claimed_funding_sat(), 0);
+        let _third = reserve_for_swap(&ctx, "dave", Uuid::new_v4(), SwapDirection::Reverse, 40_000)
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     /// Clients match these strings today, so they stay byte-identical.
     #[tokio::test]
     async fn status_refusals_keep_their_strings() {

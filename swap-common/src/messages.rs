@@ -892,8 +892,9 @@ mod tests {
         // A reason or failure detail that quotes a backend error has no bound, so an adapter has
         // to truncate those.
         let reason = format!(
-            "swap start failed: insufficient on-chain balance: {max} sat available, {max} sat \
-             needed for a {max} sat swap plus fees and the {max} sat reserve"
+            "swap start failed: insufficient on-chain balance: {max} sat available ({max} sat of \
+             it promised to swaps not yet funded), {max} sat needed for a {max} sat swap plus fees \
+             and the {max} sat reserve"
         );
         let code = RejectCode::ALL
             .into_iter()

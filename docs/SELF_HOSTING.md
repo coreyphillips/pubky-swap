@@ -16,7 +16,7 @@ A fully-functional (swap-executing) provider needs three things, all configurabl
 
 | Capability | Flag(s) | Notes |
 |---|---|---|
-| **Lightning node** | `--lightning lnd` with `--lnd-address` `--lnd-cert` `--lnd-macaroon`, or `--lightning beignet` with `--beignet-url` | For LND, a macaroon with **invoice + router** permissions (the `admin.macaroon` works). |
+| **Lightning node** | `--lightning lnd` with `--lnd-address` `--lnd-cert` `--lnd-macaroon`, or `--lightning beignet` with `--beignet-url` | For LND, a macaroon with **invoice + router** permissions, plus on-chain and address permissions with `--wallet lnd` (the `admin.macaroon` works; see [Macaroon permissions](#macaroon-permissions)). |
 | **Chain access** (Electrum/electrs) | `--electrum-url` | e.g. `tcp://host:50001` (mainnet/electrs) or `ssl://host:50002`. |
 | **Funding wallet** (on-chain) | `--wallet lnd`, `--wallet beignet`, or `--wallet bdk` | `--wallet lnd` funds reverse-swap HTLCs from **LND's own on-chain balance** (no extra seed, and recommended). `--wallet beignet` does the same from a beignet daemon's wallet. `--wallet bdk` is a separate BIP84 wallet from `PUBKY_SWAP_WALLET_MNEMONIC__FILE`. |
 
@@ -171,14 +171,27 @@ a mainnet node, and vice-versa).
 ### Macaroon permissions
 
 The provider calls `invoicesrpc` (hold invoices) + `routerrpc` (paying invoices) + `lnrpc`
-(`GetInfo`, invoice lookup). The `admin.macaroon` covers all of these. To mint a least-privilege
-macaroon instead:
+(`GetInfo`, invoice lookup). With `--wallet lnd`, the default, it also uses LND's on-chain
+wallet:
+
+- `WalletBalance` checks a reverse swap can be funded before its hold invoice exists.
+- `EstimateFee` prices the funding.
+- `NewAddress` gives a sweep destination.
+- `SendOutputs` funds the HTLC.
+- `BumpFee` is the CPFP fallback.
+
+The `admin.macaroon` covers all of these. To mint a least-privilege macaroon instead:
 
 ```bash
 lncli bakemacaroon \
   info:read invoices:read invoices:write offchain:read offchain:write \
+  onchain:read onchain:write address:write \
   --save_to swap.macaroon
 ```
+
+Leave out `onchain:read onchain:write address:write` only if the provider funds from
+`--wallet bdk` or `--wallet beignet`. Without `onchain:read`, an `--wallet lnd` provider cannot check its balance
+and refuses every reverse swap. `--doctor` reports that as a failed wallet check.
 
 ### TLS gotcha (connecting to a remote LND)
 

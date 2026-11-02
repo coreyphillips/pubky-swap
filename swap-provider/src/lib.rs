@@ -573,6 +573,9 @@ impl Drop for AdmissionGuard<'_> {
 struct StoreProgress {
     store: Arc<dyn SwapStore>,
     record: std::sync::Mutex<SwapRecord>,
+    /// Where a reverse swap's funding claim lives, so recording the funding can end it. `None`
+    /// for a driver that never claims wallet funds.
+    risk: Option<Arc<risk::RiskManager>>,
 }
 
 impl StoreProgress {
@@ -685,12 +688,19 @@ impl ProgressSink for StoreProgress {
     }
 
     fn funded(&self, outpoint: OutPoint) {
+        let mut swap_id = None;
         self.update("funding outpoint", |rec| {
             rec.funding_txid_hex = Some(outpoint.txid.to_string());
             rec.funding_vout = Some(outpoint.vout);
             rec.funding_intent_at_height = None;
             rec.state = SwapState::LockupConfirmed;
+            swap_id = Some(rec.swap_id);
         });
+        // The funding has left the wallet, so its balance already shows it. Ended whether or not
+        // the record write above landed: the coins are spent either way.
+        if let (Some(risk), Some(swap_id)) = (&self.risk, swap_id) {
+            risk.funding_settled(swap_id);
+        }
     }
 
     fn invoice_pay_started(&self) -> anyhow::Result<()> {
@@ -2128,7 +2138,7 @@ async fn reserve_for_swap(
         )
         .map_err(Refusal::from)?;
 
-    check_funding_balance(ctx, direction, onchain_amount_sat).await?;
+    check_funding_balance(ctx, swap_id, direction, onchain_amount_sat).await?;
     Ok(guard)
 }
 
@@ -2144,44 +2154,75 @@ async fn reserve_pending_swap(
             record.onchain_amount_sat,
         )
         .map_err(Refusal::from)?;
-    check_funding_balance(ctx, record.direction, record.onchain_amount_sat).await?;
+    check_funding_balance(
+        ctx,
+        record.swap_id,
+        record.direction,
+        record.onchain_amount_sat,
+    )
+    .await?;
     Ok(guard)
 }
 
+/// Check the wallet can fund reverse swap `swap_id`, and claim what it needs.
+///
+/// The claim is what makes this hold for more than one swap at a time: every reverse swap
+/// admitted but not yet funded keeps its funding claimed, and each new check subtracts those
+/// claims from the balance (see [`risk::RiskManager::claim_funding`]). The claim ends when the
+/// driver records the funding, or with the reservation.
 async fn check_funding_balance(
     ctx: &ExecCtx,
+    swap_id: Uuid,
     direction: SwapDirection,
     onchain_amount_sat: u64,
 ) -> Result<()> {
     // Only a reverse swap spends the provider's own coins on chain; in a submarine swap the
     // client funds and we claim.
-    if direction == SwapDirection::Reverse {
-        if let Some(wallet) = ctx.wallet.as_ref() {
-            let balance = run_blocking(|| wallet.spendable_balance_sat())
-                .map_err(|e| anyhow!("wallet balance: {e}"))?;
-            if let Some(available) = balance {
-                let needed = onchain_amount_sat
-                    .saturating_add(ctx.min_onchain_reserve_sat)
-                    .saturating_add(
-                        ctx.onchain_fee_rate_sat_vb
-                            .saturating_mul(pricing::FUNDING_VSIZE),
-                    );
-                if available < needed {
-                    return Err(Refusal::new(
-                        RejectCode::LiquidityUnavailable,
-                        format!(
-                            "insufficient on-chain balance: {available} sat available, {needed} \
-                             sat needed for a {onchain_amount_sat} sat swap plus fees and the \
-                             {} sat reserve",
-                            ctx.min_onchain_reserve_sat
-                        ),
-                    )
-                    .into());
-                }
-            }
-        }
+    if direction != SwapDirection::Reverse {
+        return Ok(());
     }
-    Ok(())
+    let Some(wallet) = ctx.wallet.as_ref() else {
+        return Ok(());
+    };
+    let available = run_blocking(|| wallet.spendable_balance_sat())
+        .map_err(|e| anyhow!("wallet balance: {e}"))?;
+    let claim = funding_claim_sat(ctx, onchain_amount_sat);
+    ctx.risk
+        .claim_funding(swap_id, claim, available, ctx.min_onchain_reserve_sat)
+        .map_err(|shortfall| {
+            let promised = match shortfall.claimed_sat {
+                0 => String::new(),
+                claimed => format!(" ({claimed} sat of it promised to swaps not yet funded)"),
+            };
+            Refusal::new(
+                RejectCode::LiquidityUnavailable,
+                format!(
+                    "insufficient on-chain balance: {} sat available{promised}, {} sat needed \
+                     for a {onchain_amount_sat} sat swap plus fees and the {} sat reserve",
+                    shortfall.available_sat, shortfall.needed_sat, ctx.min_onchain_reserve_sat
+                ),
+            )
+            .into()
+        })
+}
+
+/// What a reverse swap draws from the wallet: its HTLC amount and the fee to fund it.
+fn funding_claim_sat(ctx: &ExecCtx, onchain_amount_sat: u64) -> u64 {
+    onchain_amount_sat.saturating_add(
+        ctx.onchain_fee_rate_sat_vb
+            .saturating_mul(pricing::FUNDING_VSIZE),
+    )
+}
+
+/// Whether a persisted swap will still spend from the wallet: a reverse swap that has neither
+/// funded nor recorded that it was about to.
+///
+/// One that recorded a funding intent is excluded. Its driver never funds a second time, so
+/// either those coins already left the wallet or they never will.
+fn awaits_funding(record: &SwapRecord) -> bool {
+    record.direction == SwapDirection::Reverse
+        && record.funding_txid_hex.is_none()
+        && record.funding_intent_at_height.is_none()
 }
 
 /// Start a reverse swap: create the hold invoice + HTLC, reply with `SwapAccept`, and spawn
@@ -2375,6 +2416,7 @@ fn spawn_reverse_driver(
     let progress = Arc::new(StoreProgress {
         store: ctx.store.clone(),
         record: std::sync::Mutex::new(record),
+        risk: Some(ctx.risk.clone()),
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
@@ -2590,9 +2632,11 @@ fn spawn_submarine_driver(
     let peer = record.peer.clone();
     let swap_id = record.swap_id;
     let required_confirmations = record.required_confirmations;
+    // The client funds a submarine swap, so this driver holds no claim on the wallet.
     let progress = Arc::new(StoreProgress {
         store: ctx.store.clone(),
         record: std::sync::Mutex::new(record),
+        risk: None,
     });
     let ctx2 = ctx.clone();
     tokio::spawn(async move {
@@ -2904,6 +2948,14 @@ async fn resume_swaps(ctx: &ExecCtx) {
         .into_iter()
         .map(|guard| (guard.swap_id(), guard))
         .collect();
+    // A reverse swap admitted before the restart still owes its funding. Re-claim it before any
+    // pending admission below is checked, so those checks count it.
+    for record in accepted_records.iter().filter(|r| awaits_funding(r)) {
+        ctx.risk.restore_funding_claim(
+            record.swap_id,
+            funding_claim_sat(ctx, record.onchain_amount_sat),
+        );
+    }
     info!("Resuming {} persisted swap(s)", records.len());
     let needing_recovery = records.iter().filter(|r| needs_recovery(r)).count();
     if needing_recovery > 0 {
@@ -3358,6 +3410,7 @@ mod tests {
         let progress = StoreProgress {
             store: store.clone(),
             record: std::sync::Mutex::new(rec),
+            risk: None,
         };
 
         note_funding_fee(
@@ -3390,6 +3443,7 @@ mod tests {
         let progress = StoreProgress {
             store: Arc::new(JsonFileSwapStore::new(&dir).unwrap()),
             record: std::sync::Mutex::new(rec),
+            risk: None,
         };
         let unrelated = "0000000000000000000000000000000000000000000000000000000000000003"
             .parse::<Txid>()
@@ -3425,6 +3479,7 @@ mod tests {
         let progress = StoreProgress {
             store: Arc::new(store),
             record: std::sync::Mutex::new(rec),
+            risk: None,
         };
         let txid = "0000000000000000000000000000000000000000000000000000000000000001"
             .parse::<Txid>()
@@ -3694,5 +3749,31 @@ mod tests {
         assert_eq!(lnd_network_to_bitcoin("regtest"), Some(Network::Regtest));
         assert_eq!(lnd_network_to_bitcoin("signet"), Some(Network::Signet));
         assert_eq!(lnd_network_to_bitcoin("simnet"), None);
+    }
+
+    /// The claims a restart re-establishes: a reverse swap that has neither funded nor recorded
+    /// that it was about to. One with a funding intent never funds a second time.
+    #[test]
+    fn only_an_unfunded_reverse_swap_is_reclaimed_after_a_restart() {
+        let reverse = SwapRecord {
+            direction: SwapDirection::Reverse,
+            ..SwapRecord::new_progress()
+        };
+        assert!(awaits_funding(&reverse));
+        let funded = SwapRecord {
+            funding_txid_hex: Some("aa".repeat(32)),
+            ..reverse.clone()
+        };
+        assert!(!awaits_funding(&funded));
+        let intended = SwapRecord {
+            funding_intent_at_height: Some(100),
+            ..reverse.clone()
+        };
+        assert!(!awaits_funding(&intended));
+        let submarine = SwapRecord {
+            direction: SwapDirection::Submarine,
+            ..reverse
+        };
+        assert!(!awaits_funding(&submarine));
     }
 }

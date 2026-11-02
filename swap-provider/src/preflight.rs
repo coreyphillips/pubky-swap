@@ -453,7 +453,9 @@ async fn check_wallet(config: &crate::ProviderConfig, report: &mut Report) {
                 Err(e) => report.push(Check::fail(
                     "wallet",
                     format!("{backend}: {e}"),
-                    "check the wallet's Electrum server and, for --wallet bdk, its mnemonic",
+                    "check the wallet's Electrum server and, for --wallet bdk, its mnemonic; for \
+                     --wallet lnd, that LND is reachable and its macaroon can read the on-chain \
+                     wallet",
                 )),
             }
         }

@@ -1311,6 +1311,7 @@ mod tests {
             let progress = crate::StoreProgress {
                 store: store.clone(),
                 record: std::sync::Mutex::new(rec),
+                risk: None,
             };
             match drive_reverse_swap(
                 &ln,

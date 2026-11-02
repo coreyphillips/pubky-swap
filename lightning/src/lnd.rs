@@ -85,6 +85,31 @@ impl LndBackend {
         Ok((resp.sat_per_kw > 0).then_some(resp.sat_per_kw))
     }
 
+    /// Confirmed on-chain funds a funding send can use, in sat.
+    ///
+    /// Read from the `default` account, which is the one `send_outputs` spends from, at one
+    /// confirmation, which is what it requires. `confirmed_balance` already leaves out leased
+    /// outputs: btcwallet's balance subtracts every locked output, which is why LND reports
+    /// `locked_balance` beside it rather than inside it. What it still includes is the anchor
+    /// reserve, which LND will not spend below, so that comes off here.
+    pub async fn spendable_onchain_sat(&self) -> Result<u64> {
+        use fedimint_tonic_lnd::lnrpc::WalletBalanceRequest;
+        let mut client = self.client.lock().await;
+        let resp = client
+            .lightning()
+            .wallet_balance(WalletBalanceRequest {
+                account: "default".to_string(),
+                min_confs: 1,
+            })
+            .await
+            .map_err(|s| LightningError::Backend(s.to_string()))?
+            .into_inner();
+        Ok(spendable_from_balance(
+            resp.confirmed_balance,
+            resp.reserved_balance_anchor_chan,
+        ))
+    }
+
     /// Bump an unconfirmed transaction's fee, using CPFP when the output is ours.
     ///
     /// `walletrpc.BumpFee` is what makes CPFP available to an `--wallet lnd` provider at all: the
@@ -145,6 +170,17 @@ impl LndBackend {
 fn to_i64(value: u64, what: &str) -> Result<i64> {
     i64::try_from(value)
         .map_err(|_| LightningError::Backend(format!("{what} {value} does not fit in i64")))
+}
+
+/// What a funding send can use out of a `WalletBalance` reply: the confirmed balance less the
+/// anchor reserve LND keeps back, never below zero.
+///
+/// LND's protobufs carry both as `i64`. A negative value is not something the node should send,
+/// and it is read as zero rather than allowed to wrap into a huge balance.
+fn spendable_from_balance(confirmed_sat: i64, reserved_anchor_sat: i64) -> u64 {
+    let confirmed = u64::try_from(confirmed_sat).unwrap_or(0);
+    let reserved = u64::try_from(reserved_anchor_sat).unwrap_or(0);
+    confirmed.saturating_sub(reserved)
 }
 
 fn to_32(bytes: &[u8], what: &str) -> Result<[u8; 32]> {
@@ -490,5 +526,23 @@ impl LightningBackend for LndBackend {
             amount_is_explicit: resp.num_msat > 0,
             expires_at_unix,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spendable_from_balance;
+
+    /// The anchor reserve is part of the confirmed balance and LND refuses to spend below it, so
+    /// a funding send can only count on what is left above it.
+    #[test]
+    fn spendable_balance_leaves_out_the_anchor_reserve() {
+        assert_eq!(spendable_from_balance(500_000, 0), 500_000);
+        assert_eq!(spendable_from_balance(500_000, 30_000), 470_000);
+        // A reserve the wallet cannot cover leaves nothing to spend, not a wrapped balance.
+        assert_eq!(spendable_from_balance(10_000, 30_000), 0);
+        // Negative values are not something LND should send, and are read as zero.
+        assert_eq!(spendable_from_balance(-1, 0), 0);
+        assert_eq!(spendable_from_balance(500_000, -1), 500_000);
     }
 }
