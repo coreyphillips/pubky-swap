@@ -196,6 +196,12 @@ struct Cli {
     #[arg(long)]
     status_addr: Option<String>,
 
+    /// A wake gateway (https base URL) an owner may name in a wake capability. Repeatable.
+    ///
+    /// Without one the provider sends no wakes and does not advertise `swap-wake-v1`.
+    #[arg(long = "wake-gateway")]
+    wake_gateway: Vec<String>,
+
     /// Publish this identity's Paykit App Registry entry and Noise Key Authorization, and exit.
     ///
     /// Run once at setup. Rerunning writes nothing. To rotate, pass --paykit-generation with the
@@ -297,6 +303,8 @@ struct Overrides {
     homeserver: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wake_gateways: Option<Vec<String>>,
 }
 
 /// A boolean flag contributes only when it is set.
@@ -357,6 +365,7 @@ impl Cli {
             rendezvous_iroh: self.no_rendezvous_iroh.then_some(false),
             homeserver: self.no_homeserver.then_some(false),
             status_addr: self.status_addr.clone(),
+            wake_gateways: (!self.wake_gateway.is_empty()).then(|| self.wake_gateway.clone()),
         })
     }
 }

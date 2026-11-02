@@ -690,6 +690,7 @@ mod direct_requests {
             // Nothing new may start: every reply below comes from what is already persisted.
             capable: false,
             homeserver: true,
+            wake: Arc::new(crate::wake::Waker::new(&[])),
         }
     }
 

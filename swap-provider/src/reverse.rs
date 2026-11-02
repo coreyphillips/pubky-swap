@@ -71,6 +71,14 @@ pub trait ProgressSink: Send + Sync {
     fn claim_observed(&self, _txid: Txid) {}
     /// We broadcast a claim or refund.
     fn spend_broadcast(&self, _txid: Txid) {}
+    /// Whether the owner asked to hear when the funding reaches depth and has not heard yet. Read
+    /// once per run, so a swap without the hint costs no extra chain lookups.
+    fn wants_claimable(&self) -> bool {
+        false
+    }
+    /// The funding has reached the swap's required confirmations and nobody has spent it. Called
+    /// at most once per run. Must not block: the driver is watching for the claim.
+    fn claimable(&self, _outpoint: OutPoint) {}
 }
 
 impl ProgressSink for () {}
@@ -508,8 +516,9 @@ pub async fn drive_reverse_swap(
     // wait for it to appear as an unspent UTXO: the client claims as soon as it confirms,
     // which spends the output — an unspent lookup here would race (and usually lose) that
     // claim and then loop forever. Instead we watch directly for the spend (to settle) or
-    // refund at the timeout. `required_confirmations` is enforced client-side before claiming.
-    let _ = required_confirmations;
+    // refund at the timeout. `required_confirmations` is enforced client-side before claiming;
+    // here it only times the claimable hint, by the funding's own confirmations.
+    let mut hint_due = progress.wants_claimable();
 
     // 3. Watch for the client's claim (which reveals the preimage), and refund at the timeout.
     //
@@ -570,7 +579,23 @@ pub async fn drive_reverse_swap(
     let mut settled = false;
     loop {
         // Any spend of the HTLC, ours or theirs.
-        if let Some(spend) = run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))? {
+        let spend = run_blocking(|| chain.find_spend(&swap.htlc_spk, &funding_outpoint))?;
+        // An owner that has already spent needs no hint. A failed lookup only delays it: the
+        // hint is advisory, so it never costs the driver a run.
+        if hint_due && spend.is_none() {
+            if let Ok(Some(confirmations)) =
+                run_blocking(|| chain.tx_confirmations(&swap.htlc_spk, &funding_outpoint.txid))
+            {
+                if confirmations >= required_confirmations.max(1) {
+                    info!("Reverse swap: funding {funding_outpoint} is at depth; claimable");
+                    progress.claimable(funding_outpoint);
+                    hint_due = false;
+                }
+            }
+        } else if spend.is_some() {
+            hint_due = false;
+        }
+        if let Some(spend) = spend {
             let spend_txid = spend.compute_txid();
             if let Some(preimage) = extract_preimage(&spend, &funding_outpoint, &swap.payment_hash)
             {
@@ -835,6 +860,104 @@ mod tests {
             )
             .unwrap(),
             vout: 0,
+        }
+    }
+
+    /// Records every claimable hint the driver raises.
+    struct HintSink {
+        wants: bool,
+        hints: Mutex<Vec<OutPoint>>,
+    }
+
+    impl ProgressSink for HintSink {
+        fn wants_claimable(&self) -> bool {
+            self.wants
+        }
+        fn claimable(&self, outpoint: OutPoint) {
+            self.hints.lock().unwrap().push(outpoint);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_claimable_hint_fires_once_at_depth_and_never_without_asking() {
+        for wants in [true, false] {
+            let secp = Secp256k1::new();
+            let (claim_sk, claim_pk) = random_keypair(&secp);
+            let (refund_sk, refund_pk) = random_keypair(&secp);
+            let preimage = generate_preimage();
+            let ph = payment_hash(&preimage);
+            let ln = MockLn::new(InvoiceState::Accepted);
+            let swap = init_reverse_swap(
+                &ln,
+                &claim_pk,
+                refund_sk,
+                &refund_pk,
+                ph,
+                AMOUNT,
+                1000,
+                5,
+                TIMEOUT,
+                3600,
+                Network::Regtest,
+                params(),
+            )
+            .await
+            .unwrap();
+            let outpoint = funding_outpoint();
+            let claim_tx = build_claim_tx(
+                outpoint,
+                AMOUNT,
+                &swap.htlc_script,
+                dest(),
+                1000,
+                preimage,
+                &claim_sk,
+            )
+            .unwrap();
+            // The funding climbs to the required two confirmations; the last entry then buries the
+            // owner's claim.
+            let chain = MockChain::new()
+                .with_tip(MOCK_TIP)
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 0,
+                })
+                .with_confirmations(vec![None, Some(1), Some(2), Some(1_000)]);
+            let wallet = MockWallet {
+                funding_outpoint: outpoint,
+                refund_spk: dest(),
+            };
+            let sink = HintSink {
+                wants,
+                hints: Mutex::new(Vec::new()),
+            };
+            let resume = Resume::default();
+            let driver = drive_reverse_swap(
+                &ln,
+                &chain,
+                &wallet,
+                &swap,
+                2,
+                Duration::from_millis(1),
+                &resume,
+                &sink,
+            );
+            // The owner claims once it has heard, or straight away when it asked for nothing.
+            let owner = async {
+                while wants && sink.hints.lock().unwrap().is_empty() {
+                    sleep(Duration::from_millis(1)).await;
+                }
+                chain.set_spend(Some(claim_tx.clone()));
+            };
+            let (state, ()) = tokio::join!(driver, owner);
+            assert_eq!(state.unwrap(), SwapState::Claimed);
+            let hints = sink.hints.lock().unwrap().clone();
+            if wants {
+                assert_eq!(hints, vec![outpoint]);
+            } else {
+                assert!(hints.is_empty());
+            }
         }
     }
 
