@@ -80,6 +80,58 @@ The local read/poll fixture and cold/warm iroh measurements are recorded in
 the final PR head before merge; use the tracker links to verify that result before downstream
 integration. Local fixtures alone do not demonstrate complete funded swap or mobile behavior.
 
+## Pubky dependency pins
+
+The target is the tree paykit-rs [`01de5dd`](https://github.com/pubky/paykit-rs/tree/01de5dd)
+builds on: pubky 0.16.2, pkarr 8.1.0 and pubky-noise 0.1.0. Sharing it lets the provider link
+paykit-rs ([issue 100](https://github.com/coreyphillips/pubky-swap/issues/100)).
+
+| Dependency | Pin | Pulls | Used for |
+| --- | --- | --- | --- |
+| `pubky-session` (`pubky`, iroh feature) | `=0.16.2` | pkarr 8.1.0, pubky-common 0.16.2 | delegated grant sessions in `session_rpc` |
+| pubky-messenger | rev `4fff0ce` | pubky 0.4.2, pkarr 3.10.0, pubky-common 0.3.1 | DMs |
+| `pkarr` (workspace) | `3.10` | | keys shared with the messenger |
+| `pubky-common` (workspace) | `0.3` | | recovery-file decryption for the iroh identity |
+| `pubky-testnet`, `pubky-homeserver` (dev) | `0.1.2` | pubky 0.4.2 | local homeserver tests |
+
+The session side is on 0.16.2, so pubky 0.11.0 and pkarr 8.0.1 are gone. The lockfile still
+holds pubky 0.4.2 and pkarr 3.10.0 until the messenger moves. The remaining steps are:
+
+1. Publish a messenger revision on pubky 0.16.2.
+2. Pin it here, with workspace `pkarr` 8.1 and `pubky-common` 0.16.2. With those three alone,
+   `cargo tree -d` shows no second pubky, pubky-common or pkarr.
+3. Replace the 0.1.2 homeserver test dependencies. `pubky-testnet` 0.16.2 does not resolve in
+   this workspace: its `http-relay` 0.7 needs rusqlite 0.32, and bdk_wallet 3.1 (through
+   bdk_chain 0.23) holds swap-common on rusqlite 0.31. Both link `sqlite3`, and Cargo allows
+   one. Either bdk moves to a rusqlite that matches, or the local homeserver tests move out of
+   this workspace. That testnet also needs Postgres, through `TEST_PUBKY_CONNECTION_STRING`
+   or its `docker-postgres` feature, which is what paykit-rs uses.
+
+API changes to expect on 0.16:
+
+- Session auth: `PubkySession::import_grant_secret` still reads the
+  `pubky-grant-credential-v1` tokens that 0.11 exports. It also reads v2 tokens, which carry a
+  signed approval. `session_account_hint` reads both. A provider still on 0.11 rejects v2, so
+  upgrade providers before wallets start exporting it. pkarr's `ClientBuilder::request_timeout`
+  is deprecated; set `dht_request_timeout` and `relay_request_timeout` separately.
+- Key types: unlike the 0.4 line the messenger uses, pubky and pubky-common 0.16 wrap pkarr's
+  keys in their own `Keypair` and `PublicKey`. That `PublicKey` displays as `pubky<z32>`,
+  where pkarr's displays as the bare z32. Use
+  `.z32()` anywhere a key becomes a storage path, hostname, peer id or authorization field,
+  or DM paths, peer ids and swap authorizations change shape. Convert with `From` in either
+  direction or `into_inner()`.
+- DMs: `pubky_common::crypto::{encrypt, decrypt}` and the recovery-file format are byte for
+  byte unchanged, so stored messages and recovery files still open. `pubky::Client` is gone;
+  the messenger has to move to `PubkyHttpClient` and the signer and session types, and
+  `with_client` takes a `PubkyHttpClient`. A 0.16 homeserver finds the storage owner only from
+  a bare-key Host or a `pubky-host` header, so the messenger's own reads and deletes must send
+  `pubky-host`. Sign-in is grant based; the cookie `AuthToken` flow DMs use is deprecated but
+  still served.
+- iroh identity binding: the secret bytes are unchanged. pubky-common's `Keypair` uses
+  `from_secret` and `secret()` where pkarr's uses `from_secret_key` and `secret_key()`.
+  pkarr's own `Keypair` API is the same in 3.10 and 8.1, so `identity_from_secret` and the
+  iroh key derivation only change if they switch to the wrapper.
+
 ## 1. Update pubky-swap-boltz
 
 Repository: `/Users/coreyphillips/Documents/testing/pubky-swap-boltz`.
