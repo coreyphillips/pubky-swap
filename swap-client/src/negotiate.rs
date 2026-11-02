@@ -1177,6 +1177,7 @@ mod tests {
                             created_at_unix: 0,
                             payment_hash_hex: String::new(),
                             owner_ref: None,
+                            claimable: false,
                         }),
                         None => coded(RejectCode::NotFound, query.request_id, "unknown swap"),
                     }
@@ -1233,6 +1234,7 @@ mod tests {
                             created_at_unix: 0,
                             payment_hash_hex: String::new(),
                             owner_ref: None,
+                            claimable: false,
                         })
                         .collect::<Vec<_>>();
                     let next_cursor = (start + snapshots.len() < accepts.len())

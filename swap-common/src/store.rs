@@ -159,6 +159,13 @@ pub struct SwapRecord {
     /// Our own claim or refund, once broadcast. The most recent one, for the operator.
     #[serde(default)]
     pub spend_txid_hex: Option<String>,
+    /// Reverse, provider side: the owner listed `claimable-hint-v1` when it asked for its quote,
+    /// so it is told when the lockup reaches depth. Nothing else changes for an owner without it.
+    #[serde(default)]
+    pub claimable_hint: bool,
+    /// When the lockup reached `required_confirmations`, for a swap with `claimable_hint`.
+    #[serde(default)]
+    pub claimable_at_unix: Option<u64>,
     /// Every claim or refund we have put on the wire for this swap, oldest first.
     ///
     /// One txid is not enough. A fee bump is a *different* transaction, so a run that bumped
@@ -265,6 +272,7 @@ impl SwapRecord {
                 .swap_request
                 .as_ref()
                 .and_then(|request| request.owner_ref.clone()),
+            claimable: self.claimable_hint && self.claimable_at_unix.is_some(),
         })
     }
 }
@@ -394,6 +402,8 @@ impl SwapRecord {
             invoice_pay_started_at_unix: None,
             claim_observed_txid_hex: None,
             spend_txid_hex: None,
+            claimable_hint: false,
+            claimable_at_unix: None,
             our_spend_txids: Vec::new(),
             reorg_seen_at_height: None,
             preimage_hex: None,

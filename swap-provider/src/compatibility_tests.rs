@@ -690,6 +690,7 @@ mod direct_requests {
             // Nothing new may start: every reply below comes from what is already persisted.
             capable: false,
             homeserver: true,
+            wake: Arc::new(crate::wake::Waker::new(&[])),
             cap: Arc::new(crate::cap_adapter::CapState::ephemeral()),
         }
     }
@@ -1031,6 +1032,39 @@ mod direct_requests {
         let request = record.swap_request.clone().unwrap();
         let reply = ask(&ctx, &key, SwapMessage::SwapRequest(request)).await;
         assert!(matches!(reply, Some(SwapMessage::Reject(_))), "{reply:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wake_capability_is_taken_over_a_direct_request() {
+        let directory = std::env::temp_dir().join(format!("direct-wake-{}", Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[44; 32]);
+        let mut record = owned_record(&owner);
+        record.claimable_hint = true;
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        store.put(&record).unwrap();
+        let ctx = ExecCtx {
+            wake: Arc::new(crate::wake::Waker::new(&["https://wake.example".into()])),
+            ..context(store, record.swap_id)
+        };
+
+        let offer = SwapWakeCapability {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: record.swap_id,
+            capability: WakeCapability {
+                v: 1,
+                gateway: "https://wake.example".into(),
+                topics: vec![swap_common::messages::SWAP_WAKE_TOPIC.into()],
+                token: "wkg_direct".into(),
+                expires_at: u64::MAX,
+            },
+        };
+        let reply = ask(&ctx, &owner, SwapMessage::SwapWakeCapability(offer)).await;
+        assert!(
+            matches!(&reply, Some(SwapMessage::SwapStatusSnapshot(s)) if !s.claimable),
+            "{reply:?}"
+        );
+        assert!(ctx.wake.holds(record.swap_id));
         std::fs::remove_dir_all(directory).unwrap();
     }
 

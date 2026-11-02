@@ -109,6 +109,16 @@ pub(crate) fn final_update(record: &SwapRecord) -> SwapMessage {
     })
 }
 
+/// The claimable hint: the one non-terminal update a provider sends, and only to an owner that
+/// asked for `claimable-hint-v1`. The reference is the funding outpoint as `txid:vout`.
+pub(crate) fn claimable_update(record: &SwapRecord, outpoint: bitcoin::OutPoint) -> SwapMessage {
+    SwapMessage::SwapStatusUpdate(SwapStatusUpdate {
+        swap_id: record.swap_id,
+        state: SwapState::LockupConfirmed,
+        reference: Some(outpoint.to_string()),
+    })
+}
+
 /// The transaction that evidences a provider record's terminal outcome, when it names one.
 fn settlement_reference(record: &SwapRecord) -> Option<String> {
     match (&record.state, record.direction) {

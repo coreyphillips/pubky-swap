@@ -924,6 +924,7 @@ mod tests {
             created_at_unix: 1,
             payment_hash_hex: "11".repeat(32),
             owner_ref: None,
+            claimable: false,
         };
         let status = |contract| {
             CapMessage::Status(Box::new(Status {
