@@ -19,6 +19,7 @@ pub mod htlc;
 pub mod keys;
 pub mod messages;
 pub mod onchain;
+pub mod paykit_cap;
 pub mod reorg;
 pub mod store;
 pub mod swap;

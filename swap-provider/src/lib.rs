@@ -19,6 +19,7 @@ compile_error!(
 );
 
 pub mod access;
+mod cap_adapter;
 mod delivery;
 mod dispatch;
 #[cfg(feature = "paykit")]
@@ -603,6 +604,9 @@ struct ExecCtx {
     homeserver: bool,
     /// Owners' wake capabilities, and the gateways they may name.
     wake: Arc<wake::Waker>,
+    /// Signs the `paykit-cap.*` replies and remembers the terms it signed.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    cap: Arc<cap_adapter::CapState>,
 }
 
 /// Per-swap exclusion over the step that turns a persisted admission into a running driver.
@@ -1288,6 +1292,7 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
             wake::Waker::new(&config.wake_gateways)
                 .persisted_at(std::path::Path::new(&config.data_dir).join("wake-grants.json")),
         ),
+        cap: Arc::new(cap_signer(&identity)?),
     };
     // The daemon has worked out what it can do; tell anything watching.
     ready.store(capable, std::sync::atomic::Ordering::Relaxed);
@@ -3577,6 +3582,9 @@ async fn handle_direct_request(
     offer: SharedOffer,
     request: pubky_transport::p2p::DirectRpc,
 ) {
+    if swap_common::paykit_cap::is_cap_message(&request.message) {
+        return cap_adapter::handle_cap_request(ctx, offer, request).await;
+    }
     let Some(message) = customer_request(request.message) else {
         return;
     };
@@ -3588,6 +3596,26 @@ async fn handle_direct_request(
     {
         warn!("could not handle direct swap request");
     }
+}
+
+/// The `paykit-cap.*` signer. For now it is the provider's root key, the one a client dials;
+/// whether it becomes a delegated subkey waits on pubky/paykit-rs#229.
+#[cfg(feature = "iroh")]
+fn cap_signer(identity: &swap_config::Identity) -> Result<cap_adapter::CapState> {
+    let secret = pubky_transport::identity::secret_from_recovery(
+        identity.method,
+        &identity.value,
+        &identity.passphrase,
+    )?;
+    Ok(cap_adapter::CapState::new(Arc::new(
+        swap_common::paykit_cap::Ed25519Signer::from_secret(&secret),
+    )))
+}
+
+/// Without iroh nothing carries the kinds, so nothing is signed.
+#[cfg(not(feature = "iroh"))]
+fn cap_signer(_: &swap_config::Identity) -> Result<cap_adapter::CapState> {
+    Ok(cap_adapter::CapState::ephemeral())
 }
 
 /// Only customer requests are accepted over the request/reply protocols.

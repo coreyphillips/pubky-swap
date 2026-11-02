@@ -691,6 +691,7 @@ mod direct_requests {
             capable: false,
             homeserver: true,
             wake: Arc::new(crate::wake::Waker::new(&[])),
+            cap: Arc::new(crate::cap_adapter::CapState::ephemeral()),
         }
     }
 
@@ -879,6 +880,131 @@ mod direct_requests {
         );
         let reply = ask(&ctx, &stranger, SwapMessage::SwapRequest(request)).await;
         assert!(matches!(reply, Some(SwapMessage::Reject(_))), "{reply:?}");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// One `paykit-cap.*` request over the direct protocol, and its raw reply.
+    async fn ask_cap(
+        ctx: &ExecCtx,
+        remote_key: &str,
+        message: &swap_common::paykit_cap::CapMessage,
+    ) -> Vec<u8> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = DirectRpc {
+            remote_key: remote_key.into(),
+            message: serde_json::to_value(message).unwrap(),
+            reply,
+        };
+        handle_direct_request(ctx.clone(), offer(), request).await;
+        answer.await.unwrap()
+    }
+
+    /// #102: a replayed commit gets the contract first signed, byte for byte, across a restart,
+    /// and `status_request` returns the same stored contract.
+    #[tokio::test]
+    async fn a_replayed_commit_gets_the_stored_signed_contract_after_restart() {
+        use swap_common::paykit_cap::*;
+        let directory = std::env::temp_dir().join(format!("cap-replay-{}", Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[41; 32]);
+        let record = owned_record(&owner);
+        let request = record.swap_request.clone().unwrap();
+        JsonFileSwapStore::new(&directory)
+            .unwrap()
+            .put(&record)
+            .unwrap();
+        let signer = Arc::new(Ed25519Signer::from_secret(&[40; 32]));
+        let provider = |store| ExecCtx {
+            cap: Arc::new(crate::cap_adapter::CapState::new(signer.clone())),
+            ..context(store, record.swap_id)
+        };
+        let commit = CapMessage::Commit(Commit {
+            terms_hash: "ab".repeat(32),
+            commit: CommitBody::from_request(&request),
+        });
+
+        let ctx = provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let first = ask_cap(&ctx, &owner, &commit).await;
+        let CapMessage::Contract(contract) = serde_json::from_slice(&first).unwrap() else {
+            panic!("expected a contract: {}", String::from_utf8_lossy(&first));
+        };
+        contract.signed.verify().unwrap();
+        assert_eq!(
+            contract.open().unwrap(),
+            record.swap_accept.clone().unwrap()
+        );
+        assert_eq!(ask_cap(&ctx, &owner, &commit).await, first);
+        // The driver writes whole records from a snapshot taken before the contract was signed.
+        ctx.store.put(&record).unwrap();
+
+        // A restarted provider: a fresh store handle and no terms in memory.
+        let ctx = provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let stored = ctx.store.get(record.swap_id).unwrap().unwrap().cap_contract;
+        assert_eq!(stored.as_ref(), Some(&contract));
+        assert_eq!(ask_cap(&ctx, &owner, &commit).await, first);
+
+        let status = CapMessage::StatusRequest(SwapStatusRequest {
+            request_id: Some(Uuid::new_v4()),
+            swap_id: None,
+            quote_id: Some(request.quote_id),
+        });
+        let reply = ask_cap(&ctx, &owner, &status).await;
+        let CapMessage::Status(status) = serde_json::from_slice(&reply).unwrap() else {
+            panic!("expected a status: {}", String::from_utf8_lossy(&reply));
+        };
+        assert_eq!(status.contract.as_ref(), Some(&contract));
+        assert_eq!(status.state, "created");
+        assert_eq!(status.snapshot.unwrap().accept.invoice, None);
+
+        // The sender is the owner, whatever the body says: a stranger replaying the same commit
+        // gets nothing signed.
+        let stranger = pubky_transport::identity_from_secret(&[42; 32]);
+        let reply = ask_cap(&ctx, &stranger, &commit).await;
+        assert!(matches!(
+            serde_json::from_slice(&reply).unwrap(),
+            CapMessage::Refusal(_)
+        ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// An rfq gets a quote signed over the rfq it answered, and a commit naming other terms for
+    /// that quote is refused before the engine sees it.
+    #[tokio::test]
+    async fn an_rfq_gets_a_signed_quote_and_a_commit_must_name_its_terms() {
+        use swap_common::paykit_cap::*;
+        let directory = std::env::temp_dir().join(format!("cap-quote-{}", Uuid::new_v4()));
+        let store = Arc::new(JsonFileSwapStore::new(&directory).unwrap());
+        let ctx = executing(context(store, Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[41; 32]);
+        let constraints = RfqConstraints {
+            offer_id: Uuid::nil(),
+            direction: SwapDirection::Reverse,
+            amount_sat: 100_000,
+        };
+        let rfq = CapMessage::Rfq(Rfq {
+            request_id: Some(Uuid::new_v4()),
+            constraints: constraints.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            features: Vec::new(),
+        });
+        let reply = ask_cap(&ctx, &owner, &rfq).await;
+        let CapMessage::Quote(signed) = serde_json::from_slice(&reply).unwrap() else {
+            panic!("expected a quote: {}", String::from_utf8_lossy(&reply));
+        };
+        signed.verify(&constraints).unwrap();
+
+        let mut request = owned_record(&owner).swap_request.unwrap();
+        request.quote_id = signed.quote.quote_id;
+        let commit = CapMessage::Commit(Commit {
+            terms_hash: "00".repeat(32),
+            commit: CommitBody::from_request(&request),
+        });
+        let reply = ask_cap(&ctx, &owner, &commit).await;
+        assert!(
+            matches!(serde_json::from_slice(&reply).unwrap(), CapMessage::Refusal(r)
+                if r.code == "invalid_request" && r.quote_id == Some(request.quote_id)),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1207,6 +1333,7 @@ mod direct_requests {
         let ctx = ExecCtx {
             ln: Arc::new(OpenInvoiceLightning),
             homeserver: false,
+            cap: Arc::new(crate::cap_adapter::CapState::ephemeral()),
             ..executing(context(store.clone(), Uuid::new_v4()))
         };
         let advertised = build_offer(
