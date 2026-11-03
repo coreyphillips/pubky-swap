@@ -470,4 +470,48 @@ mod tests {
         }
         let _ = waker;
     }
+
+    /// The one wake this provider sends, against a real gateway: the dev stack of
+    /// synonymdev/wake, with a grant a simulated phone created for `swap.claimable`. The phone
+    /// then holds exactly one `swap.claimable` push. Run it with:
+    ///
+    /// ```text
+    /// # in a wake checkout
+    /// docker compose -f docker/compose.yml --profile dev up -d --build --wait
+    /// cargo build -q -p wake-cli
+    /// ./target/debug/wake sim init --state target/phone.json --force --platform apns \
+    ///   --ln-secret "$(printf '33%.0s' {1..32})" --pk-seed "$(printf '44%.0s' {1..32})"
+    /// ./target/debug/wake sim register --state target/phone.json \
+    ///   --gateway http://127.0.0.1:9010 --topics swap.claimable
+    /// TOKEN=$(./target/debug/wake sim grant create --state target/phone.json \
+    ///   --topics swap.claimable | jq -r .token)
+    /// # in pubky-swap
+    /// WAKE_GATEWAY_URL=http://127.0.0.1:9010 WAKE_GRANT_TOKEN=$TOKEN cargo test -p swap-provider \
+    ///   --lib wake::tests::a_live_gateway_takes_the_claim_wake -- --ignored
+    /// # back in wake: one swap.claimable push, then tear down
+    /// ./target/debug/wake sim inbox --state target/phone.json --fake http://127.0.0.1:9100
+    /// docker compose -f docker/compose.yml --profile dev down -v
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a running wake gateway and a swap.claimable grant token"]
+    async fn a_live_gateway_takes_the_claim_wake() {
+        let gateway = std::env::var("WAKE_GATEWAY_URL").expect("WAKE_GATEWAY_URL");
+        let token = std::env::var("WAKE_GRANT_TOKEN").expect("WAKE_GRANT_TOKEN");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let waker = Waker::allowing_http(std::slice::from_ref(&gateway));
+        let swap_id = Uuid::new_v4();
+        let capability = WakeCapability {
+            v: 1,
+            gateway,
+            topics: vec![SWAP_WAKE_TOPIC.into()],
+            token,
+            expires_at: now + 3600,
+        };
+        waker.hold(swap_id, capability, now).unwrap();
+        let taken = waker.take(swap_id).unwrap();
+        assert_eq!(waker.wake(&taken, now).await, WakeOutcome::Accepted);
+    }
 }
