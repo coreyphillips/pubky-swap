@@ -279,6 +279,10 @@ struct QuoteBook {
     /// Issuance order, oldest first. Ids already redeemed or pruned stay here until skipped or
     /// compacted away.
     order: VecDeque<Uuid>,
+    /// Quotes redeemed in this run, until they expire. Their admission ran or is still running,
+    /// so a signed copy is never taken back for them (#103). Each is a commit that passed
+    /// [`take_valid_quote`] for its own sender, and it leaves when its quote expires.
+    redeemed: HashMap<Uuid, u64>,
 }
 
 impl QuoteBook {
@@ -286,6 +290,27 @@ impl QuoteBook {
     fn prune(&mut self, now: u64) {
         self.quotes
             .retain(|_, q| q.expires_at_unix == 0 || now < q.expires_at_unix);
+        self.redeemed
+            .retain(|_, expires_at| *expires_at == 0 || now < *expires_at);
+    }
+
+    // Only the `paykit-cap` adapter takes quotes back, and only `direct/1` carries it.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    fn holds(&self, quote_id: Uuid) -> bool {
+        self.quotes.contains_key(&quote_id)
+    }
+
+    /// Take back a quote this provider signed and no longer holds: after a restart, or after a
+    /// full book evicted it (#103). Refused, returning false, for one still held or already
+    /// redeemed in this run.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    fn restore(&mut self, quote_id: Uuid, quote: IssuedQuote, now: u64) -> bool {
+        self.prune(now);
+        if self.quotes.contains_key(&quote_id) || self.redeemed.contains_key(&quote_id) {
+            return false;
+        }
+        self.insert(quote_id, quote, now);
+        true
     }
 
     fn insert(&mut self, quote_id: Uuid, quote: IssuedQuote, now: u64) {
@@ -344,7 +369,20 @@ async fn take_valid_quote(
         )
         .into());
     }
-    Ok(entry.remove())
+    let quote = entry.remove();
+    book.redeemed.insert(quote_id, quote.expires_at_unix);
+    Ok(quote)
+}
+
+/// The swap created from `quote_id`, if any. A scan of every record, which only a status query
+/// by quote and a signed quote the book no longer holds pay for.
+fn swap_for_quote(store: &dyn SwapStore, quote_id: Uuid) -> Result<Option<SwapRecord>> {
+    Ok(store.load_all_checked()?.into_iter().find(|record| {
+        record
+            .swap_request
+            .as_ref()
+            .is_some_and(|original| original.quote_id == quote_id)
+    }))
 }
 
 /// Refuse a request whose self-declared `client_pkarr` is not the pubky it arrived from.
@@ -568,6 +606,24 @@ struct IssuedQuote {
     expires_at_unix: u64,
     /// A reverse quote whose owner listed `claimable-hint-v1`.
     claimable_hint: bool,
+}
+
+impl IssuedQuote {
+    /// The entry for a quote this provider signed and has since forgotten (#103): the same
+    /// numbers the quote states, for the sender its signed terms name.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    fn signed(peer: &str, quote: &Quote, claimable_hint: bool) -> Self {
+        Self {
+            peer: peer.to_string(),
+            direction: quote.direction,
+            amount_sat: quote.amount_sat,
+            fee_sat: quote.fee_sat,
+            service_fee_sat: quote.service_fee_sat,
+            onchain_fee_sat: quote.onchain_fee_sat,
+            expires_at_unix: quote.valid_until_unix,
+            claimable_hint,
+        }
+    }
 }
 
 /// The advertised offer, which does not exist for the first moments of a run.
@@ -2356,12 +2412,7 @@ fn status_snapshot(
 ) -> Result<SwapStatusSnapshot> {
     let record = match (request.swap_id, request.quote_id) {
         (Some(swap_id), None) => store.get(swap_id)?,
-        (None, Some(quote_id)) => store.load_all_checked()?.into_iter().find(|record| {
-            record
-                .swap_request
-                .as_ref()
-                .is_some_and(|original| original.quote_id == quote_id)
-        }),
+        (None, Some(quote_id)) => swap_for_quote(store, quote_id)?,
         _ => {
             return Err(Refusal::new(
                 RejectCode::InvalidRequest,
@@ -3609,9 +3660,10 @@ fn cap_signer(identity: &swap_config::Identity) -> Result<cap_adapter::CapState>
         &identity.value,
         &identity.passphrase,
     )?;
-    Ok(cap_adapter::CapState::new(Arc::new(
-        swap_common::paykit_cap::Ed25519Signer::from_secret(&secret),
-    )))
+    Ok(cap_adapter::CapState::new(
+        Arc::new(swap_common::paykit_cap::Ed25519Signer::from_secret(&secret)),
+        pubky_transport::identity_from_secret(&secret),
+    ))
 }
 
 /// Without iroh nothing carries the kinds, so nothing is signed.
@@ -4102,6 +4154,32 @@ mod tests {
             now_unix(),
         );
         (quotes, id)
+    }
+
+    /// #103: a quote redeemed in this run is never taken back from a signed copy, so a second
+    /// commit cannot start another admission while the first is still running.
+    #[tokio::test]
+    async fn the_book_takes_back_only_quotes_it_never_redeemed() {
+        let quotes = Mutex::new(QuoteBook::default());
+        let id = Uuid::new_v4();
+        let expires_at = now_unix().saturating_add(300);
+        let quote = || issued("peer-a", SwapDirection::Reverse, expires_at);
+        assert!(quotes.lock().await.restore(id, quote(), now_unix()));
+        assert!(
+            !quotes.lock().await.restore(id, quote(), now_unix()),
+            "a quote still held is not taken back again"
+        );
+        take_valid_quote(&quotes, id, "peer-a", SwapDirection::Reverse)
+            .await
+            .unwrap();
+        assert!(
+            !quotes.lock().await.restore(id, quote(), now_unix()),
+            "a quote redeemed in this run is not taken back"
+        );
+        // Once the quote has expired, so has the record that it was redeemed.
+        let mut book = quotes.lock().await;
+        book.prune(expires_at);
+        assert!(book.redeemed.is_empty());
     }
 
     /// A quote id used to be a bearer token: whoever held it could spend it, on their own

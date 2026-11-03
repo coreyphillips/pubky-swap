@@ -205,10 +205,18 @@ pub struct CapChannel {
 impl CapChannel {
     pub async fn new(secret: [u8; 32], provider: &str) -> Result<Self> {
         let signer = *pubky_transport::p2p::pubky_to_endpoint_id(provider)?.as_bytes();
+        // Signed quotes name both keys, so one issued to anyone else does not verify here.
+        let parties = swap_common::paykit_cap::Parties {
+            owner: pubky_transport::identity_from_secret(&secret),
+            provider: pubky_transport::canonical_pubky(provider)?,
+        };
         let client = pubky_transport::p2p::DirectRpcClient::new(secret, provider).await?;
         Ok(Self {
             client,
-            cap: Mutex::new(swap_common::paykit_cap::CapClient::new(Some(signer))),
+            cap: Mutex::new(swap_common::paykit_cap::CapClient::new(
+                Some(signer),
+                parties,
+            )),
         })
     }
 }
@@ -1032,6 +1040,8 @@ fn rejection(reply: SwapMessage) -> Error {
 /// The channel tried before any fallback: plain kinds or the `paykit-cap.*` kinds, both over
 /// iroh `direct/1`.
 #[cfg(feature = "iroh")]
+// One per negotiator, so the larger variant's size costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 pub enum Preferred {
     Iroh(IrohChannel),
     Cap(CapChannel),

@@ -3,8 +3,10 @@
 //! Unlike the other regtest suites, which call the engines directly, this one runs the provider
 //! daemon (`swap_provider::run`, iroh only, no homeserver) and negotiates with it the way the CLI
 //! does with `--negotiation paykit-cap`: quotes and contracts come back signed and are checked
-//! against the provider's key before anything is paid. Each test ends by verifying the signed
-//! contract the provider stored, as a third party would.
+//! against the provider's key before anything is paid. One reverse swap has its provider restart
+//! between the quote and the commit (#103), so the commit is honoured on the signed quote it
+//! carries. Each test ends by verifying the signed contract the provider stored, as a third party
+//! would.
 //!
 //! The client finds the provider by its key through iroh's n0 discovery, so this needs network
 //! access besides the regtest backplane. `#[ignore]`d; run with the same environment as
@@ -301,62 +303,70 @@ fn quote_request(client: &str, direction: SwapDirection) -> QuoteRequest {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires two LND nodes with a channel + bitcoind + electrs, and n0 discovery"]
-async fn cap_reverse_swap_two_nodes() {
-    init_tracing();
-    // Keys of their own, so a daemon from another test never answers for this one.
-    let provider_phrase =
-        "legal winner thank year wave sausage worth useful legal winner thank yellow";
-    let client_phrase =
-        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
-    let provider = pubky_of(provider_phrase);
-    let data_dir = temp_dir("reverse-provider");
-    let daemon = start_provider(provider_phrase, &data_dir);
-    let (negotiator, client) = negotiator_when_ready(client_phrase, &provider, &daemon).await;
+/// The owner's keys for one reverse swap.
+struct ReverseKeys {
+    claim_sk: bitcoin::secp256k1::SecretKey,
+    claim_pk: PublicKey,
+    preimage: [u8; 32],
+    payment_hash: [u8; 32],
+}
 
-    // Signed quote, then signed contract: `CapChannel` checks both against the provider's key.
-    let quote = negotiator
-        .quote(&quote_request(&client, SwapDirection::Reverse))
-        .await
-        .expect("signed quote");
+fn reverse_keys() -> ReverseKeys {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let (claim_sk, claim_pk) = random_keypair(&secp);
     let preimage = generate_preimage();
-    let ph = payment_hash(&preimage);
-    let accept = negotiator
-        .create(&SwapRequest {
-            script_type: SwapScript::P2wsh,
-            quote_id: quote.quote_id,
-            client_pkarr: client.clone(),
-            direction: SwapDirection::Reverse,
-            payment_hash_hex: hex::encode(ph),
-            client_claim_pubkey_hex: Some(hex::encode(claim_pk.to_bytes())),
-            client_refund_pubkey_hex: None,
-            invoice: None,
-            owner_ref: None,
-        })
-        .await
-        .expect("signed contract");
-    negotiator.close().await;
+    ReverseKeys {
+        claim_sk,
+        claim_pk,
+        preimage,
+        payment_hash: payment_hash(&preimage),
+    }
+}
 
+fn reverse_request(client: &str, quote_id: Uuid, keys: &ReverseKeys) -> SwapRequest {
+    SwapRequest {
+        script_type: SwapScript::P2wsh,
+        quote_id,
+        client_pkarr: client.to_string(),
+        direction: SwapDirection::Reverse,
+        payment_hash_hex: hex::encode(keys.payment_hash),
+        client_claim_pubkey_hex: Some(hex::encode(keys.claim_pk.to_bytes())),
+        client_refund_pubkey_hex: None,
+        invoice: None,
+        owner_ref: None,
+    }
+}
+
+/// Pay the hold invoice from LND B and claim, then check what the provider did: claimed, settled
+/// its hold invoice, and stored the contract a third party can verify.
+async fn finish_reverse(
+    accept: &SwapAccept,
+    keys: ReverseKeys,
+    data_dir: &std::path::Path,
+    provider: &str,
+) {
     let htlc_spk = verify_contract(
-        &accept,
+        accept,
         SwapDirection::Reverse,
-        &ph,
-        &claim_pk,
+        &keys.payment_hash,
+        &keys.claim_pk,
         Network::Regtest,
     )
     .expect("the contract pays our claim key under our payment hash");
     let provider_pk: PublicKey = accept.provider_pubkey_hex.parse().unwrap();
     let claim = ReverseClaim {
-        htlc_script: build_htlc_script(&ph, &claim_pk, &provider_pk, accept.timeout_block_height),
+        htlc_script: build_htlc_script(
+            &keys.payment_hash,
+            &keys.claim_pk,
+            &provider_pk,
+            accept.timeout_block_height,
+        ),
         htlc_spk,
         onchain_amount_sat: accept.onchain_amount_sat,
         timeout_height: accept.timeout_block_height,
         invoice: accept.invoice.clone().expect("the hold invoice, unsealed"),
-        preimage,
-        claim_key: claim_sk,
+        preimage: keys.preimage,
+        claim_key: keys.claim_sk,
         dest_spk: spk_of(&cli(&["getnewaddress", "", "bech32"])),
         fee_rate_sat_vb: 2,
     };
@@ -383,7 +393,7 @@ async fn cap_reverse_swap_two_nodes() {
     let record = match claimed {
         Ok(Ok(txid)) => {
             println!("client claim {txid}");
-            provider_record(&data_dir, accept.swap_id, SwapState::Claimed).await
+            provider_record(data_dir, accept.swap_id, SwapState::Claimed).await
         }
         Ok(Err(error)) => panic!("client execution failed: {error:#}"),
         Err(_) => panic!("client execution timed out"),
@@ -395,13 +405,88 @@ async fn cap_reverse_swap_two_nodes() {
         .await
         .expect("provider LND");
     assert_eq!(
-        provider_ln.invoice_state(ph).await.expect("invoice state"),
+        provider_ln
+            .invoice_state(keys.payment_hash)
+            .await
+            .expect("invoice state"),
         InvoiceState::Settled,
         "the provider settled its hold invoice with the revealed preimage"
     );
-    assert_signed_contract(&record, &accept, &provider);
+    assert_signed_contract(&record, accept, provider);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires two LND nodes with a channel + bitcoind + electrs, and n0 discovery"]
+async fn cap_reverse_swap_two_nodes() {
+    init_tracing();
+    // Keys of their own, so a daemon from another test never answers for this one.
+    let provider_phrase =
+        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    let client_phrase =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
+    let provider = pubky_of(provider_phrase);
+    let data_dir = temp_dir("reverse-provider");
+    let daemon = start_provider(provider_phrase, &data_dir);
+    let (negotiator, client) = negotiator_when_ready(client_phrase, &provider, &daemon).await;
+
+    // Signed quote, then signed contract: `CapChannel` checks both against the provider's key.
+    let quote = negotiator
+        .quote(&quote_request(&client, SwapDirection::Reverse))
+        .await
+        .expect("signed quote");
+    let keys = reverse_keys();
+    let accept = negotiator
+        .create(&reverse_request(&client, quote.quote_id, &keys))
+        .await
+        .expect("signed contract");
+    negotiator.close().await;
+
+    finish_reverse(&accept, keys, &data_dir, &provider).await;
     drop(daemon);
     println!("paykit-cap reverse swap: claimed, invoice settled, signed contract verified");
+}
+
+/// #103: the provider restarts between the quote and the commit. Its quote book is empty after
+/// the restart, and the commit is honoured on the signed quote it carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires two LND nodes with a channel + bitcoind + electrs, and n0 discovery"]
+async fn cap_reverse_swap_survives_a_provider_restart() {
+    init_tracing();
+    let provider_phrase =
+        "scheme spot photo card baby mountain device kick cradle pact join borrow";
+    let client_phrase =
+        "cat swing flag economy stadium alone churn speed unique patch report train";
+    let probe_phrase =
+        "vessel ladder alter error federal sibling chat ability sun glass valve picture";
+    let provider = pubky_of(provider_phrase);
+    let data_dir = temp_dir("restart-provider");
+    let daemon = start_provider(provider_phrase, &data_dir);
+    let (negotiator, client) = negotiator_when_ready(client_phrase, &provider, &daemon).await;
+    let quote = negotiator
+        .quote(&quote_request(&client, SwapDirection::Reverse))
+        .await
+        .expect("signed quote");
+    let quoted_at = Instant::now();
+
+    drop(daemon);
+    let daemon = start_provider(provider_phrase, &data_dir);
+    let (probe, _) = negotiator_when_ready(probe_phrase, &provider, &daemon).await;
+    probe.close().await;
+    // The client's pooled connection went with the old process. Once it has been idle past
+    // the pool's 20 s, the next request dials the new one.
+    tokio::time::sleep(Duration::from_secs(21).saturating_sub(quoted_at.elapsed())).await;
+
+    let keys = reverse_keys();
+    let accept = negotiator
+        .create(&reverse_request(&client, quote.quote_id, &keys))
+        .await
+        .expect("the restarted provider honours the signed quote");
+    negotiator.close().await;
+    assert_eq!(accept.quote_id, quote.quote_id);
+
+    finish_reverse(&accept, keys, &data_dir, &provider).await;
+    drop(daemon);
+    println!("paykit-cap reverse swap across a provider restart: claimed, contract verified");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

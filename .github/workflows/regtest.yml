@@ -91,8 +91,9 @@ jobs:
         run: cargo test -p swap-provider --features full --test submarine_swap_regtest -- --ignored --nocapture
 
       # A provider daemon and a client negotiating in the signed paykit-cap kinds over iroh
-      # direct/1 (#102). The only step that needs n0 discovery: the client finds the provider by
-      # its key. One test at a time, because both use LND A, LND B and the funding wallet.
+      # direct/1 (#102), including a provider restart between quote and commit (#103). The only
+      # step that needs n0 discovery: the client finds the provider by its key. One test at a
+      # time, because they all use LND A, LND B and the funding wallet.
       - name: Reverse and submarine swaps in paykit-cap kinds (provider daemon, two LND nodes)
         run: cargo test -p swap-provider --features full --test cap_swap_regtest -- --ignored --nocapture --test-threads=1
 

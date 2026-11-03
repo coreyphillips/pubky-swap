@@ -241,18 +241,33 @@ same swap: ask again, it is not a decline. Every refusal code passes through, so
 `liquidity_unavailable`, `rate_limited` or `access_denied`.
 
 Three hashes chain the agreement. Each is SHA-256 over a domain prefix, then the RFC 8785 (JCS)
-form of a two-member object:
+form of an object:
 
 | Hash | Domain prefix | Object |
 | --- | --- | --- |
-| `terms_hash` | `paykit-cap/swap/1/terms_hash\0` | `{"rfq": {offer_id, direction, amount_sat}, "quote": <quote without request_id>}` |
+| `terms_hash` | `paykit-cap/swap/1/terms_hash\0` | `{"owner": <z32>, "provider": <z32>, "rfq": {offer_id, direction, amount_sat}, "quote": <quote without request_id>}` |
 | `commit_hash` | `paykit-cap/swap/1/commit_hash\0` | `{"terms_hash": <hex>, "commit": <commit body>}` |
 | `contract_hash` | `paykit-cap/swap/1/contract_hash\0` | `{"commit_hash": <hex>, "contract": {"accept": <SwapAccept without invoice>, "invoice_blob_hash": <hex>}}` |
+
+`owner` is the key that authenticated the connection and `provider` is the provider's pubky,
+both bare z32, as Capabilities §10.1 lists both identities. A quote signed for one owner does not
+verify for another.
 
 The provider signs `terms_hash` in the quote and `contract_hash` in the contract, with Ed25519
 over the 32 hash bytes. `signer` is the public key as hex. Today it is the provider's root key,
 the one a client dials; whether a delegated subkey replaces it waits on pubky/paykit-rs#229. A
 commit names the `terms_hash` it accepts, and one that differs from the signed quote is refused.
+
+A commit also carries the signed quote and the rfq it answered, as `quote: {rfq, signed}`.
+`commit_hash` does not cover it, because `terms_hash` already binds it. A provider that no longer
+holds the quote, after a restart or because a full book evicted it, takes it back only if its own
+key signed it, `terms_hash` recomputed with the sender as owner matches both the quote and the
+commit, it has not expired, and the direction matches. Every admission check then runs as usual,
+so a commit on a valid quote can still get `liquidity_unavailable`, `rate_limited` or
+`access_denied`. A quote that a swap already used, or that this run already redeemed, is not
+taken back: an identical replay gets its contract, anything else is refused. `quote` is optional
+on the wire, so a carrier with a size limit can leave it out, at the cost of `quote_expired` after
+a restart.
 
 The reverse hold invoice is not in the contract. It is sealed with ChaCha20-Poly1305 under a
 per-swap key and a zero nonce, and the contract signs SHA-256 of the ciphertext. Over `direct/1`
@@ -268,9 +283,9 @@ Golden vectors, from `swap-common/src/paykit_cap.rs` (`golden_vectors`), for sig
 
 | | Hex |
 | --- | --- |
-| `terms_hash` | `766a45ca9f2aafb59085836d2f8c77153b26eef5461d5c55d18e3ecb495759f6` |
-| `commit_hash` | `a4c7b47b6a9f1e6e2d8bcab2d4046ca0365904972294a032cf5e85898246397f` |
-| `contract_hash` | `e09ffac51ae04cfa914e435282a976cfeb6a82ea5444a102034f4543be6a7a37` |
+| `terms_hash` | `273f025818bb3fdcc84dfd3d26092e66592bdf0705c146ea7f2be4a0e8234161` |
+| `commit_hash` | `dca484d94be41ef37eb4d7eeac3d2b8686a3e0e92e0bfc9e2a370a77ed0ebdc5` |
+| `contract_hash` | `8e52dcc64cdbaaa377d333130d5ab411f14fb21c3962ec28c2e45fe507953974` |
 | `signer` | `ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c` |
 
 The inputs are the fixtures in that test. `swap_client::negotiate::CapChannel` is the client side:
@@ -278,16 +293,19 @@ it sends these kinds and checks each signature against the provider it dialed. T
 uses it with `--negotiation paykit-cap` (`PUBKY_SWAP_NEGOTIATION`, or `negotiation` in the config
 file). It reads the offer first and stops unless the provider advertises `paykit-cap-v1`, and it
 never falls back to DMs. The regtest step `cap_swap_regtest` runs a reverse and a submarine swap
-this way against a provider daemon, and checks the stored contract as a third party would.
+this way against a provider daemon, and a reverse swap whose provider restarts between the quote
+and the commit, and checks each stored contract as a third party would.
 
 What the client checked lives only in `CapChannel`'s memory. A creation recovered by a later
 process (`negotiation_recovery`) is replayed as a plain `SwapRequest` on `direct/1`, which the
 provider answers with the same swap; the signed contract stays with the provider's record, and
 `status_request` returns it.
 
-The rfq, quote and commit fit 1,000 bytes. A signed contract does not yet: with the P2WSH
-script or Taproot tree the provider always sends, it is over. A `status` reply carries the full
-snapshot and contract, and is larger still.
+The rfq, quote and a commit without its signed quote fit 1,000 bytes. A commit carrying the
+signed quote is about 1,350 bytes, and a signed contract is over too: with the P2WSH script or
+Taproot tree the provider always sends, it is 1,048 to 1,208 bytes. A `status` reply carries the
+full snapshot and contract, and is larger still. #119 tracks fitting them into an Encrypted
+Link.
 
 ## Amounts and fees
 
