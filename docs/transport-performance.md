@@ -26,18 +26,16 @@ At 10,000 acknowledged resources, incremental polling used about 28 times less m
 
 ## Fixture and reproduction
 
-The standard pubky-testnet helper gives its homeserver a fixed 10 MiB LMDB map, which is too small for this fixture. The benchmark uses the public pubky-homeserver 0.1.2 builder with its normal virtual map capacity, a newly created private temporary storage directory, local DHT bootstrap, generated identities and local signup tokens. No dependency fork or local source patch is needed.
+Since #118 the fixture runs on pubky 0.16.2: a pubky-testnet 0.16.2 local DHT and a homeserver with open sign-up, whose data lives in Postgres (one Docker container per test binary, or the database `TEST_PUBKY_CONNECTION_STRING` names). Identities are generated for the run. No fixed ports are needed. The measurements below were taken on the earlier pubky 0.4 fixture (an LMDB homeserver from the pubky-homeserver 0.1.2 builder), so a rerun on 0.16.2 is not directly comparable.
 
-Ports 6286 and 6287 must both be unused. The fixture probes both ports and fails before server startup if either is occupied. The upstream builder does not expose port or listen-address setters. Its listeners bind all interfaces and its published address is loopback. Signup tokens and administration credentials belong only to the generated fixture and are not logged. Existing services are neither stopped nor reconfigured.
-
-From the swap repository:
+The tests live in their own workspace, because pubky-testnet 0.16 links sqlite through crates (rusqlite 0.32, sqlx-sqlite) that bdk_wallet's rusqlite 0.31 rules out of the main one. From the swap repository:
 
 ```sh
-cargo test -p pubky-transport --lib delivery_tests:: --locked -- --nocapture
-cargo test -p pubky-transport --lib delivery_tests::local_homeserver_read_poll_benchmark --locked -- --ignored --exact --nocapture
+cargo test --manifest-path pubky-transport/homeserver-test/Cargo.toml -- --nocapture
+cargo test --manifest-path pubky-transport/homeserver-test/Cargo.toml local_homeserver_read_poll_benchmark -- --ignored --exact --nocapture
 ```
 
-Source: `pubky-transport/src/delivery_tests.rs`.
+Source: `pubky-transport/homeserver-test/tests/delivery.rs`.
 
 Structured measurement rows: [local homeserver measurements](benchmarks/local-read-poll-2026-09-28.json).
 

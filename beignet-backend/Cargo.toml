@@ -17,8 +17,8 @@ thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
 tokio.workspace = true
-# `default-features = false` keeps this from adding anything: reqwest 0.12, hyper and rustls are
-# already in the lockfile via the pkarr/pubky stack, and Cargo unifies features additively.
+# `default-features = false` keeps this small. The pubky stack is on reqwest 0.13 since #118, so
+# 0.12 is here for this crate and swap-provider; hyper and rustls are shared.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 [features]

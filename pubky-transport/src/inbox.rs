@@ -235,7 +235,7 @@ impl Inboxes {
         Ok(delivered)
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     pub(super) async fn acknowledge_listed<B: Mailbox>(
         &self,
         mailbox: &B,

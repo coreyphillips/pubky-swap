@@ -1,11 +1,41 @@
-//! Local homeserver delivery validation and read/poll measurements.
+//! Local homeserver delivery validation and read/poll measurements, against pubky 0.16.2.
+//!
+//! Needs Docker for Postgres, or `TEST_PUBKY_CONNECTION_STRING`. Run with
+//! `cargo test --manifest-path pubky-transport/homeserver-test/Cargo.toml`.
 
-use super::Transport;
 use futures::{stream, StreamExt};
-use pubky_messenger::{Keypair, PrivateMessengerClient, PublicKey, RequestCounts, RequestStats};
-use pubky_testnet::Testnet;
+use pubky_testnet::{docker_postgres::DockerPostgres, Testnet};
+use pubky_transport::test_util::{
+    self,
+    pubky_messenger::{Keypair, PrivateMessengerClient, PublicKey, RequestCounts, RequestStats},
+};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
+
+/// A local DHT whose homeservers keep their data in the Postgres that
+/// `TEST_PUBKY_CONNECTION_STRING` names, or else in one Docker Postgres per test binary.
+async fn testnet() -> Testnet {
+    if std::env::var_os("TEST_PUBKY_CONNECTION_STRING").is_some() {
+        return Testnet::new().await.expect("testnet");
+    }
+    let postgres = DockerPostgres::shared()
+        .await
+        .connection_string()
+        .expect("Docker Postgres connection string");
+    Testnet::new_with_custom_postgres(postgres)
+        .await
+        .expect("testnet")
+}
+
+/// A homeserver with open sign-up.
+async fn homeserver(testnet: &mut Testnet) -> PublicKey {
+    testnet
+        .create_random_homeserver()
+        .await
+        .expect("homeserver")
+        .public_key()
+        .into_inner()
+}
 
 async fn signed_up(testnet: &Testnet, homeserver: &PublicKey) -> PrivateMessengerClient {
     let client = PrivateMessengerClient::with_client(
@@ -20,32 +50,10 @@ fn restored(testnet: &Testnet, keypair: Keypair) -> PrivateMessengerClient {
     PrivateMessengerClient::with_client(keypair, testnet.client_builder().build().unwrap())
 }
 
-async fn benchmark_identity(
-    testnet: &Testnet,
-    homeserver: &PublicKey,
-    admin: &str,
-) -> PrivateMessengerClient {
-    let client = testnet.client_builder().build().unwrap();
-    let token = client
-        .get("http://127.0.0.1:6286/admin/generate_signup_token")
-        .header("X-Admin-Password", admin)
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .text()
-        .await
-        .unwrap();
-    let messenger = PrivateMessengerClient::with_client(Keypair::random(), client);
-    messenger.sign_up(homeserver, Some(&token)).await.unwrap();
-    messenger
-}
-
 #[tokio::test]
 async fn durable_publication_restarts_and_cleans_only_completed_scope() {
-    let testnet = Testnet::run().await.unwrap();
-    let homeserver = testnet.run_homeserver().await.unwrap().public_key();
+    let mut testnet = testnet().await;
+    let homeserver = homeserver(&mut testnet).await;
     let alice = signed_up(&testnet, &homeserver).await;
     let bob = signed_up(&testnet, &homeserver).await;
     let alice_keypair = alice.keypair().clone();
@@ -53,7 +61,7 @@ async fn durable_publication_restarts_and_cleans_only_completed_scope() {
     let bob_public = bob.public_key_string();
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("outbox.json");
-    let transport = Transport::wrap(alice).with_outbox(&path).unwrap();
+    let transport = test_util::wrap(alice).with_outbox(&path).unwrap();
     transport
         .enqueue_with_scope(&bob_public, "swap:complete", &7_u32)
         .unwrap();
@@ -62,21 +70,17 @@ async fn durable_publication_restarts_and_cleans_only_completed_scope() {
         .unwrap();
     assert_eq!(transport.request_stats().put.attempts, 0);
     assert_eq!(transport.request_stats().session.attempts, 0);
-    let reserved = transport
-        .outbox
-        .as_ref()
+    let reserved = test_util::outbox(&transport)
         .unwrap()
         .due_pending(0, 4)
         .unwrap();
     assert_eq!(reserved.len(), 2);
     drop(transport);
 
-    let transport = Transport::wrap(restored(&testnet, alice_keypair))
+    let transport = test_util::wrap(restored(&testnet, alice_keypair))
         .with_outbox(&path)
         .unwrap();
-    let reopened = transport
-        .outbox
-        .as_ref()
+    let reopened = test_util::outbox(&transport)
         .unwrap()
         .due_pending(0, 4)
         .unwrap();
@@ -85,7 +89,7 @@ async fn durable_publication_restarts_and_cleans_only_completed_scope() {
         assert_eq!(before.payload(), after.payload());
     }
     transport
-        .process_outbox(super::unix_time(), 4)
+        .process_outbox(test_util::unix_time(), 4)
         .await
         .unwrap();
     assert_eq!(transport.request_stats().put.attempts, 2);
@@ -98,10 +102,10 @@ async fn durable_publication_restarts_and_cleans_only_completed_scope() {
         .unwrap();
     assert_eq!(bob.get_messages(&alice_public).await.unwrap().len(), 2);
     transport
-        .complete_scope(&bob_public, "swap:complete", super::unix_time())
+        .complete_scope(&bob_public, "swap:complete", test_util::unix_time())
         .unwrap();
     transport
-        .process_outbox(super::unix_time(), 4)
+        .process_outbox(test_util::unix_time(), 4)
         .await
         .unwrap();
     let remaining = bob.get_messages(&alice_public).await.unwrap();
@@ -118,14 +122,14 @@ async fn durable_publication_restarts_and_cleans_only_completed_scope() {
 
 #[tokio::test]
 async fn changed_ephemeral_replies_keep_distinct_stable_resources() {
-    let testnet = Testnet::run().await.unwrap();
-    let homeserver = testnet.run_homeserver().await.unwrap().public_key();
+    let mut testnet = testnet().await;
+    let homeserver = homeserver(&mut testnet).await;
     let alice = signed_up(&testnet, &homeserver).await;
     let bob = signed_up(&testnet, &homeserver).await;
     let alice_public = alice.public_key();
     let bob_public = bob.public_key_string();
     let directory = tempfile::tempdir().unwrap();
-    let transport = Transport::wrap(alice)
+    let transport = test_util::wrap(alice)
         .with_outbox(directory.path().join("outbox.json"))
         .unwrap();
     for value in [1_u32, 2, 1] {
@@ -134,9 +138,7 @@ async fn changed_ephemeral_replies_keep_distinct_stable_resources() {
             .unwrap();
     }
     assert_eq!(
-        transport
-            .outbox
-            .as_ref()
+        test_util::outbox(&transport)
             .unwrap()
             .due_pending(0, 4)
             .unwrap()
@@ -144,7 +146,7 @@ async fn changed_ephemeral_replies_keep_distinct_stable_resources() {
         2
     );
     transport
-        .process_outbox(super::unix_time(), 4)
+        .process_outbox(test_util::unix_time(), 4)
         .await
         .unwrap();
     let mut received: Vec<_> = bob
@@ -214,37 +216,17 @@ fn report(
 }
 
 /// Measures reads of already handled history. No swap, Lightning payment or funded negotiation
-/// runs here. Setup writes real encrypted resources to an isolated local homeserver, bounded to
-/// 16 concurrent publications. The normal homeserver builder avoids the test helper's 10 MiB
-/// database map. It requires unused ports 6286 and 6287 and refuses occupied ports. Storage is
-/// private temporary fixture data; identities and signup tokens are generated only for this run.
-/// The dependency listens on all interfaces, advertises loopback and uses the local test DHT.
-/// Warmups and fixture acknowledgment are excluded from samples.
+/// runs here. Setup writes real encrypted resources to an isolated local homeserver with open
+/// sign-up, on the testnet's Postgres, bounded to 16 concurrent publications. Identities are
+/// generated only for this run. Warmups and fixture acknowledgment are excluded from samples.
 #[tokio::test]
 #[ignore = "local homeserver read/poll benchmark seeds 10,000 encrypted resources"]
 async fn local_homeserver_read_poll_benchmark() {
-    // Holding both probes together detects either occupied port without touching its service.
-    let probes: Vec<_> = [6286, 6287]
-        .into_iter()
-        .map(|port| {
-            std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
-                .unwrap_or_else(|_| panic!("benchmark requires unused local port {port}"))
-        })
-        .collect();
-    let testnet = Testnet::run().await.unwrap();
-    let storage = tempfile::tempdir().unwrap();
-    let admin = Keypair::random().public_key().to_string();
-    let mut builder = pubky_homeserver::Homeserver::builder();
-    builder
-        .storage(storage.path().to_path_buf())
-        .bootstrap(testnet.bootstrap())
-        .admin_password(admin.clone());
-    drop(probes);
-    // Safety: this newly created private directory is exclusively owned by this fixture.
-    let homeserver = unsafe { builder.run().await }.unwrap();
+    let mut testnet = testnet().await;
+    let homeserver = homeserver(&mut testnet).await;
     for history in [0_usize, 200, 10_000] {
-        let sender = benchmark_identity(&testnet, &homeserver.public_key(), &admin).await;
-        let baseline = benchmark_identity(&testnet, &homeserver.public_key(), &admin).await;
+        let sender = signed_up(&testnet, &homeserver).await;
+        let baseline = signed_up(&testnet, &homeserver).await;
         let recipient = baseline.public_key();
         let seed_before = sender.request_stats();
         let seed_started = Instant::now();
@@ -305,15 +287,13 @@ async fn local_homeserver_read_poll_benchmark() {
 
         let directory = tempfile::tempdir().unwrap();
         let journal = directory.path().join("receive.json");
-        let incremental = Transport::wrap(restored(&testnet, baseline.keypair().clone()))
+        let incremental = test_util::wrap(restored(&testnet, baseline.keypair().clone()))
             .with_receive_journal(&journal)
             .unwrap();
         // Fixture history is known to have been handled. Listing acknowledgment avoids
         // including initial migration and body downloads in a warm incremental measurement.
         assert_eq!(
-            incremental
-                .inboxes
-                .acknowledge_listed(&incremental.messenger, &peer)
+            test_util::acknowledge_listed(&incremental, &peer)
                 .await
                 .unwrap(),
             history
@@ -346,5 +326,4 @@ async fn local_homeserver_read_poll_benchmark() {
             std::fs::metadata(&journal).unwrap().len(),
         );
     }
-    homeserver.shutdown().await;
 }

@@ -47,7 +47,7 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Peer wakes to an owner's wake gateway. Already in the tree through pubky; TLS only, no redirects.
+# Peer wakes to an owner's wake gateway. TLS only, no redirects. The same 0.12 beignet-backend uses.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # The status API (feature `status`). Optional so the default build pulls in no HTTP server.
 axum = { version = "0.8", optional = true }

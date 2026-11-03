@@ -112,8 +112,12 @@ storage requests; scoped sessions still renew and verify their authorization.
 The local homeserver fixture compares full-history reads with acknowledged incremental polls:
 
 ```text
-cargo test -p pubky-transport --lib local_homeserver_read_poll_benchmark -- --ignored --nocapture
+cargo test --manifest-path pubky-transport/homeserver-test/Cargo.toml \
+  local_homeserver_read_poll_benchmark -- --ignored --nocapture
 ```
+
+It lives in its own workspace, because pubky-testnet 0.16 and bdk_wallet need different sqlite
+crates, and its homeservers keep their data in Postgres (Docker, or `TEST_PUBKY_CONNECTION_STRING`).
 
 These fixtures measure transport operations, not funded swap settlement. Report loopback,
 public relay, local homeserver and live provider results separately. See the implementation
