@@ -21,23 +21,34 @@ struct IssuedTerms {
 #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
 pub(crate) struct CapState {
     signer: Arc<dyn CapSigner>,
+    /// This provider's pubky, which every quote it signs names beside the owner's.
+    provider: String,
     terms: Mutex<HashMap<Uuid, IssuedTerms>>,
 }
 
 impl CapState {
-    pub(crate) fn new(signer: Arc<dyn CapSigner>) -> Self {
+    pub(crate) fn new(signer: Arc<dyn CapSigner>, provider: String) -> Self {
         Self {
             signer,
+            provider,
             terms: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// This provider's pubky, as its signed quotes name it.
+    #[cfg(all(test, feature = "iroh"))]
+    pub(crate) fn provider(&self) -> &str {
+        &self.provider
     }
 
     /// A key nobody holds, for builds and tests that never sign anything they keep.
     #[cfg(any(test, not(feature = "iroh")))]
     pub(crate) fn ephemeral() -> Self {
-        Self::new(Arc::new(
-            swap_common::paykit_cap::Ed25519Signer::from_secret(&rand::random()),
-        ))
+        let secret: [u8; 32] = rand::random();
+        Self::new(
+            Arc::new(swap_common::paykit_cap::Ed25519Signer::from_secret(&secret)),
+            pubky_transport::identity_from_secret(&secret),
+        )
     }
 }
 
@@ -50,12 +61,13 @@ mod direct {
     use crate::{handle_message, now_unix, ExecCtx, SharedOffer};
     use swap_common::messages::*;
     use swap_common::paykit_cap::*;
-    use tracing::warn;
+    use swap_common::SwapDirection;
+    use tracing::{info, warn};
 
     /// What the request was, for translating its reply.
     enum Asked {
         Quote(RfqConstraints),
-        Commit(Commit),
+        Commit(Box<Commit>),
         Status,
     }
 
@@ -126,8 +138,16 @@ mod direct {
                     }
                 }
                 drop(issued);
+                if let Some(proof) = &commit.quote {
+                    if let Err(refusal) = restore_quote(ctx, sender, &commit, proof).await {
+                        return CapMessage::Refusal(refusal);
+                    }
+                }
                 let request = commit.commit.clone().into_request(sender);
-                (Asked::Commit(commit), SwapMessage::SwapRequest(request))
+                (
+                    Asked::Commit(Box::new(commit)),
+                    SwapMessage::SwapRequest(request),
+                )
             }
             CapMessage::StatusRequest(request) => {
                 (Asked::Status, SwapMessage::SwapStatusRequest(request))
@@ -165,7 +185,11 @@ mod direct {
     ) -> anyhow::Result<CapMessage> {
         Ok(match (asked, reply) {
             (Asked::Quote(rfq), SwapMessage::Quote(quote)) => {
-                let signed = sign_quote(ctx.cap.signer.as_ref(), &rfq, &quote)?;
+                let parties = Parties {
+                    owner: sender.to_string(),
+                    provider: ctx.cap.provider.clone(),
+                };
+                let signed = sign_quote(ctx.cap.signer.as_ref(), &parties, &rfq, &quote)?;
                 let now = now_unix();
                 let mut issued = ctx.cap.terms.lock().await;
                 issued.retain(|_, terms| terms.expires_at_unix > now);
@@ -224,6 +248,70 @@ mod direct {
                 anyhow::bail!("unexpected reply {:?}", std::mem::discriminant(&other))
             }
         })
+    }
+
+    /// Put a quote this provider signed back in its book when the book no longer holds it, after
+    /// a restart or because a full book evicted it (#103). The request that follows runs every
+    /// admission check as before. A quote a swap already used, or one this run already redeemed,
+    /// is not put back: an identical replay still gets its contract, and anything else is refused.
+    async fn restore_quote(
+        ctx: &ExecCtx,
+        sender: &str,
+        commit: &Commit,
+        proof: &QuoteProof,
+    ) -> Result<(), Refusal> {
+        let quote_id = commit.commit.quote_id;
+        if ctx.quotes.lock().await.holds(quote_id) {
+            return Ok(());
+        }
+        let refuse = |code: RejectCode, reason: String| Refusal {
+            code: code.as_str().into(),
+            reason,
+            request_id: None,
+            quote_id: Some(quote_id),
+            swap_id: None,
+        };
+        let parties = Parties {
+            owner: sender.to_string(),
+            provider: ctx.cap.provider.clone(),
+        };
+        if let Err(error) = proof.check(&parties, &ctx.cap.signer.public_key_hex(), commit) {
+            return Err(refuse(
+                RejectCode::InvalidRequest,
+                format!("signed quote refused: {error}"),
+            ));
+        }
+        let quote = &proof.signed.quote;
+        let now = now_unix();
+        if quote.valid_until_unix <= now {
+            return Err(refuse(
+                RejectCode::QuoteExpired,
+                "the signed quote has expired".into(),
+            ));
+        }
+        match crate::swap_for_quote(ctx.store.as_ref(), quote_id) {
+            // The engine answers a replay of that swap from its record, and refuses anything else.
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) => {
+                warn!("could not look up swaps for quote {quote_id}: {error:#}");
+                return Err(refuse(
+                    RejectCode::InternalError,
+                    "could not check the quote".into(),
+                ));
+            }
+        }
+        let claimable_hint = quote.direction == SwapDirection::Reverse
+            && proof
+                .rfq
+                .features
+                .iter()
+                .any(|f| f == CLAIMABLE_HINT_FEATURE);
+        let issued = crate::IssuedQuote::signed(sender, quote, claimable_hint);
+        if ctx.quotes.lock().await.restore(quote_id, issued, now) {
+            info!("Took back signed quote {quote_id} from {sender}");
+        }
+        Ok(())
     }
 
     /// The contract stored with the swap, signing and storing one first if there is none. The

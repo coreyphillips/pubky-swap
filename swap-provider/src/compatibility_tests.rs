@@ -932,12 +932,16 @@ mod direct_requests {
             .unwrap();
         let signer = Arc::new(Ed25519Signer::from_secret(&[40; 32]));
         let provider = |store| ExecCtx {
-            cap: Arc::new(crate::cap_adapter::CapState::new(signer.clone())),
+            cap: Arc::new(crate::cap_adapter::CapState::new(
+                signer.clone(),
+                pubky_transport::identity_from_secret(&[40; 32]),
+            )),
             ..context(store, record.swap_id)
         };
         let commit = CapMessage::Commit(Commit {
             terms_hash: "ab".repeat(32),
             commit: CommitBody::from_request(&request),
+            quote: None,
         });
 
         let ctx = provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
@@ -1008,13 +1012,18 @@ mod direct_requests {
         let CapMessage::Quote(signed) = serde_json::from_slice(&reply).unwrap() else {
             panic!("expected a quote: {}", String::from_utf8_lossy(&reply));
         };
-        signed.verify(&constraints).unwrap();
+        let parties = Parties {
+            owner: owner.clone(),
+            provider: ctx.cap.provider().to_string(),
+        };
+        signed.verify(&parties, &constraints).unwrap();
 
         let mut request = owned_record(&owner).swap_request.unwrap();
         request.quote_id = signed.quote.quote_id;
         let commit = CapMessage::Commit(Commit {
             terms_hash: "00".repeat(32),
             commit: CommitBody::from_request(&request),
+            quote: None,
         });
         let reply = ask_cap(&ctx, &owner, &commit).await;
         assert!(
@@ -1022,6 +1031,227 @@ mod direct_requests {
                 if r.code == "invalid_request" && r.quote_id == Some(request.quote_id)),
             "{}",
             String::from_utf8_lossy(&reply)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The `paykit-cap` secret of [`signing_provider`].
+    const PROVIDER_SECRET: [u8; 32] = [40; 32];
+
+    /// A provider that signs with [`PROVIDER_SECRET`] and can start reverse swaps.
+    fn signing_provider(store: Arc<JsonFileSwapStore>) -> ExecCtx {
+        ExecCtx {
+            ln: Arc::new(OpenInvoiceLightning),
+            homeserver: false,
+            cap: Arc::new(crate::cap_adapter::CapState::new(
+                Arc::new(swap_common::paykit_cap::Ed25519Signer::from_secret(
+                    &PROVIDER_SECRET,
+                )),
+                pubky_transport::identity_from_secret(&PROVIDER_SECRET),
+            )),
+            ..executing(context(store, Uuid::new_v4()))
+        }
+    }
+
+    /// The owner's half of `paykit-cap`, talking to [`signing_provider`].
+    fn cap_client(owner: &str) -> swap_common::paykit_cap::CapClient {
+        use swap_common::paykit_cap::{CapSigner, Ed25519Signer, Parties};
+        let key = hex::decode(Ed25519Signer::from_secret(&PROVIDER_SECRET).public_key_hex())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        swap_common::paykit_cap::CapClient::new(
+            Some(key),
+            Parties {
+                owner: owner.into(),
+                provider: pubky_transport::identity_from_secret(&PROVIDER_SECRET),
+            },
+        )
+    }
+
+    /// A reverse creation for `quote_id` with keys of its own.
+    fn reverse_request(owner: &str, quote_id: Uuid, preimage: [u8; 32]) -> SwapRequest {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let (_, claim) = swap_common::random_keypair(&secp);
+        SwapRequest {
+            script_type: SwapScript::P2wsh,
+            quote_id,
+            client_pkarr: owner.into(),
+            direction: SwapDirection::Reverse,
+            payment_hash_hex: hex::encode(payment_hash(&preimage)),
+            client_claim_pubkey_hex: Some(hex::encode(claim.to_bytes())),
+            client_refund_pubkey_hex: None,
+            invoice: None,
+            owner_ref: None,
+        }
+    }
+
+    /// One request through `client` to `ctx`: the provider's raw answer, and what the client
+    /// made of it.
+    async fn exchange_cap(
+        ctx: &ExecCtx,
+        owner: &str,
+        client: &mut swap_common::paykit_cap::CapClient,
+        request: SwapMessage,
+    ) -> (
+        Vec<u8>,
+        std::result::Result<SwapMessage, swap_common::paykit_cap::CapError>,
+    ) {
+        let message = client.request(&request).expect("a paykit-cap kind");
+        let bytes = ask_cap(ctx, owner, &message).await;
+        let reply = serde_json::from_slice(&bytes).unwrap();
+        (bytes.clone(), client.reply(&request, reply))
+    }
+
+    /// A signed quote from `ctx` for `owner`, through `client`.
+    async fn signed_quote(
+        ctx: &ExecCtx,
+        owner: &str,
+        client: &mut swap_common::paykit_cap::CapClient,
+    ) -> Quote {
+        let request = quote_request(owner, SwapDirection::Reverse, 100_000);
+        let (bytes, reply) =
+            exchange_cap(ctx, owner, client, SwapMessage::QuoteRequest(request)).await;
+        match reply {
+            Ok(SwapMessage::Quote(quote)) => quote,
+            other => panic!(
+                "expected a quote, got {other:?}: {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+        }
+    }
+
+    /// #103: a commit on a quote the provider signed is honoured after a restart, on the quote
+    /// it carries. A replay gets the same contract, and another commit on that quote is refused.
+    #[tokio::test]
+    async fn a_signed_quote_is_honoured_after_a_restart() {
+        let directory = std::env::temp_dir().join(format!("cap-restart-{}", Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[51; 32]);
+        let mut client = cap_client(&owner);
+        let ctx = signing_provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let quote = signed_quote(&ctx, &owner, &mut client).await;
+
+        // Restarted: the same store and key, an empty book and no signed terms in memory.
+        let ctx = signing_provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let request = SwapMessage::SwapRequest(reverse_request(&owner, quote.quote_id, [52; 32]));
+        let (first, accepted) = exchange_cap(&ctx, &owner, &mut client, request.clone()).await;
+        assert!(
+            matches!(&accepted, Ok(SwapMessage::SwapAccept(a)) if a.quote_id == quote.quote_id),
+            "{accepted:?}: {}",
+            String::from_utf8_lossy(&first)
+        );
+        let (replayed, _) = exchange_cap(&ctx, &owner, &mut client, request).await;
+        assert_eq!(replayed, first, "a replay gets the contract first signed");
+
+        let other = SwapMessage::SwapRequest(reverse_request(&owner, quote.quote_id, [53; 32]));
+        let (bytes, refused) = exchange_cap(&ctx, &owner, &mut client, other).await;
+        assert!(
+            matches!(&refused, Ok(SwapMessage::Reject(_))),
+            "a spent quote takes no second swap: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// #103: a quote a full book evicted is honoured on its signature. Before, the same commit
+    /// got `quote_expired`.
+    #[tokio::test]
+    async fn a_signed_quote_is_honoured_after_the_book_evicts_it() {
+        use swap_common::paykit_cap::{CapMessage, Commit};
+        let directory = std::env::temp_dir().join(format!("cap-evicted-{}", Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[54; 32]);
+        let mut client = cap_client(&owner);
+        let ctx = signing_provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let quote = signed_quote(&ctx, &owner, &mut client).await;
+        let request = SwapMessage::SwapRequest(reverse_request(&owner, quote.quote_id, [55; 32]));
+        let Some(CapMessage::Commit(commit)) = client.request(&request) else {
+            panic!("a commit follows a signed quote");
+        };
+        // What a full book does to its oldest quote.
+        assert!(ctx
+            .quotes
+            .lock()
+            .await
+            .quotes
+            .remove(&quote.quote_id)
+            .is_some());
+
+        let unsigned = CapMessage::Commit(Commit {
+            quote: None,
+            ..commit.clone()
+        });
+        let reply = ask_cap(&ctx, &owner, &unsigned).await;
+        assert!(
+            matches!(serde_json::from_slice(&reply).unwrap(), CapMessage::Refusal(r) if r.code == "quote_expired"),
+            "without the signed quote: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        let (bytes, accepted) = exchange_cap(&ctx, &owner, &mut client, request).await;
+        assert!(
+            matches!(&accepted, Ok(SwapMessage::SwapAccept(a)) if a.quote_id == quote.quote_id),
+            "{accepted:?}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// #103: a signed quote vouches only for the owner its terms name, under this provider's key,
+    /// before it expires.
+    #[tokio::test]
+    async fn a_forged_borrowed_or_expired_signed_quote_is_refused() {
+        use swap_common::paykit_cap::*;
+        let directory = std::env::temp_dir().join(format!("cap-refused-{}", Uuid::new_v4()));
+        let owner = pubky_transport::identity_from_secret(&[56; 32]);
+        let mut client = cap_client(&owner);
+        let ctx = signing_provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let quote = signed_quote(&ctx, &owner, &mut client).await;
+        let request = SwapMessage::SwapRequest(reverse_request(&owner, quote.quote_id, [57; 32]));
+        let Some(CapMessage::Commit(commit)) = client.request(&request) else {
+            panic!("a commit follows a signed quote");
+        };
+        // Restarted, so only the quote the commit carries can vouch for it.
+        let ctx = signing_provider(Arc::new(JsonFileSwapStore::new(&directory).unwrap()));
+        let refusal = |reply: &[u8]| match serde_json::from_slice(reply).unwrap() {
+            CapMessage::Refusal(refusal) => refusal.code,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let parties = Parties {
+            owner: owner.clone(),
+            provider: ctx.cap.provider().to_string(),
+        };
+        let resigned = |by: &dyn CapSigner, change: &dyn Fn(&mut Quote)| {
+            let mut commit = commit.clone();
+            let proof = commit.quote.as_mut().unwrap();
+            change(&mut proof.signed.quote);
+            proof.signed =
+                sign_quote(by, &parties, &proof.rfq.constraints, &proof.signed.quote).unwrap();
+            commit.terms_hash = proof.signed.terms_hash.clone();
+            CapMessage::Commit(commit)
+        };
+
+        let thief = pubky_transport::identity_from_secret(&[58; 32]);
+        let borrowed = ask_cap(&ctx, &thief, &CapMessage::Commit(commit.clone())).await;
+        assert_eq!(refusal(&borrowed), "invalid_request", "another key's quote");
+        let forged = resigned(&Ed25519Signer::from_secret(&[59; 32]), &|_| {});
+        assert_eq!(
+            refusal(&ask_cap(&ctx, &owner, &forged).await),
+            "invalid_request",
+            "signed by another key"
+        );
+        let signer = Ed25519Signer::from_secret(&PROVIDER_SECRET);
+        let expired = resigned(&signer, &|quote| quote.valid_until_unix = 1);
+        assert_eq!(
+            refusal(&ask_cap(&ctx, &owner, &expired).await),
+            "quote_expired",
+            "past its validity"
+        );
+
+        // None of those spent the quote: the genuine commit still goes through.
+        let (bytes, accepted) = exchange_cap(&ctx, &owner, &mut client, request).await;
+        assert!(
+            matches!(&accepted, Ok(SwapMessage::SwapAccept(_))),
+            "{accepted:?}: {}",
+            String::from_utf8_lossy(&bytes)
         );
         std::fs::remove_dir_all(directory).unwrap();
     }

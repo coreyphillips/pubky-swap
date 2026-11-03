@@ -101,8 +101,17 @@ pub struct RfqConstraints {
     pub amount_sat: u64,
 }
 
+/// Who a quote is between: the owner, which is the key that authenticated the connection, and
+/// the provider. Both are bare z32 pubkys. `terms_hash` covers both (Capabilities §10.1), so a
+/// signed quote still says who it was issued to after the provider has forgotten it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Parties {
+    pub owner: String,
+    pub provider: String,
+}
+
 /// A quote and the provider's signature over its `terms_hash`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedQuote {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<Uuid>,
@@ -118,6 +127,44 @@ pub struct SignedQuote {
 pub struct Commit {
     pub terms_hash: String,
     pub commit: CommitBody,
+    /// The signed quote and the RFQ it answered. A provider that no longer holds the quote, after
+    /// a restart or because its book was full, accepts the commit on its own signature instead
+    /// (#103). Optional, so a carrier with a size limit can leave it out; `commit_hash` does not
+    /// cover it, since `terms_hash` already binds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<QuoteProof>,
+}
+
+/// A signed quote and the RFQ it answered, as a commit carries them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteProof {
+    pub rfq: Rfq,
+    pub signed: SignedQuote,
+}
+
+impl QuoteProof {
+    /// Check a quote the provider no longer holds: signed by `signer`, over terms naming
+    /// `parties`, matching the commit's `terms_hash`, quote and direction. Expiry is left to the
+    /// caller, which owns the clock.
+    pub fn check(&self, parties: &Parties, signer: &str, commit: &Commit) -> Result<(), CapError> {
+        if self.signed.signer != signer {
+            return Err(CapError::UnexpectedSigner);
+        }
+        self.signed.verify(parties, &self.rfq.constraints)?;
+        if self.signed.terms_hash != commit.terms_hash {
+            return Err(CapError::HashMismatch("terms_hash"));
+        }
+        let quote = &self.signed.quote;
+        if quote.quote_id != commit.commit.quote_id {
+            return Err(CapError::Unexpected("signed quote for another quote id"));
+        }
+        if quote.direction != commit.commit.direction
+            || self.rfq.constraints.direction != commit.commit.direction
+        {
+            return Err(CapError::Unexpected("signed quote for another direction"));
+        }
+        Ok(())
+    }
 }
 
 /// What `commit_hash` covers: a [`SwapRequest`] without its sender.
@@ -427,8 +474,17 @@ fn quote_terms(quote: &Quote) -> Quote {
     }
 }
 
-pub fn terms_hash(rfq: &RfqConstraints, quote: &Quote) -> Result<[u8; 32], CapError> {
-    let value = serde_json::json!({ "rfq": rfq, "quote": quote_terms(quote) });
+pub fn terms_hash(
+    parties: &Parties,
+    rfq: &RfqConstraints,
+    quote: &Quote,
+) -> Result<[u8; 32], CapError> {
+    let value = serde_json::json!({
+        "owner": parties.owner,
+        "provider": parties.provider,
+        "rfq": rfq,
+        "quote": quote_terms(quote),
+    });
     domain_hash(TERMS_DOMAIN, &value)
 }
 
@@ -442,13 +498,14 @@ pub fn contract_hash(commit_hash_hex: &str, contract: &ContractBody) -> Result<[
     domain_hash(CONTRACT_DOMAIN, &value)
 }
 
-/// Sign a quote answering `rfq`.
+/// Sign a quote answering `rfq`, between `parties`.
 pub fn sign_quote(
     signer: &dyn CapSigner,
+    parties: &Parties,
     rfq: &RfqConstraints,
     quote: &Quote,
 ) -> Result<SignedQuote, CapError> {
-    let hash = terms_hash(rfq, quote)?;
+    let hash = terms_hash(parties, rfq, quote)?;
     Ok(SignedQuote {
         request_id: quote.request_id,
         quote: quote_terms(quote),
@@ -459,9 +516,9 @@ pub fn sign_quote(
 }
 
 impl SignedQuote {
-    /// Check the quote answers `rfq` and the signature over its `terms_hash`.
-    pub fn verify(&self, rfq: &RfqConstraints) -> Result<(), CapError> {
-        let hash = terms_hash(rfq, &self.quote)?;
+    /// Check the quote answers `rfq` between `parties`, and the signature over its `terms_hash`.
+    pub fn verify(&self, parties: &Parties, rfq: &RfqConstraints) -> Result<(), CapError> {
+        let hash = terms_hash(parties, rfq, &self.quote)?;
         if hex::encode(hash) != self.terms_hash {
             return Err(CapError::HashMismatch("terms_hash"));
         }
@@ -515,12 +572,15 @@ pub fn sign_contract(
 
 /// Client-side translation: [`SwapMessage`] requests into these kinds, and replies back after
 /// their signatures and hashes check out.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CapClient {
     /// The provider's key as hex. Replies signed by any other key are refused.
     expected_signer: Option<String>,
-    /// Signed terms by quote id, which a commit names.
-    terms: HashMap<Uuid, String>,
+    /// This client and the provider it talks to, which every quote it accepts names.
+    parties: Parties,
+    /// Each signed quote and the RFQ it answered, by quote id. A commit names its terms and
+    /// carries it, so a provider that forgot the quote can still honour it.
+    quotes: HashMap<Uuid, QuoteProof>,
     /// Each commit sent and its `commit_hash`, by quote id. A status reply for that quote must
     /// carry a contract signed over it.
     commits: HashMap<Uuid, (String, Commit)>,
@@ -530,10 +590,11 @@ pub struct CapClient {
 }
 
 impl CapClient {
-    pub fn new(expected_signer: Option<[u8; 32]>) -> Self {
+    pub fn new(expected_signer: Option<[u8; 32]>, parties: Parties) -> Self {
         Self {
             expected_signer: expected_signer.map(hex::encode),
-            terms: HashMap::new(),
+            parties,
+            quotes: HashMap::new(),
             commits: HashMap::new(),
             swaps: HashMap::new(),
         }
@@ -543,16 +604,13 @@ impl CapClient {
     /// or list request, or a commit whose signed quote this client never saw.
     pub fn request(&mut self, request: &SwapMessage) -> Option<CapMessage> {
         match request {
-            SwapMessage::QuoteRequest(request) => Some(CapMessage::Rfq(Rfq {
-                request_id: request.request_id,
-                constraints: constraints(request),
-                protocol_version: request.protocol_version,
-                features: request.features.clone(),
-            })),
+            SwapMessage::QuoteRequest(request) => Some(CapMessage::Rfq(rfq(request))),
             SwapMessage::SwapRequest(request) => {
+                let proof = self.quotes.get(&request.quote_id)?.clone();
                 let commit = Commit {
-                    terms_hash: self.terms.get(&request.quote_id)?.clone(),
+                    terms_hash: proof.signed.terms_hash.clone(),
                     commit: CommitBody::from_request(request),
+                    quote: Some(proof),
                 };
                 let hash = commit_hash(&commit.terms_hash, &commit.commit).ok()?;
                 self.commits
@@ -583,17 +641,25 @@ impl CapClient {
             (_, CapMessage::Refusal(refusal)) => Ok(SwapMessage::Reject(refusal.into())),
             (SwapMessage::QuoteRequest(request), CapMessage::Quote(signed)) => {
                 self.check_signer(&signed.signer)?;
-                signed.verify(&constraints(request))?;
-                self.terms
-                    .insert(signed.quote.quote_id, signed.terms_hash.clone());
-                Ok(SwapMessage::Quote(signed.to_quote()))
+                signed.verify(&self.parties, &constraints(request))?;
+                let quote = signed.to_quote();
+                self.quotes.insert(
+                    signed.quote.quote_id,
+                    QuoteProof {
+                        rfq: rfq(request),
+                        signed,
+                    },
+                );
+                Ok(SwapMessage::Quote(quote))
             }
             (SwapMessage::SwapRequest(request), CapMessage::Contract(contract)) => {
                 self.check_signer(&contract.signed.signer)?;
-                let terms_hash = self
-                    .terms
+                let terms_hash = &self
+                    .quotes
                     .get(&request.quote_id)
-                    .ok_or(CapError::Unexpected("contract for an unsigned quote"))?;
+                    .ok_or(CapError::Unexpected("contract for an unsigned quote"))?
+                    .signed
+                    .terms_hash;
                 let expected = commit_hash(terms_hash, &CommitBody::from_request(request))?;
                 if hex::encode(expected) != contract.signed.commit_hash {
                     return Err(CapError::HashMismatch("commit_hash"));
@@ -676,6 +742,15 @@ fn constraints(request: &QuoteRequest) -> RfqConstraints {
     }
 }
 
+fn rfq(request: &QuoteRequest) -> Rfq {
+    Rfq {
+        request_id: request.request_id,
+        constraints: constraints(request),
+        protocol_version: request.protocol_version,
+        features: request.features.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,6 +762,14 @@ mod tests {
 
     fn signer() -> Ed25519Signer {
         Ed25519Signer::from_secret(&[7; 32])
+    }
+
+    /// Fixed 52-character z32 strings, so the golden vectors stay put.
+    fn parties() -> Parties {
+        Parties {
+            owner: "y".repeat(52),
+            provider: "b".repeat(52),
+        }
     }
 
     fn rfq() -> RfqConstraints {
@@ -750,7 +833,7 @@ mod tests {
     /// profile; a change here is a wire change.
     #[test]
     fn golden_vectors() {
-        let terms = sign_quote(&signer(), &rfq(), &quote()).unwrap();
+        let terms = sign_quote(&signer(), &parties(), &rfq(), &quote()).unwrap();
         let contract = sign_contract(&signer(), &terms.terms_hash, &commit(), &accept()).unwrap();
         let actual = [
             terms.terms_hash.as_str(),
@@ -767,9 +850,9 @@ mod tests {
 
     /// `terms_hash`, `commit_hash`, `contract_hash`, and the signer for secret `[7; 32]`.
     const GOLDEN: [&str; 4] = [
-        "766a45ca9f2aafb59085836d2f8c77153b26eef5461d5c55d18e3ecb495759f6",
-        "a4c7b47b6a9f1e6e2d8bcab2d4046ca0365904972294a032cf5e85898246397f",
-        "e09ffac51ae04cfa914e435282a976cfeb6a82ea5444a102034f4543be6a7a37",
+        "273f025818bb3fdcc84dfd3d26092e66592bdf0705c146ea7f2be4a0e8234161",
+        "dca484d94be41ef37eb4d7eeac3d2b8686a3e0e92e0bfc9e2a370a77ed0ebdc5",
+        "8e52dcc64cdbaaa377d333130d5ab411f14fb21c3962ec28c2e45fe507953974",
         "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
     ];
 
@@ -787,23 +870,34 @@ mod tests {
     /// Both signed messages survive the wire, and a changed byte anywhere breaks them.
     #[test]
     fn signed_messages_round_trip_and_a_changed_byte_breaks_them() {
-        let quote_message = CapMessage::Quote(sign_quote(&signer(), &rfq(), &quote()).unwrap());
+        let quote_message =
+            CapMessage::Quote(sign_quote(&signer(), &parties(), &rfq(), &quote()).unwrap());
         let bytes = serde_json::to_vec(&quote_message).unwrap();
         let CapMessage::Quote(parsed) = serde_json::from_slice(&bytes).unwrap() else {
             panic!("kind changed in transit");
         };
-        parsed.verify(&rfq()).unwrap();
+        parsed.verify(&parties(), &rfq()).unwrap();
         assert_eq!(parsed.to_quote().request_id, quote().request_id);
 
         let mut changed = parsed.clone();
         changed.quote.fee_sat -= 1;
         assert_eq!(
-            changed.verify(&rfq()),
+            changed.verify(&parties(), &rfq()),
             Err(CapError::HashMismatch("terms_hash"))
         );
         let mut other_rfq = rfq();
         other_rfq.amount_sat += 1;
-        assert!(parsed.verify(&other_rfq).is_err());
+        assert!(parsed.verify(&parties(), &other_rfq).is_err());
+        // The terms name both parties: the same quote does not verify for anyone else.
+        let mut other_owner = parties();
+        other_owner.owner = "n".repeat(52);
+        assert_eq!(
+            parsed.verify(&other_owner, &rfq()),
+            Err(CapError::HashMismatch("terms_hash"))
+        );
+        let mut other_provider = parties();
+        other_provider.provider = "n".repeat(52);
+        assert!(parsed.verify(&other_provider, &rfq()).is_err());
 
         let contract = sign_contract(&signer(), &parsed.terms_hash, &commit(), &accept()).unwrap();
         let bytes = serde_json::to_vec(&CapMessage::Contract(contract.clone())).unwrap();
@@ -837,7 +931,7 @@ mod tests {
     /// Signing the same contract again, as a provider does after a crash, gives the same bytes.
     #[test]
     fn a_contract_signed_twice_is_the_same_bytes() {
-        let terms = hex::encode(terms_hash(&rfq(), &quote()).unwrap());
+        let terms = hex::encode(terms_hash(&parties(), &rfq(), &quote()).unwrap());
         let first = sign_contract(&signer(), &terms, &commit(), &accept()).unwrap();
         let second = sign_contract(&signer(), &terms, &commit(), &accept()).unwrap();
         assert_eq!(
@@ -911,7 +1005,7 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let mut client = CapClient::new(Some(key));
+        let mut client = CapClient::new(Some(key), parties());
         let quote_request = quote_request();
         let Some(CapMessage::Rfq(sent)) = client.request(&quote_request) else {
             panic!("a quote request goes as an rfq");
@@ -919,10 +1013,18 @@ mod tests {
         assert_eq!(sent.constraints, rfq());
 
         let stranger = Ed25519Signer::from_secret(&[8; 32]);
-        let forged = CapMessage::Quote(sign_quote(&stranger, &rfq(), &quote()).unwrap());
+        let forged =
+            CapMessage::Quote(sign_quote(&stranger, &parties(), &rfq(), &quote()).unwrap());
         assert!(client.reply(&quote_request, forged).is_err());
+        // Signed by the provider, but for another owner: not this client's quote.
+        let mut elsewhere = parties();
+        elsewhere.owner = "n".repeat(52);
+        let theirs = sign_quote(&provider, &elsewhere, &rfq(), &quote()).unwrap();
+        assert!(client
+            .reply(&quote_request, CapMessage::Quote(theirs))
+            .is_err());
 
-        let signed = sign_quote(&provider, &rfq(), &quote()).unwrap();
+        let signed = sign_quote(&provider, &parties(), &rfq(), &quote()).unwrap();
         let reply = client
             .reply(&quote_request, CapMessage::Quote(signed.clone()))
             .unwrap();
@@ -933,6 +1035,16 @@ mod tests {
             panic!("a commit follows a signed quote");
         };
         assert_eq!(sent.terms_hash, signed.terms_hash);
+        // The commit carries the signed quote and its RFQ, for a provider that forgot them.
+        let proof = sent
+            .quote
+            .clone()
+            .expect("the signed quote rides on the commit");
+        assert_eq!(proof.signed, signed);
+        assert_eq!(proof.rfq.constraints, rfq());
+        proof
+            .check(&parties(), &provider.public_key_hex(), &sent)
+            .unwrap();
         let contract = sign_contract(&provider, &signed.terms_hash, &commit(), &accept()).unwrap();
         let reply = client
             .reply(&swap_request, CapMessage::Contract(contract.clone()))
@@ -994,10 +1106,10 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap();
-        let mut client = CapClient::new(Some(key));
+        let mut client = CapClient::new(Some(key), parties());
         let quote_request = quote_request();
         client.request(&quote_request).unwrap();
-        let signed = sign_quote(&provider, &rfq(), &quote()).unwrap();
+        let signed = sign_quote(&provider, &parties(), &rfq(), &quote()).unwrap();
         client
             .reply(&quote_request, CapMessage::Quote(signed.clone()))
             .unwrap();
@@ -1047,7 +1159,8 @@ mod tests {
     }
 
     /// Paykit Event Messages carry at most 1,000 bytes. A signed contract is left out: with the
-    /// P2WSH script or Taproot tree the provider always sends, it does not fit yet.
+    /// P2WSH script or Taproot tree the provider always sends, it does not fit yet (#119). So is
+    /// the signed quote a commit can carry, which an Encrypted Link would leave out.
     #[test]
     fn rfq_quote_and_commit_fit_a_paykit_event_message() {
         let rfq_message = CapMessage::Rfq(Rfq {
@@ -1056,14 +1169,82 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             features: Vec::new(),
         });
-        let quote_message = CapMessage::Quote(sign_quote(&signer(), &rfq(), &quote()).unwrap());
+        let quote_message =
+            CapMessage::Quote(sign_quote(&signer(), &parties(), &rfq(), &quote()).unwrap());
         let commit_message = CapMessage::Commit(Commit {
             terms_hash: "00".repeat(32),
             commit: commit(),
+            quote: None,
         });
         for message in [rfq_message, quote_message, commit_message] {
             let size = serde_json::to_vec(&message).unwrap().len();
             assert!(size <= PAYKIT_EVENT_MAX_BYTES, "{size} bytes: {message:?}");
         }
+        let signed = sign_quote(&signer(), &parties(), &rfq(), &quote()).unwrap();
+        let with_quote = CapMessage::Commit(Commit {
+            terms_hash: signed.terms_hash.clone(),
+            commit: commit(),
+            quote: Some(QuoteProof {
+                rfq: Rfq {
+                    request_id: Some(uuid(9)),
+                    constraints: rfq(),
+                    protocol_version: PROTOCOL_VERSION,
+                    features: Vec::new(),
+                },
+                signed,
+            }),
+        });
+        println!(
+            "commit carrying its signed quote: {} bytes",
+            serde_json::to_vec(&with_quote).unwrap().len()
+        );
+    }
+
+    /// #103: a provider that forgot a quote takes it back only on its own signature, over terms
+    /// naming the sender, and only for the commit those terms belong to.
+    #[test]
+    fn a_quote_proof_is_checked_against_the_commit_it_rides_on() {
+        let provider = signer();
+        let signed = sign_quote(&provider, &parties(), &rfq(), &quote()).unwrap();
+        let proof = QuoteProof {
+            rfq: Rfq {
+                request_id: None,
+                constraints: rfq(),
+                protocol_version: PROTOCOL_VERSION,
+                features: Vec::new(),
+            },
+            signed: signed.clone(),
+        };
+        let commit = Commit {
+            terms_hash: signed.terms_hash.clone(),
+            commit: commit(),
+            quote: Some(proof.clone()),
+        };
+        let key = provider.public_key_hex();
+        proof.check(&parties(), &key, &commit).unwrap();
+
+        let stranger = Ed25519Signer::from_secret(&[8; 32]).public_key_hex();
+        assert_eq!(
+            proof.check(&parties(), &stranger, &commit),
+            Err(CapError::UnexpectedSigner)
+        );
+        let mut thief = parties();
+        thief.owner = "n".repeat(52);
+        assert_eq!(
+            proof.check(&thief, &key, &commit),
+            Err(CapError::HashMismatch("terms_hash"))
+        );
+        let mut other_terms = commit.clone();
+        other_terms.terms_hash = "00".repeat(32);
+        assert_eq!(
+            proof.check(&parties(), &key, &other_terms),
+            Err(CapError::HashMismatch("terms_hash"))
+        );
+        let mut other_quote = commit.clone();
+        other_quote.commit.quote_id = uuid(4);
+        assert!(proof.check(&parties(), &key, &other_quote).is_err());
+        let mut other_direction = commit.clone();
+        other_direction.commit.direction = SwapDirection::Submarine;
+        assert!(proof.check(&parties(), &key, &other_direction).is_err());
     }
 }
