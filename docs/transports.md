@@ -37,13 +37,18 @@ The CLI client chooses with `negotiation` (`--negotiation`, `PUBKY_SWAP_NEGOTIAT
   reached, nothing was sent, and the client uses Pubky DMs for the rest of the run. Message-storage authentication waits until DMs are actually needed.
 - `iroh`: `direct/1` only. A provider without it fails the run.
 - `dm`: Pubky DMs only, as before this protocol existed.
+- `paykit-cap`: `direct/1` only, in the signed `paykit-cap.*` kinds for `swap/1`. Quotes and
+  contracts come back signed, and the client checks each signature against the key it dialed
+  before it pays anything. The provider has to advertise `paykit-cap-v1`, which the client checks
+  first. It never falls back to DMs, because a signed flow that continued unsigned would not be
+  one. See `docs/CLIENT_ADAPTERS.md`.
 
 `rendezvous_iroh` only controls the doorbell rung before the first DM. A build without the `iroh`
-feature always uses DMs, and `negotiation = "iroh"` is an error there.
+feature always uses DMs, and `negotiation = "iroh"` or `"paykit-cap"` is an error there.
 
 A provider accepts `direct/1` whenever it runs iroh rendezvous (`rendezvous_iroh`, on by default,
 and the `iroh` feature). Providers that do advertise `direct-rpc-v1` in their offer alongside
-`session-rpc-v1`. The ALPN handshake is the authoritative check, so a client does not need the
+`session-rpc-v1` and `paykit-cap-v1`. The ALPN handshake is the authoritative check, so a client does not need the
 offer before it connects.
 
 | Client | Provider | Path |
@@ -51,6 +56,8 @@ offer before it connects.
 | iroh build, `auto` | has `direct/1` | iroh, no DM polling |
 | iroh build, `auto` | older, or `rendezvous_iroh` off, or no `iroh` feature | refused before sending, then DMs |
 | iroh build, `iroh` | older | fails without sending |
+| iroh build, `paykit-cap` | advertises `paykit-cap-v1` | iroh, signed kinds |
+| iroh build, `paykit-cap` | without `paykit-cap-v1` | fails after reading the offer |
 | no `iroh` feature, or `dm` | any | DMs |
 | older client | any | DMs |
 

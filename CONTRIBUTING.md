@@ -74,7 +74,9 @@ test there asserts that every failure carries a remedy.
     `wallet_regtest`): spin up the backplane with
     `docker compose -f docker-compose.regtest.yml up -d`, then run the test with
     `-- --ignored --nocapture`.
-  - **Two-node LND swap tests** (`full_swap_regtest`, `submarine_swap_regtest`): the compose
+  - **Two-node LND swap tests** (`full_swap_regtest`, `submarine_swap_regtest`, and
+    `cap_swap_regtest`, which runs a provider daemon and negotiates in the signed `paykit-cap`
+    kinds, so it also needs network access for iroh's n0 discovery): the compose
     backplane includes two LND nodes; `scripts/setup-regtest-lnd.sh` opens a funded, balanced
     channel between them (so both swap directions have liquidity). Then export the creds and run:
 

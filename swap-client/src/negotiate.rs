@@ -6,7 +6,9 @@
 //! answer it, and the reply comes back on the same stream. A provider that predates the protocol,
 //! or cannot be reached over iroh, refuses the connection before anything is sent, and the client
 //! then uses Pubky DMs for the rest of the run. `Negotiation::Iroh` never falls back and
-//! `Negotiation::Dm` never tries iroh.
+//! `Negotiation::Dm` never tries iroh. `Negotiation::PaykitCap` is `Iroh` in the signed
+//! `paykit-cap.*` kinds for `swap/1` ([`CapChannel`]), and never falls back either: a signed flow
+//! that quietly continued in plain DMs would not be one.
 //!
 //! A request that fails after it may have reached the provider is sent again, identically, once
 //! over iroh and then over DMs. Every request here is read-only or idempotent for the same
@@ -40,6 +42,28 @@ pub enum Negotiation {
     Iroh,
     /// Pubky DMs only.
     Dm,
+    /// iroh only, in the signed `paykit-cap.*` kinds. The provider has to advertise
+    /// [`PAYKIT_CAP_FEATURE`].
+    #[serde(rename = "paykit-cap")]
+    PaykitCap,
+}
+
+impl Negotiation {
+    /// The spelling the flag, the environment and the config file use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Iroh => "iroh",
+            Self::Dm => "dm",
+            Self::PaykitCap => "paykit-cap",
+        }
+    }
+
+    /// Whether Pubky DMs carry what iroh cannot. Only `auto` falls back, and `dm` has nothing
+    /// else.
+    fn uses_dm(self) -> bool {
+        matches!(self, Self::Auto | Self::Dm)
+    }
 }
 
 impl std::str::FromStr for Negotiation {
@@ -49,6 +73,7 @@ impl std::str::FromStr for Negotiation {
             "auto" => Ok(Self::Auto),
             "iroh" => Ok(Self::Iroh),
             "dm" => Ok(Self::Dm),
+            "paykit-cap" => Ok(Self::PaykitCap),
             other => Err(anyhow!("unknown negotiation transport: {other}")),
         }
     }
@@ -1004,8 +1029,50 @@ fn rejection(reply: SwapMessage) -> Error {
     }
 }
 
+/// The channel tried before any fallback: plain kinds or the `paykit-cap.*` kinds, both over
+/// iroh `direct/1`.
 #[cfg(feature = "iroh")]
-pub type Preferred = IrohChannel;
+pub enum Preferred {
+    Iroh(IrohChannel),
+    Cap(CapChannel),
+}
+
+#[cfg(feature = "iroh")]
+impl Channel for Preferred {
+    const NAME: &'static str = "iroh";
+    async fn exchange(
+        &self,
+        request: &SwapMessage,
+        expected: fn(&SwapMessage) -> bool,
+    ) -> std::result::Result<SwapMessage, ExchangeError> {
+        match self {
+            Self::Iroh(channel) => channel.exchange(request, expected).await,
+            Self::Cap(channel) => channel.exchange(request, expected).await,
+        }
+    }
+
+    fn acknowledge(&self, request: &SwapMessage) -> Result<()> {
+        match self {
+            Self::Iroh(channel) => channel.acknowledge(request),
+            Self::Cap(channel) => channel.acknowledge(request),
+        }
+    }
+
+    async fn close(&self) {
+        match self {
+            Self::Iroh(channel) => Channel::close(channel).await,
+            Self::Cap(channel) => Channel::close(channel).await,
+        }
+    }
+
+    async fn maintain(&self) {
+        match self {
+            Self::Iroh(channel) => channel.maintain().await,
+            Self::Cap(channel) => channel.maintain().await,
+        }
+    }
+}
+
 #[cfg(not(feature = "iroh"))]
 pub type Preferred = Unavailable;
 
@@ -1080,20 +1147,23 @@ async fn connect_inner(
         let preferred = match preference {
             Negotiation::Dm => None,
             Negotiation::Auto => match IrohChannel::new(secret, provider).await {
-                Ok(channel) => Some(channel),
+                Ok(channel) => Some(Preferred::Iroh(channel)),
                 Err(e) => {
                     warn!("iroh unavailable ({e}); using Pubky DMs");
                     None
                 }
             },
-            Negotiation::Iroh => Some(IrohChannel::new(secret, provider).await?),
+            Negotiation::Iroh => Some(Preferred::Iroh(IrohChannel::new(secret, provider).await?)),
+            Negotiation::PaykitCap => {
+                Some(Preferred::Cap(CapChannel::new(secret, provider).await?))
+            }
         };
         // Signing in waits until a request actually needs DMs.
-        let fallback = match (preference != Negotiation::Iroh).then(dm).transpose() {
+        let fallback = match preference.uses_dm().then(dm).transpose() {
             Ok(fallback) => fallback,
             Err(error) => {
                 if let Some(channel) = &preferred {
-                    channel.close().await;
+                    Channel::close(channel).await;
                 }
                 return Err(error);
             }
@@ -1102,9 +1172,10 @@ async fn connect_inner(
     }
     #[cfg(not(feature = "iroh"))]
     {
-        if preference == Negotiation::Iroh {
+        if !preference.uses_dm() {
             return Err(anyhow!(
-                "negotiation = \"iroh\" needs a build with the `iroh` feature"
+                "negotiation = \"{}\" needs a build with the `iroh` feature",
+                preference.as_str()
             ));
         }
         if rendezvous_iroh {
@@ -1125,6 +1196,32 @@ mod tests {
 
     /// Snapshots per page the fake provider hands back, small so paging is exercised.
     const FAKE_PAGE: usize = 2;
+
+    /// #102: one spelling per mode, shared by the flag, the environment and the config file.
+    #[test]
+    fn every_negotiation_mode_round_trips_its_spelling() {
+        for mode in [
+            Negotiation::Auto,
+            Negotiation::Iroh,
+            Negotiation::Dm,
+            Negotiation::PaykitCap,
+        ] {
+            assert_eq!(mode.as_str().parse::<Negotiation>().unwrap(), mode);
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+            let parsed: Negotiation = serde_json::from_value(mode.as_str().into()).unwrap();
+            assert_eq!(parsed, mode);
+        }
+        assert!("paykitcap".parse::<Negotiation>().is_err());
+    }
+
+    /// #102: only `auto` and `dm` ever use DMs, so a signed flow never continues unsigned.
+    #[test]
+    fn paykit_cap_never_falls_back_to_dms() {
+        assert!(Negotiation::Auto.uses_dm());
+        assert!(Negotiation::Dm.uses_dm());
+        assert!(!Negotiation::Iroh.uses_dm());
+        assert!(!Negotiation::PaykitCap.uses_dm());
+    }
 
     /// A provider that admits one swap per quote and replays it for the same request.
     #[derive(Default)]
