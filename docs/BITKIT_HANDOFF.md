@@ -82,30 +82,29 @@ integration. Local fixtures alone do not demonstrate complete funded swap or mob
 
 ## Pubky dependency pins
 
-The target is the tree paykit-rs [`01de5dd`](https://github.com/pubky/paykit-rs/tree/01de5dd)
-builds on: pubky 0.16.2, pkarr 8.1.0 and pubky-noise 0.1.0. Sharing it lets the provider link
-paykit-rs ([issue 100](https://github.com/coreyphillips/pubky-swap/issues/100)).
+The tree is the one paykit-rs [`01de5dd`](https://github.com/pubky/paykit-rs/tree/01de5dd)
+builds on: pubky 0.16.2, pkarr 8.1.0 and pubky-noise 0.1.0. Since
+[issue 118](https://github.com/coreyphillips/pubky-swap/issues/118), `cargo tree -d
+--all-features` shows one pubky, one pubky-common and one pkarr.
 
 | Dependency | Pin | Pulls | Used for |
 | --- | --- | --- | --- |
 | `pubky-session` (`pubky`, iroh feature) | `=0.16.2` | pkarr 8.1.0, pubky-common 0.16.2 | delegated grant sessions in `session_rpc` |
-| pubky-messenger | rev `4fff0ce` | pubky 0.4.2, pkarr 3.10.0, pubky-common 0.3.1 | DMs |
-| `pkarr` (workspace) | `3.10` | | keys shared with the messenger |
-| `pubky-common` (workspace) | `0.3` | | recovery-file decryption for the iroh identity |
-| `pubky-testnet`, `pubky-homeserver` (dev) | `0.1.2` | pubky 0.4.2 | local homeserver tests |
+| pubky-messenger | rev `9ebe9f9` (0.5.0) | pubky 0.16.2 | DMs |
+| `pkarr` (workspace) | `8.1` | | keys shared with the messenger |
+| `pubky-common` (workspace) | `0.16.2` | | recovery-file decryption for the iroh identity |
+| `pubky-testnet` (in `pubky-transport/homeserver-test`) | `=0.16.2` | pubky-homeserver 0.16.2, sqlite | local homeserver tests, in their own workspace |
 
-The session side is on 0.16.2, so pubky 0.11.0 and pkarr 8.0.1 are gone. The lockfile still
-holds pubky 0.4.2 and pkarr 3.10.0 until the messenger moves. The remaining steps are:
+The local homeserver tests sit in their own workspaces (`paykit-identity/homeserver-test`,
+`pubky-transport/homeserver-test`), each with its own lockfile and a CI step: pubky-testnet 0.16
+links sqlite through rusqlite 0.32 (http-relay) and sqlx-sqlite (libsqlite3-sys 0.30), and
+bdk_wallet holds the main workspace on rusqlite 0.31. Both link `sqlite3`, and Cargo allows one.
+They need Postgres, through Docker or `TEST_PUBKY_CONNECTION_STRING`.
 
-1. Publish a messenger revision on pubky 0.16.2.
-2. Pin it here, with workspace `pkarr` 8.1 and `pubky-common` 0.16.2. With those three alone,
-   `cargo tree -d` shows no second pubky, pubky-common or pkarr.
-3. Replace the 0.1.2 homeserver test dependencies. `pubky-testnet` 0.16.2 does not resolve in
-   this workspace: its `http-relay` 0.7 needs rusqlite 0.32, and bdk_wallet 3.1 (through
-   bdk_chain 0.23) holds swap-common on rusqlite 0.31. Both link `sqlite3`, and Cargo allows
-   one. Either bdk moves to a rusqlite that matches, or the local homeserver tests move out of
-   this workspace. That testnet also needs Postgres, through `TEST_PUBKY_CONNECTION_STRING`
-   or its `docker-postgres` feature, which is what paykit-rs uses.
+Messenger 0.5.0 signs in with a session grant, and falls back to the cookie flow on a homeserver
+without the grant endpoint. DMs keep the cookie `/session` flow scoped to
+`/pub/private_messages/`, which 0.16 homeservers still serve. Its DM paths, message cipher,
+recovery-file format and bare z32 key form are unchanged (fixtures in the messenger repo).
 
 API changes to expect on 0.16:
 
@@ -209,7 +208,7 @@ The tracked regtest item is [pubky-swap issue 40](https://github.com/coreyphilli
 - The required job should be the real `full regtest integration tests` job, including HTLC behavior, spend history, reorg handling, wallet behavior and reverse, submarine and taproot flows using LND. Main branch protection was absent and repository rulesets were empty during inspection. Require the final commit's successful run in the merge process; do not treat an older green commit as validation of the merged work. Repository branch protection was not changed by this implementation.
 - The last observed successful reference run was [35600418780](https://github.com/coreyphillips/pubky-swap/actions/runs/35600418780), for commit `51493f872961a2123ce2651613d67b1278e8e046`. This is a historical reference only.
 - Docker 29.5.3 and its daemon were available. Existing `bitcoin`, `electrum` and `lnd` containers were live, with names or ports overlapping the repository stack. Do not run fixed-name compose teardown or regtest setup against them. Use CI or a separately named stack with distinct ports and data directories.
-- A local homeserver benchmark does not require Docker. Messenger's `pubky-testnet` fixtures create temporary identities and homeservers. `tests/test_prepared_messages.rs` covers persisted prepared resources and restart. The older `tests/test_delete_methods.rs` also contains external tests requiring local key files, so select the local fixture tests rather than running that file unfiltered.
+- The local homeserver tests and benchmark need Docker for Postgres (or `TEST_PUBKY_CONNECTION_STRING`) since #118 moved them to pubky 0.16.2, in `pubky-transport/homeserver-test`. Messenger's `pubky-testnet` fixtures create temporary identities and homeservers, and since messenger 0.5.0 none of its tests reach the live network. `tests/test_prepared_messages.rs` covers persisted prepared resources and restart.
 - `pubky-transport/src/session_rpc.rs:658` has a local DHT and raw-public-key TLS fixture on ephemeral loopback ports. `p2p.rs:933` has an ignored cold/warm latency test whose relay branch depends on external relay reachability. Keep public relay results separate from repeatable local measurements.
 - Benchmark cold and warm direct sessions against local homeserver delivery, reporting p50/p95 wall time and LIST/GET/PUT/DELETE/session attempts and bytes. Include fresh history, old history, restart with pending work, ambiguous response loss, rate limiting, unavailable peer, and two active scopes. Report injected delays separately from measured network latency. Verify that cleanup reduces old resource listings without removing pending or recovery state.
 

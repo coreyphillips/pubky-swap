@@ -1,4 +1,7 @@
 /target
+# The homeserver test workspaces build in their own directories.
+/paykit-identity/homeserver-test/target
+/pubky-transport/homeserver-test/target
 **/*.rs.bk
 .DS_Store
 *.pkarr

@@ -33,6 +33,7 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path paykit-identity/homeserver-test/Cargo.toml --check
+          cargo fmt --manifest-path pubky-transport/homeserver-test/Cargo.toml --check
 
       - name: Clippy (default + all feature combos)
         run: |
@@ -70,3 +71,9 @@ jobs:
         run: |
           cargo clippy --manifest-path paykit-identity/homeserver-test/Cargo.toml --all-targets -- -D warnings
           cargo test --manifest-path paykit-identity/homeserver-test/Cargo.toml
+
+      # The same split for pubky-transport's DM delivery tests on pubky 0.16.2 (#118).
+      - name: DM delivery against a local homeserver
+        run: |
+          cargo clippy --manifest-path pubky-transport/homeserver-test/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path pubky-transport/homeserver-test/Cargo.toml

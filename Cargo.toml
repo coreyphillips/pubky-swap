@@ -10,8 +10,8 @@ members = [
     "swap-client",
 ]
 resolver = "2"
-# Its own workspace and lockfile: see its manifest.
-exclude = ["paykit-identity/homeserver-test"]
+# Their own workspaces and lockfiles: see their manifests.
+exclude = ["paykit-identity/homeserver-test", "pubky-transport/homeserver-test"]
 
 [workspace.package]
 version = "0.1.0"
@@ -26,12 +26,13 @@ license = "MIT"
 # `Txid`s at worst.
 bitcoin = "0.32"
 
-# Pubky & Pkarr (same versions proven in bitcoin-batch-coordinator)
-pubky-messenger = { git = "https://github.com/coreyphillips/pubky-messenger", rev = "4fff0ce2183f7273c0418801c262ed291a0a145a" }
-pkarr = "3.10"
+# Pubky & Pkarr: the versions pubky 0.16.2 builds on, which paykit-rs uses too, so the whole tree
+# resolves one pubky, one pubky-common and one pkarr.
+pubky-messenger = { git = "https://github.com/coreyphillips/pubky-messenger", rev = "9ebe9f95e211549ae240993a15d1b917c9f176b7" }
+pkarr = "8.1"
 # Recovery-file decryption, for the iroh identity. One `pkarr` resolves across this and
 # pubky-messenger, so their `Keypair` is the same type and the secret is the same secret.
-pubky-common = "0.3"
+pubky-common = "0.16.2"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

@@ -1,0 +1,19 @@
+[package]
+name = "pubky-transport-homeserver-test"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# A workspace of its own, like paykit-identity/homeserver-test. pubky-testnet 0.16 links sqlite
+# through http-relay (rusqlite 0.32) and sqlx-sqlite (libsqlite3-sys 0.30), bdk_wallet holds the
+# main workspace on rusqlite 0.31, and one resolution links sqlite3 once.
+[workspace]
+
+[dev-dependencies]
+# `test-util` re-exports the messenger it pins, so its revision is named only in the root manifest.
+pubky-transport = { path = "..", features = ["test-util"] }
+pubky-testnet = { version = "=0.16.2", features = ["docker-postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+futures = "0.3"
+serde_json = "1"
+tempfile = "3"

@@ -16,8 +16,6 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-#[cfg(test)]
-mod delivery_tests;
 mod inbox;
 mod journal;
 pub mod outbox;
@@ -198,6 +196,38 @@ pub fn identity_from_secret(secret: &[u8; 32]) -> String {
     pkarr::Keypair::from_secret_key(secret)
         .public_key()
         .to_string()
+}
+
+/// What `homeserver-test`, a workspace of its own, reaches past the public API for: building a
+/// transport around a messenger it configured, the clock the outbox uses, and the outbox and inbox
+/// journal it checks. Not for production use.
+#[cfg(feature = "test-util")]
+#[doc(hidden)]
+pub mod test_util {
+    use super::*;
+
+    /// The messenger this crate pins, so that workspace names it once.
+    pub use pubky_messenger;
+
+    pub fn wrap(messenger: PrivateMessengerClient) -> Transport {
+        Transport::wrap(messenger)
+    }
+
+    pub fn unix_time() -> u64 {
+        super::unix_time()
+    }
+
+    pub fn outbox(transport: &Transport) -> Option<&outbox::Outbox> {
+        transport.outbox.as_ref()
+    }
+
+    /// Mark every message `peer` has listed as handled, without reading the bodies.
+    pub async fn acknowledge_listed(transport: &Transport, peer: &PublicKey) -> Result<usize> {
+        transport
+            .inboxes
+            .acknowledge_listed(&transport.messenger, peer)
+            .await
+    }
 }
 
 /// Transport layer wrapper for pubky-messenger.
@@ -865,7 +895,7 @@ mod tests {
     /// conversation, or the poller backs off as if the peer were merely quiet.
     #[tokio::test]
     async fn an_unreachable_homeserver_is_a_failed_read_not_an_empty_one() {
-        let mut builder = pubky_messenger::pubky::Client::builder();
+        let mut builder = pubky_messenger::pubky::PubkyHttpClient::builder();
         // Resolution goes only to a relay that refuses connections, so neither conversation
         // listing can reach a homeserver.
         builder.pkarr(|pkarr| {

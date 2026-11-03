@@ -9,6 +9,8 @@ description = "Generic, message-type-agnostic transport over pubky-messenger (en
 [features]
 # Direct P2P rendezvous over iroh (NAT-holepunched QUIC, discovery via pkarr/mainline).
 iroh = ["dep:iroh", "dep:bip39", "dep:pubky-common", "dep:pubky-session"]
+# What `homeserver-test` (its own workspace) needs past the public API. Not for production use.
+test-util = []
 
 [dependencies]
 fs2 = "0.4"
@@ -27,8 +29,6 @@ pubky-common = { workspace = true, optional = true }
 pubky-session = { package = "pubky", version = "=0.16.2", optional = true }
 
 [dev-dependencies]
-pubky-homeserver = "0.1.2"
-pubky-testnet = "0.1.2"
 tempfile = "3"
 # Local DHT and raw-public-key TLS for the authorization lookup fixture in `session_rpc`.
 mainline = { version = "8", default-features = false }

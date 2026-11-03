@@ -83,7 +83,12 @@ mod tests {
     async fn a_recovery_file_yields_the_same_identity_as_the_messenger_reads() {
         const PASSPHRASE: &str = "correct horse battery staple";
         let keypair = pkarr::Keypair::random();
-        let bytes = pubky_common::recovery_file::create_recovery_file(&keypair, PASSPHRASE);
+        // pubky-common 0.16 writes from its own wrapper. The checks below keep the pkarr key,
+        // whose `to_string` is the bare z32 that peer ids use.
+        let bytes = pubky_common::recovery_file::create_recovery_file(
+            &pubky_common::crypto::Keypair::from(keypair.clone()),
+            PASSPHRASE,
+        );
 
         let path = std::env::temp_dir().join(format!(
             "pubky-swap-recovery-{}.pkarr",
