@@ -649,6 +649,24 @@ fn a_provider_without_a_homeserver_does_not_advertise_dm_retention() {
     );
 }
 
+/// #102: the signed kinds ride `direct/1`, so they are advertised exactly when it is.
+#[test]
+fn paykit_cap_is_advertised_with_direct_requests() {
+    for rendezvous_iroh in [true, false] {
+        let config = ProviderConfig {
+            rendezvous_iroh,
+            ..Default::default()
+        };
+        let offer = build_offer(&config, "provider", Network::Regtest, None, 2, true).unwrap();
+        let has = |feature: &str| offer.features.iter().any(|f| f == feature);
+        assert_eq!(has(PAYKIT_CAP_FEATURE), has("direct-rpc-v1"));
+        assert_eq!(
+            has(PAYKIT_CAP_FEATURE),
+            cfg!(feature = "iroh") && rendezvous_iroh
+        );
+    }
+}
+
 #[test]
 fn offers_carry_the_configured_fund_within() {
     let config = ProviderConfig {

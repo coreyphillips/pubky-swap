@@ -92,7 +92,8 @@ pub struct ClientConfig {
     /// know it should look.
     pub rendezvous_iroh: bool,
     /// Transport for offer, quote, creation and status requests: `auto` (iroh when the provider
-    /// supports it, Pubky DMs otherwise), `iroh`, or `dm`. See [`negotiate`].
+    /// supports it, Pubky DMs otherwise), `iroh`, `dm`, or `paykit-cap` (iroh in the signed
+    /// `paykit-cap.*` kinds, never DMs). See [`negotiate`].
     pub negotiation: Negotiation,
     /// Confirmations this client requires before acting, whatever the provider quotes. `0` means
     /// "use the network default" (2 on mainnet, 1 elsewhere).
@@ -375,6 +376,18 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     result
 }
 
+/// Refuse a provider whose offer lacks [`PAYKIT_CAP_FEATURE`], for `negotiation = "paykit-cap"`.
+fn require_paykit_cap(offer: &SwapOffer) -> Result<()> {
+    if offer.features.iter().any(|f| f == PAYKIT_CAP_FEATURE) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "the provider does not advertise {PAYKIT_CAP_FEATURE}, so it cannot answer \
+             negotiation = \"paykit-cap\"; use auto or iroh"
+        ))
+    }
+}
+
 async fn run_negotiation<P: Channel, F: Channel>(
     config: &ClientConfig,
     network: Network,
@@ -382,6 +395,12 @@ async fn run_negotiation<P: Channel, F: Channel>(
     negotiator: &Negotiator<P, F>,
     client_pkarr: &str,
 ) -> Result<()> {
+    // A provider without the signed kinds drops them unanswered, so check its offer first rather
+    // than wait on a quote that never comes.
+    if config.negotiation == Negotiation::PaykitCap {
+        require_paykit_cap(&negotiator.offer().await?)?;
+    }
+
     // For reverse swaps the client owns the preimage and the on-chain claim key.
     let secp = Secp256k1::new();
     let (claim_sk, claim_pk) = swap_common::random_keypair(&secp);
@@ -1101,6 +1120,37 @@ fn build_chain(_config: &ClientConfig) -> Result<Arc<dyn ChainWatcher>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #102: `paykit-cap` needs a provider that says it serves the signed kinds.
+    #[test]
+    fn paykit_cap_needs_the_offer_feature() {
+        let offer = |features: &[&str]| SwapOffer {
+            request_id: None,
+            offer_id: Uuid::nil(),
+            provider_pkarr: "provider".into(),
+            network: swap_common::NetworkSpec::Regtest,
+            directions: vec![SwapDirection::Reverse],
+            min_amount_sat: 1,
+            max_amount_sat: 1_000_000,
+            base_fee_sat: 0,
+            fee_ppm: 0,
+            required_confirmations: 1,
+            htlc_timeout_blocks: 144,
+            lightning_node_id: None,
+            valid_until_unix: u64::MAX,
+            fund_within_secs: 300,
+            onchain_fee_sat: 0,
+            fee_rate_sat_vb: 1,
+            protocol_version: PROTOCOL_VERSION,
+            features: features.iter().map(|f| f.to_string()).collect(),
+        };
+        assert!(require_paykit_cap(&offer(&["direct-rpc-v1", PAYKIT_CAP_FEATURE])).is_ok());
+        let refused = require_paykit_cap(&offer(&["direct-rpc-v1"])).unwrap_err();
+        assert!(
+            refused.to_string().contains(PAYKIT_CAP_FEATURE),
+            "{refused}"
+        );
+    }
 
     #[tokio::test]
     async fn resume_only_needs_no_identity() {

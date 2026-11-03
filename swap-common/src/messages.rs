@@ -141,6 +141,11 @@ pub const PAYKIT_EVENT_MAX_BYTES: usize = 1_000;
 /// [`SwapRequest::owner_ref`].
 pub const SWAP_LIST_FEATURE: &str = "swap-list-v1";
 
+/// The offer feature of a provider that answers the `paykit-cap.*` kinds for `swap/1` on iroh
+/// `direct/1` (see [`crate::paykit_cap`]). A client that asks for signed quotes and contracts
+/// checks for it first: a provider without it drops those kinds unanswered.
+pub const PAYKIT_CAP_FEATURE: &str = "paykit-cap-v1";
+
 /// The feature of a side that sends, or wants, the claimable hint.
 ///
 /// A provider advertising it, sent a [`QuoteRequest`] that lists it, tells the owner of a reverse
@@ -1168,9 +1173,12 @@ mod tests {
             "boltz-taproot-v1",
             "swap-status-v1",
             SWAP_LIST_FEATURE,
+            CLAIMABLE_HINT_FEATURE,
+            SWAP_WAKE_FEATURE,
             "dm-retention-v1",
             "session-rpc-v1",
             "direct-rpc-v1",
+            PAYKIT_CAP_FEATURE,
         ]
         .map(String::from)
         .to_vec();

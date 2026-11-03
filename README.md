@@ -298,6 +298,10 @@ REGTEST_ELECTRUM_URL=tcp://127.0.0.1:60001 \
 
 # Full submarine swap across two LND nodes (same env; provider needs outbound liquidity)
   cargo test -p swap-provider --features full --test submarine_swap_regtest -- --ignored --nocapture
+
+# Both directions through a provider daemon, negotiated in the signed paykit-cap kinds (same env;
+# also needs network access for iroh's n0 discovery)
+  cargo test -p swap-provider --features full --test cap_swap_regtest -- --ignored --nocapture --test-threads=1
 ```
 
 ## License

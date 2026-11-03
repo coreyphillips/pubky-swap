@@ -274,7 +274,16 @@ Golden vectors, from `swap-common/src/paykit_cap.rs` (`golden_vectors`), for sig
 | `signer` | `ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c` |
 
 The inputs are the fixtures in that test. `swap_client::negotiate::CapChannel` is the client side:
-it sends these kinds and checks each signature against the provider it dialed.
+it sends these kinds and checks each signature against the provider it dialed. The CLI client
+uses it with `--negotiation paykit-cap` (`PUBKY_SWAP_NEGOTIATION`, or `negotiation` in the config
+file). It reads the offer first and stops unless the provider advertises `paykit-cap-v1`, and it
+never falls back to DMs. The regtest step `cap_swap_regtest` runs a reverse and a submarine swap
+this way against a provider daemon, and checks the stored contract as a third party would.
+
+What the client checked lives only in `CapChannel`'s memory. A creation recovered by a later
+process (`negotiation_recovery`) is replayed as a plain `SwapRequest` on `direct/1`, which the
+provider answers with the same swap; the signed contract stays with the provider's record, and
+`status_request` returns it.
 
 The rfq, quote and commit fit 1,000 bytes. A signed contract does not yet: with the P2WSH
 script or Taproot tree the provider always sends, it is over. A `status` reply carries the full

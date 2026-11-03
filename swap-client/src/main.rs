@@ -122,7 +122,8 @@ struct Cli {
     no_rendezvous_iroh: bool,
 
     /// Transport for requests to the provider: `auto` (iroh when the provider supports it, Pubky
-    /// DMs otherwise), `iroh` (never DMs), or `dm` (never iroh).
+    /// DMs otherwise), `iroh` (never DMs), `dm` (never iroh), or `paykit-cap` (iroh in the signed
+    /// `paykit-cap.*` kinds: quotes and contracts checked against the provider's key; never DMs).
     #[arg(long)]
     negotiation: Option<String>,
 
