@@ -21,6 +21,7 @@ compile_error!(
 pub mod access;
 mod cap_adapter;
 mod delivery;
+mod descriptor;
 mod dispatch;
 #[cfg(feature = "paykit")]
 pub mod paykit;
@@ -1215,12 +1216,18 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
     let risk = risk::RiskManager::new(risk_limits(&config));
     let offer: SharedOffer = Arc::new(RwLock::new(None));
     let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg_attr(
+        not(any(feature = "status", feature = "paykit")),
+        allow(unused_variables)
+    )]
+    let descriptors = descriptor::SharedDescriptors::default();
     #[cfg(feature = "status")]
     status::spawn(status::State {
         config: Arc::new(config.clone()),
         store: store.clone(),
         risk: risk.clone(),
         offer: offer.clone(),
+        descriptor: descriptors.clone(),
         ready: ready.clone(),
         provider_pkarr: provider_pkarr.clone(),
     })
@@ -1404,6 +1411,12 @@ pub async fn run(config: ProviderConfig) -> Result<()> {
         lightning_node_id,
         offer.clone(),
     );
+
+    // Only a provider that can execute swaps advertises them where any wallet can read it.
+    #[cfg(feature = "paykit")]
+    if config.homeserver && ctx.capable {
+        paykit::spawn_descriptor_publisher(&config, offer.clone(), descriptors, &ctx.cap);
+    }
 
     if !config.homeserver {
         info!(

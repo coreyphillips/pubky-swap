@@ -222,6 +222,7 @@ can see what the daemon is doing without parsing its logs:
 | `/swaps` | live swaps, and the most recent finished ones |
 | `/limits` | exposure and concurrency against their ceilings, and per counterparty |
 | `/offer` | the offer currently being advertised |
+| `/descriptor` | the signed `swap/1` Capability Descriptor last published (feature `paykit`), or 404 once it lapses |
 | `/earnings` | completed, refunded and failed swaps, volume, and fees earned |
 
 Read-only by design: nothing here moves money or changes a swap. It binds loopback and requires a

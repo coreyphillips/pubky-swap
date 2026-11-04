@@ -36,9 +36,15 @@ impl CapState {
     }
 
     /// This provider's pubky, as its signed quotes name it.
-    #[cfg(all(test, feature = "iroh"))]
+    #[cfg(any(feature = "paykit", all(test, feature = "iroh")))]
     pub(crate) fn provider(&self) -> &str {
         &self.provider
+    }
+
+    /// The signer, which the Capability Descriptor shares with the quotes and contracts.
+    #[cfg(feature = "paykit")]
+    pub(crate) fn signer(&self) -> Arc<dyn CapSigner> {
+        self.signer.clone()
     }
 
     /// A key nobody holds, for builds and tests that never sign anything they keep.

@@ -11,7 +11,9 @@
 //! - [`validate`] — client-side checks on a provider's quote, acceptance, and invoice.
 //! - [`store`] — crash-safe persistence of in-flight swaps, shared by both sides.
 //! - [`keys`] — key helpers.
+//! - [`cap_descriptor`]: the public `swap/1` Capability Descriptor built from a [`SwapOffer`].
 
+pub mod cap_descriptor;
 pub mod chain;
 pub mod error;
 pub mod fee_bump;
