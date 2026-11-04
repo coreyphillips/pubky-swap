@@ -48,6 +48,9 @@ pub(crate) fn spawn_descriptor_publisher(
     // Signing in again checks the Paykit records again, so a rotated key generation reaches the
     // descriptor within this long, and a session the homeserver dropped is replaced before use.
     const SESSION_AGE: Duration = Duration::from_secs(3600);
+    // The Pubky clients set no request timeout, so without this a stalled homeserver would hold
+    // the loop past every retry and renewal while the published descriptor lapsed.
+    const ATTEMPT: Duration = Duration::from_secs(60);
     let secret = match identity_secret(config) {
         Ok(secret) => secret,
         Err(e) => return warn!("not publishing the swap/1 descriptor: {e:#}"),
@@ -76,7 +79,7 @@ pub(crate) fn spawn_descriptor_publisher(
                 sleep(POLL).await;
                 continue;
             };
-            let outcome = async {
+            let attempt = async {
                 if writer.is_none() {
                     let session = paykit_identity::DescriptorWriter::sign_in(&secret).await?;
                     writer = Some((session, Instant::now()));
@@ -91,8 +94,12 @@ pub(crate) fn spawn_descriptor_publisher(
                 )?;
                 session.put(DESCRIPTOR_PATH, bytes).await?;
                 anyhow::Ok(descriptor)
-            }
-            .await;
+            };
+            let outcome = tokio::time::timeout(ATTEMPT, attempt)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(anyhow::anyhow!("no answer within {}s", ATTEMPT.as_secs()))
+                });
             match outcome {
                 Ok(descriptor) => {
                     // Every refresh rewrites it, so only the first after a failure is news.
