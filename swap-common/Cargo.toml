@@ -20,6 +20,8 @@ anyhow.workspace = true
 tracing.workspace = true
 # Paykit Capabilities signatures and the sealed invoice blob. Both already in the lockfile.
 ed25519-dalek = "2"
+# The descriptor's base64url `sig` (Capabilities §6.1). Already in the lockfile.
+base64 = "0.22"
 chacha20poly1305 = "0.10"
 # `time` for the fee-bump loop; `rt`/`rt-multi-thread` for `chain::blocking` (block_in_place).
 tokio = { version = "1", features = ["time", "rt", "rt-multi-thread"] }

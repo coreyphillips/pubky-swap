@@ -170,6 +170,53 @@ pub async fn sign_in_and_setup(
     setup(&session, &identity, generation).await
 }
 
+/// Writes this app's Capability Descriptor file under a signed-in session.
+///
+/// It signs in only once the identity's Paykit records are published and match what it derives,
+/// because a reader drops a descriptor whose `app_id` the App Registry does not list (§6.2).
+pub struct DescriptorWriter {
+    session: PubkySession,
+    generation: u64,
+}
+
+impl DescriptorWriter {
+    pub async fn sign_in(identity_secret: &[u8; 32]) -> Result<Self> {
+        let inspection = inspect_published(identity_secret).await?;
+        let generation = match inspection.generation {
+            Some(generation) if inspection.is_healthy() => generation,
+            _ => bail!(
+                "the Paykit identity is not set up ({inspection:?}); run swap-provider \
+                 --paykit-setup"
+            ),
+        };
+        let identity = Keypair::from_secret(identity_secret);
+        let session = pubky::Pubky::new()
+            .context("build a Pubky client")?
+            .signer(identity)
+            .signin(pubky::ClientId::new(APP_ID).map_err(|e| anyhow!("{e}"))?)
+            .await
+            .context("sign in to the homeserver")?;
+        Ok(Self {
+            session,
+            generation,
+        })
+    }
+
+    /// The key generation the published authorization was at when this writer signed in.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
+        self.session
+            .storage()
+            .put(path, bytes)
+            .await
+            .with_context(|| format!("write {path}"))?;
+        Ok(())
+    }
+}
+
 /// [`inspect`] over the public Pubky network.
 pub async fn inspect_published(identity_secret: &[u8; 32]) -> Result<Inspection> {
     let storage = PublicStorage::new().context("build a Pubky client")?;

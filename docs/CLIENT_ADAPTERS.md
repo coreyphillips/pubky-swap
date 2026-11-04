@@ -50,6 +50,9 @@ Only providers configured for execution advertise `boltz-taproot-v1`, `swap-stat
 `swap-list-v1`. Capabilities should be checked before requesting a Taproot contract or a
 listing.
 
+A provider built with `paykit` also publishes its offer as a signed Capability Descriptor on its
+homeserver; see [The swap/1 Capability Descriptor](#the-swap1-capability-descriptor).
+
 ## Refusal codes
 
 Every `Reject` carries `code`, one of the strings below, and `Reject::code()` parses it into
@@ -306,6 +309,59 @@ signed quote is about 1,350 bytes, and a signed contract is over too: with the P
 Taproot tree the provider always sends, it is 1,048 to 1,208 bytes. A `status` reply carries the
 full snapshot and contract, and is larger still. #119 tracks fitting them into an Encrypted
 Link.
+
+## The swap/1 Capability Descriptor
+
+A provider built with `paykit`, configured for execution and running with a homeserver publishes
+a signed `paykit-cap.descriptor` (Paykit Capabilities §6) at
+`/pub/paykit/ext/capabilities/v1/apps/pubky-swap.json`. A wallet reads it from the provider's
+homeserver instead of asking every contact for an offer, so finding providers tells nobody that a
+swap is wanted. `swap_common::cap_descriptor` builds and verifies it. Nothing is written until
+`--paykit-setup` has published the App Registry entry and the Noise Key Authorization, since a
+reader drops a descriptor whose `app_id` the owner's registry does not list.
+
+It has one `swap/1` entry, built from the current `SwapOffer`:
+
+| Member | From |
+| --- | --- |
+| `edges[].min` | `effective_min_amount_sat()`: the configured minimum raised to 10 × `onchain_fee_sat` |
+| `edges[].max` | `max_amount_sat` |
+| `edges[].fee` | `{"base": base_fee_sat, "ppm": fee_ppm, "onchain": onchain_fee_sat}`, so `base + floor(a × ppm / 1e6) + onchain` is `quote_fee(a).total_fee_sat` |
+| `edges[].fund_within_secs` | `fund_within_secs` |
+| `edges[].lock_profiles` | `taproot_boltz` only when the offer lists `boltz-taproot-v1`, then `p2wsh` |
+| `edges[].atomicity`, `sides`, `unit` | `hash`, `["exact_out"]`, `sat` |
+| `terms` | `offer_id`, `network`, `htlc_timeout_blocks`, `required_confirmations` |
+| `contact.rfq` | `iroh:pubky-swap/direct/1`, when the offer lists `paykit-cap-v1` and `direct-rpc-v1` |
+| `contact.intro` | `{"type": "iroh", "alpn": "pubky-swap/direct/1"}`, when the offer lists `direct-rpc-v1` |
+
+Amounts are integer strings. The offer-wide values are the same on every edge.
+
+Edges name exact Payment Endpoint Identifiers, one edge per identifier, as `swap/1` settled on
+pubky/paykit-rs#229: a reverse edge runs from `btc-lightning-bolt11` to each on-chain output type a
+claim can pay, and a submarine edge from each output type a lockup can be funded from. The types
+are `p2pkh`, `p2sh`, `p2wpkh`, `p2wsh` and `p2tr`, so a two-direction offer has ten edges. The rail
+segment names the network: `btc-bitcoin-*` on mainnet, `btc-signet-*`, `btc-regtest-*` and
+`btc-testnet-*` elsewhere, with `terms.network` saying the same. The Lightning identifier is
+`btc-lightning-bolt11` on every network, because the invoice names its own.
+
+The signature is Ed25519 over `paykit-cap/descriptor/v1\0` followed by the JCS form of the
+descriptor without `sig`, base64url-encoded without padding into `sig`. The signer is the one the
+`paykit-cap.*` adapter uses. `key_generation` is the published Noise Key Authorization's
+generation when the provider last signed in, which it does again at least hourly. The envelope is
+closed: an unknown member makes it unreadable.
+
+The refresher rebuilds the offer every `quote_ttl_secs / 2` (at least 30 s) with a new `offer_id`,
+and an RFQ naming an older id is refused, so every rebuild is a rewrite. A fee move that changes
+the effective minimum reaches the file the same way. `valid_until` is the offer's own expiry, so a
+provider that stops refreshing lapses within one quote TTL. `seq` rises on every rewrite and
+never falls below the Unix time, so it keeps rising across restarts without being stored. A
+descriptor whose offer has expired is never written, and the status API's `/descriptor` returns
+404 once the published one lapses.
+
+What a reader cannot do yet: verify the signer under §5. Paykit Capabilities settled on a signing
+subkey delegated by the routing key (ask 3 on pubky/paykit-rs#229), published at
+`/pub/paykit/ext/capabilities/v1/signing-key.json`. Until that delegation is published, the
+signer is the provider's identity key, the one a client dials on `direct/1`.
 
 ## Amounts and fees
 

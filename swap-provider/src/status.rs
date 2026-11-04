@@ -112,6 +112,8 @@ pub(crate) struct State {
     pub store: Arc<dyn swap_common::store::SwapStore>,
     pub risk: Arc<risk::RiskManager>,
     pub offer: SharedOffer,
+    /// The `swap/1` Capability Descriptor last written to the homeserver.
+    pub descriptor: crate::descriptor::SharedDescriptors,
     /// Set once the daemon has worked out whether it can execute swaps. False until then, which
     /// is the honest answer while it is still finding out.
     pub ready: Arc<AtomicBool>,
@@ -151,6 +153,7 @@ pub(crate) async fn spawn(state: State) -> Result<()> {
         .route("/swaps", get(swaps))
         .route("/limits", get(limits))
         .route("/offer", get(offer_route))
+        .route("/descriptor", get(descriptor_route))
         .route("/earnings", get(earnings))
         .with_state(api);
 
@@ -496,6 +499,16 @@ async fn offer_route(Extract(api): Extract<Api>, headers: axum::http::HeaderMap)
     Json(offer).into_response()
 }
 
+/// The published `swap/1` descriptor, or 404 once it has lapsed: a reader would drop it too.
+async fn descriptor_route(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
+    guard!(api, headers);
+    let book = api.state.descriptor.read().await;
+    match book.current(crate::now_unix()) {
+        Some(descriptor) => Json(descriptor).into_response(),
+        None => (StatusCode::NOT_FOUND, "no current swap/1 descriptor").into_response(),
+    }
+}
+
 async fn earnings(Extract(api): Extract<Api>, headers: axum::http::HeaderMap) -> Response {
     guard!(api, headers);
     let all = match api.state.store.load_all() {
@@ -701,6 +714,7 @@ mod tests {
                 store: Arc::new(UnreadableStore),
                 risk: risk::RiskManager::new(Default::default()),
                 offer: Arc::new(RwLock::new(None)),
+                descriptor: Default::default(),
                 ready: Arc::new(AtomicBool::new(true)),
                 provider_pkarr: String::new(),
             }),
@@ -722,6 +736,71 @@ mod tests {
         );
         assert!(check.detail.contains("permission denied"));
         assert!(check.remedy.is_some(), "a failure must say what to do");
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_descriptor_is_not_served() {
+        use swap_common::paykit_cap::Ed25519Signer;
+        use swap_common::{NetworkSpec, SwapDirection, SwapOffer, PROTOCOL_VERSION};
+
+        let dir = std::env::temp_dir().join(format!("descriptor-route-{}", uuid::Uuid::new_v4()));
+        let api = Api {
+            state: Arc::new(State {
+                config: Arc::new(ProviderConfig::default()),
+                store: Arc::new(swap_common::store::JsonFileSwapStore::new(&dir).unwrap()),
+                risk: risk::RiskManager::new(Default::default()),
+                offer: Arc::new(RwLock::new(None)),
+                descriptor: Default::default(),
+                ready: Arc::new(AtomicBool::new(true)),
+                provider_pkarr: String::new(),
+            }),
+            token: "t".into(),
+            health: Arc::new(RwLock::new(None)),
+        };
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            "Bearer t".parse().unwrap(),
+        );
+        let served = |api: Api| {
+            let headers = headers.clone();
+            async move { descriptor_route(Extract(api), headers).await.status() }
+        };
+        assert_eq!(served(api.clone()).await, StatusCode::NOT_FOUND);
+
+        let now = crate::now_unix();
+        let offer = |valid_until_unix| SwapOffer {
+            request_id: None,
+            offer_id: uuid::Uuid::new_v4(),
+            provider_pkarr: String::new(),
+            network: NetworkSpec::Regtest,
+            directions: vec![SwapDirection::Reverse],
+            min_amount_sat: 10_000,
+            max_amount_sat: 100_000,
+            base_fee_sat: 0,
+            fee_ppm: 0,
+            required_confirmations: 1,
+            htlc_timeout_blocks: 144,
+            lightning_node_id: None,
+            valid_until_unix,
+            fund_within_secs: 0,
+            onchain_fee_sat: 0,
+            fee_rate_sat_vb: 1,
+            protocol_version: PROTOCOL_VERSION,
+            features: vec![],
+        };
+        let signer = Ed25519Signer::from_secret(&[1; 32]);
+        for (valid_until, expected) in [(now + 600, StatusCode::OK), (now, StatusCode::NOT_FOUND)] {
+            let mut book = api.state.descriptor.write().await;
+            // Signed a second before it lapses, as the publisher last wrote it.
+            let (descriptor, _) = book
+                .next(&offer(valid_until), "owner", 1, &signer, valid_until - 1)
+                .unwrap();
+            book.published(descriptor);
+            drop(book);
+            assert_eq!(served(api.clone()).await, expected);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The reason a swap failed belongs in a field, not inside the state name.

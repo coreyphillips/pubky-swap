@@ -1,9 +1,14 @@
-//! The provider's Paykit identity (feature `paykit`): `--paykit-setup` and the doctor's check.
+//! The provider's Paykit identity (feature `paykit`): `--paykit-setup`, the doctor's check, and
+//! the `swap/1` Capability Descriptor it publishes.
 
 use anyhow::Result;
+use swap_common::cap_descriptor::DESCRIPTOR_PATH;
+use tokio::time::{sleep, Duration, Instant};
+use tracing::{debug, info, warn};
 
+use crate::descriptor::SharedDescriptors;
 use crate::preflight::{Check, Report};
-use crate::ProviderConfig;
+use crate::{ProviderConfig, SharedOffer};
 
 fn identity_secret(config: &ProviderConfig) -> Result<[u8; 32]> {
     let id = config.identity()?;
@@ -26,6 +31,104 @@ pub async fn setup(config: &ProviderConfig, generation: Option<u64>) -> Result<S
         report.registry,
         report.authorization,
     ))
+}
+
+/// Keep the `swap/1` Capability Descriptor on the homeserver describing the current offer.
+///
+/// Each rebuilt offer is written once. A failed write or sign-in is retried with a growing delay,
+/// and nothing is written while the offer has expired, so the file lapses rather than lies.
+pub(crate) fn spawn_descriptor_publisher(
+    config: &ProviderConfig,
+    offer: SharedOffer,
+    book: SharedDescriptors,
+    cap: &crate::cap_adapter::CapState,
+) {
+    const POLL: Duration = Duration::from_secs(5);
+    const MAX_BACKOFF: Duration = Duration::from_secs(1800);
+    // Signing in again checks the Paykit records again, so a rotated key generation reaches the
+    // descriptor within this long, and a session the homeserver dropped is replaced before use.
+    const SESSION_AGE: Duration = Duration::from_secs(3600);
+    let secret = match identity_secret(config) {
+        Ok(secret) => secret,
+        Err(e) => return warn!("not publishing the swap/1 descriptor: {e:#}"),
+    };
+    let signer = cap.signer();
+    let owner = cap.provider().to_string();
+    tokio::spawn(async move {
+        let mut writer: Option<(paykit_identity::DescriptorWriter, Instant)> = None;
+        let mut backoff = POLL;
+        let mut quiet = false;
+        loop {
+            if writer
+                .as_ref()
+                .is_some_and(|(_, since)| since.elapsed() > SESSION_AGE)
+            {
+                writer = None;
+            }
+            let current = offer.read().await.clone();
+            let stale = match &current {
+                Some(o) => book.read().await.needs_rewrite(o),
+                None => false,
+            };
+            // An offer the refresher failed to renew has nothing current to describe.
+            let Some(current) = current.filter(|o| stale && o.valid_until_unix > crate::now_unix())
+            else {
+                sleep(POLL).await;
+                continue;
+            };
+            let outcome = async {
+                if writer.is_none() {
+                    let session = paykit_identity::DescriptorWriter::sign_in(&secret).await?;
+                    writer = Some((session, Instant::now()));
+                }
+                let (session, _) = writer.as_ref().expect("signed in above");
+                let (descriptor, bytes) = book.write().await.next(
+                    &current,
+                    &owner,
+                    session.generation(),
+                    signer.as_ref(),
+                    crate::now_unix(),
+                )?;
+                session.put(DESCRIPTOR_PATH, bytes).await?;
+                anyhow::Ok(descriptor)
+            }
+            .await;
+            match outcome {
+                Ok(descriptor) => {
+                    // Every refresh rewrites it, so only the first after a failure is news.
+                    let message = format!(
+                        "published the swap/1 descriptor: seq {}, offer {}, minimum {} sat, \
+                         valid until {}",
+                        descriptor.seq,
+                        current.offer_id,
+                        current.effective_min_amount_sat(),
+                        descriptor.valid_until
+                    );
+                    if quiet {
+                        debug!("{message}");
+                    } else {
+                        info!("{message}");
+                        quiet = true;
+                    }
+                    book.write().await.published(descriptor);
+                    backoff = POLL;
+                    sleep(POLL).await;
+                }
+                Err(e) => {
+                    // A session can lapse, and the Paykit records can be rotated or removed:
+                    // sign in again, checking them, before the next write.
+                    writer = None;
+                    quiet = false;
+                    warn!(
+                        "could not publish the swap/1 descriptor, retrying in {}s: {e:#}",
+                        backoff.as_secs()
+                    );
+                    sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    });
 }
 
 pub async fn check(config: &ProviderConfig, report: &mut Report) {
