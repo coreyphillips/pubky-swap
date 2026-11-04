@@ -13,8 +13,8 @@
 //! A request that fails after it may have reached the provider is sent again, identically, once
 //! over iroh and then over DMs. Every request here is read-only or idempotent for the same
 //! authenticated key: a repeated creation returns the original acceptance, whichever transport
-//! carries it. If a repeated creation is refused, the swap is looked up by its quote before the
-//! refusal is believed.
+//! carries it. If a repeated creation is refused, or any creation is answered `pending`, the swap
+//! is looked up by its quote before the refusal is believed.
 
 use anyhow::{anyhow, Error, Result};
 use pubky_transport::Transport;
@@ -841,11 +841,15 @@ impl<P: Channel, F: Channel> Negotiator<P, F> {
                 reply: SwapMessage::SwapAccept(accept),
                 ..
             }) => accept,
-            // The first attempt may have been admitted while the resend was refused.
-            Ok(Exchanged {
-                reply,
-                uncertain: true,
-            }) => self.recover(request.quote_id, rejection(reply)).await?,
+            // The first attempt may have been admitted while the resend was refused. `pending`
+            // is no decline either: another request for this quote is still being admitted.
+            Ok(Exchanged { reply, uncertain })
+                if uncertain
+                    || matches!(&reply, SwapMessage::Reject(reject)
+                        if reject.code() == Some(RejectCode::Pending)) =>
+            {
+                self.recover(request.quote_id, rejection(reply)).await?
+            }
             Ok(Exchanged { reply, .. }) => return Err(rejection(reply)),
             Err(ExchangeError::Uncertain(error)) => self.recover(request.quote_id, error).await?,
             Err(ExchangeError::NotSent(error)) => return Err(error),
@@ -1243,6 +1247,9 @@ mod tests {
         /// Refuse a creation whose quote was already spent, as a provider still admitting the
         /// first attempt does when the resend races it.
         refuse_replays: AtomicBool,
+        /// Answer the next creation `pending` and admit its swap anyway, as a provider does when
+        /// another process holding the same key requested that quote a moment earlier.
+        admitting_elsewhere: AtomicBool,
         /// Codes status queries are refused with, in order, before the swap is reported.
         status_refusals: Mutex<VecDeque<RejectCode>>,
     }
@@ -1261,6 +1268,15 @@ mod tests {
                     self.creations.fetch_add(1, Ordering::SeqCst);
                     let accept = acceptance(request.quote_id);
                     accepted.insert(request.quote_id, (request.clone(), accept.clone()));
+                    if self.admitting_elsewhere.swap(false, Ordering::SeqCst) {
+                        return SwapMessage::Reject(Reject {
+                            code: Some(RejectCode::Pending.as_str().into()),
+                            request_id: None,
+                            swap_id: None,
+                            quote_id: Some(request.quote_id),
+                            reason: "the swap is still being admitted".into(),
+                        });
+                    }
                     SwapMessage::SwapAccept(accept)
                 }
                 SwapMessage::SwapStatusRequest(query) => {
@@ -1698,6 +1714,42 @@ mod tests {
             Some(RejectCode::QuoteExpired)
         );
         assert_eq!(negotiator.preferred().unwrap().0.seen().len(), 2);
+        assert!(negotiator.fallback().unwrap().0.seen().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_creation_is_looked_up_by_its_quote_instead_of_believed() {
+        let provider = Arc::new(Provider::default());
+        provider.admitting_elsewhere.store(true, Ordering::SeqCst);
+        provider
+            .status_refusals
+            .lock()
+            .unwrap()
+            .push_back(RejectCode::Pending);
+        let negotiator = negotiator(&provider, [], Some(vec![]));
+        let request = swap_request(Uuid::new_v4());
+        let accept = negotiator.create(&request).await.unwrap();
+        assert_eq!(provider.creations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            accept.swap_id,
+            provider.accepted.lock().unwrap()[&request.quote_id]
+                .1
+                .swap_id
+        );
+        // One creation, then status queries by its quote until the admission finished.
+        let seen = negotiator.preferred().unwrap().0.seen.lock().unwrap();
+        assert!(
+            matches!(
+                &seen[..],
+                [
+                    SwapMessage::SwapRequest(_),
+                    SwapMessage::SwapStatusRequest(first),
+                    SwapMessage::SwapStatusRequest(second),
+                ] if first.quote_id == Some(request.quote_id)
+                    && second.quote_id == Some(request.quote_id)
+            ),
+            "{seen:?}"
+        );
         assert!(negotiator.fallback().unwrap().0.seen().is_empty());
     }
 
