@@ -259,6 +259,16 @@ impl DescriptorWriter {
         })
     }
 
+    /// A writer for `generation` on a session the caller has already signed in. Unlike
+    /// [`DescriptorWriter::sign_in`] it does not check the published records first, but
+    /// [`DescriptorWriter::ensure_delegation`] still checks the generation before each write.
+    pub fn with_session(session: PubkySession, generation: u64) -> Self {
+        Self {
+            session,
+            generation,
+        }
+    }
+
     /// The key generation the published authorization was at when this writer signed in.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -269,6 +279,8 @@ impl DescriptorWriter {
     ///
     /// The authorization is read again first and must still be at this generation, so a writer
     /// whose generation has since been rotated away never writes over the newer delegation.
+    /// Called again later, it also repairs a delegation another app overwrote with an older
+    /// generation, or removed (Capabilities §5, "Writing the delegation").
     pub async fn ensure_delegation(
         &self,
         identity_secret: &[u8; 32],

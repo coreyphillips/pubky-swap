@@ -193,9 +193,10 @@ with paykit-rs's Paykit KDF v1, so nothing new needs backing up: the recovery ph
 restores them. `--doctor` reads the records the way any peer does and prints a `paykit` line with
 the published generation. It fails when the published routing key is not the one this identity
 derives at that generation, and warns when nothing is published yet, the App Registry has fallen
-behind, or the delegation is missing or does not verify. A running provider also writes the
-delegation itself when it signs in, so a provider set up before the delegation existed only needs
-a restart.
+behind, or the delegation is missing or does not verify. A running provider with a homeserver
+also checks the delegation at least once a minute and rewrites it if it is missing or stale, so
+a provider set up before the delegation existed only needs a restart, and one another app
+overwrote repairs itself.
 
 ### Rotating the key
 
@@ -211,7 +212,7 @@ key at the published generation is refused. The App Registry moves first and the
 second, then the delegation for the new generation. Once the authorization is at the new
 generation, the provider refuses to sign with the old one, so anything it published under the old
 key has to be signed again. Peers that saw the old generation reject the old key from then on. A
-running provider moves to the new capability signing key at its next sign-in, within an hour.
+running provider moves to the new capability signing key within about a minute.
 
 ## Generic: point a provider at your LND
 

@@ -4,9 +4,10 @@
 //! key signs one delegation naming it per key generation. The delegation holds no timestamp and
 //! Ed25519 is deterministic, so every app of the identity writes byte-identical bytes.
 //!
-//! Encodings §5 leaves open are pinned to what pubky-swap already writes elsewhere: `owner` is
-//! bare z-base-32 and base64url is unpadded. A reader also accepts a `pubky`-prefixed `owner`,
-//! because pubky's `PublicKey` displays with that prefix and another app may have written it.
+//! Encodings follow §5 as pinned in `55e0bc2`: `owner` is bare z-base-32 (`PublicKey::z32()`,
+//! never its `pubky`-prefixed `Display` form) and base64url is RFC 4648 §5 without padding. A
+//! reader refuses any other form rather than normalizing it, because the signature covers the
+//! exact bytes.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -114,9 +115,8 @@ impl SigningKeyDelegation {
         if wire.version != VERSION || wire.kind != KIND {
             bail!("not a version {VERSION} {KIND} delegation");
         }
-        let owner = wire.owner.strip_prefix("pubky").unwrap_or(&wire.owner);
-        if owner != authorization.owner().z32() {
-            bail!("the delegation belongs to another identity");
+        if wire.owner != authorization.owner().z32() {
+            bail!("the delegation's owner is not this identity in bare z-base-32");
         }
         if wire.key_generation != authorization.key_generation() {
             bail!(
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pubky_prefixed_owner_is_accepted() {
+    fn an_owner_or_key_in_another_encoding_is_refused() {
         let current = authorization(&SECRET, 1);
         let keys = GenerationKeys::derive(&SECRET, 1).unwrap();
         let mut wire = Wire {
@@ -315,12 +315,33 @@ mod tests {
         };
         assert!(wire.owner.starts_with("pubky"));
         let signer = RoutingSigner::new(&SECRET, &current).unwrap();
-        let signature = signer
-            .sign(&current, &wire.signing_input().unwrap())
-            .unwrap();
-        wire.sig = Some(URL_SAFE_NO_PAD.encode(signature));
-        let bytes = serde_json::to_vec(&wire).unwrap();
-        assert!(SigningKeyDelegation::verify(&bytes, &current).is_ok());
+        let signed = |wire: &mut Wire| {
+            wire.sig = None;
+            let signature = signer
+                .sign(&current, &wire.signing_input().unwrap())
+                .unwrap();
+            wire.sig = Some(URL_SAFE_NO_PAD.encode(signature));
+            serde_json::to_vec(&*wire).unwrap()
+        };
+        // Correctly signed over the prefixed form, and still refused.
+        let err = SigningKeyDelegation::verify(&signed(&mut wire), &current).unwrap_err();
+        assert!(err.to_string().contains("bare z-base-32"), "{err}");
+        wire.owner = format!("pk:{}", current.owner().z32());
+        assert!(SigningKeyDelegation::verify(&signed(&mut wire), &current).is_err());
+        wire.owner = current.owner().z32().to_uppercase();
+        assert!(SigningKeyDelegation::verify(&signed(&mut wire), &current).is_err());
+
+        // A padded signing key is refused, and so is a padded signature.
+        wire.owner = current.owner().z32();
+        assert!(SigningKeyDelegation::verify(&signed(&mut wire), &current).is_ok());
+        wire.signing_key = format!("{}=", wire.signing_key);
+        assert!(SigningKeyDelegation::verify(&signed(&mut wire), &current).is_err());
+        wire.signing_key = URL_SAFE_NO_PAD.encode(keys.cap_signing_public_key());
+        let mut padded: serde_json::Value = serde_json::from_slice(&signed(&mut wire)).unwrap();
+        let sig = format!("{}==", padded["sig"].as_str().unwrap());
+        padded["sig"] = sig.into();
+        let bytes = serde_json::to_vec(&padded).unwrap();
+        assert!(SigningKeyDelegation::verify(&bytes, &current).is_err());
     }
 
     #[test]

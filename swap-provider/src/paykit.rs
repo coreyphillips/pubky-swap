@@ -38,16 +38,17 @@ pub async fn setup(config: &ProviderConfig, generation: Option<u64>) -> Result<S
     ))
 }
 
-/// Keep the `swap/1` Capability Descriptor on the homeserver describing the current offer.
+/// Keep the `swap/1` Capability Descriptor on the homeserver describing the current offer, and
+/// the capability signing key delegation current.
 ///
 /// Each rebuilt offer is written once. A failed write or sign-in is retried with a growing delay,
 /// and nothing is written while the offer has expired, so the file lapses rather than lies.
 ///
-/// Each sign-in also publishes the capability signing key delegation for the published
-/// generation, if it is not there already, and moves the `paykit-cap` signer to that
-/// generation's capability signing key (Capabilities §5). The descriptor is signed only after
-/// that, so a reader can always verify it, and a rotation reaches the signer with the next
-/// sign-in.
+/// Before each descriptor write, and at least every [`DELEGATION_CHECK`] in between, the
+/// publisher reads the delegation and rewrites it if it is missing or not this generation's,
+/// as Capabilities §5 asks of an app on the published generation. It then moves the `paykit-cap`
+/// signer to that generation's capability signing key, so the descriptor is signed only once a
+/// reader can verify it, and a rotation reaches the signer within about a minute.
 pub(crate) fn spawn_descriptor_publisher(
     config: &ProviderConfig,
     offer: SharedOffer,
@@ -56,8 +57,8 @@ pub(crate) fn spawn_descriptor_publisher(
 ) {
     const POLL: Duration = Duration::from_secs(5);
     const MAX_BACKOFF: Duration = Duration::from_secs(1800);
-    // Signing in again checks the Paykit records again, so a rotated key generation reaches the
-    // descriptor within this long, and a session the homeserver dropped is replaced before use.
+    // Signing in again checks the Paykit records again, and a session the homeserver dropped is
+    // replaced before use.
     const SESSION_AGE: Duration = Duration::from_secs(3600);
     // The Pubky clients set no request timeout, so without this a stalled homeserver would hold
     // the loop past every retry and renewal while the published descriptor lapsed.
@@ -70,6 +71,7 @@ pub(crate) fn spawn_descriptor_publisher(
     let owner = cap.provider().to_string();
     tokio::spawn(async move {
         let mut writer: Option<(paykit_identity::DescriptorWriter, Instant)> = None;
+        let mut checked: Option<Instant> = None;
         let mut backoff = POLL;
         let mut quiet = false;
         loop {
@@ -85,43 +87,32 @@ pub(crate) fn spawn_descriptor_publisher(
                 None => false,
             };
             // An offer the refresher failed to renew has nothing current to describe.
-            let Some(current) = current.filter(|o| stale && o.valid_until_unix > crate::now_unix())
-            else {
+            let describe = current.filter(|o| stale && o.valid_until_unix > crate::now_unix());
+            let check_due = checked.is_none_or(|at| at.elapsed() >= DELEGATION_CHECK);
+            if describe.is_none() && !check_due {
                 sleep(POLL).await;
                 continue;
-            };
+            }
             let attempt = async {
                 if writer.is_none() {
                     let session = paykit_identity::DescriptorWriter::sign_in(&secret).await?;
-                    let (change, keys) = session.ensure_delegation(&secret).await?;
-                    if change != paykit_identity::Change::Unchanged {
-                        info!(
-                            "published the capability signing key delegation for generation {}",
-                            session.generation()
-                        );
-                    }
-                    let signer: Arc<dyn CapSigner> =
-                        Arc::new(Ed25519Signer::from_secret(&keys.cap_signing_secret()));
-                    let key = signer.public_key_hex();
-                    if cap.set_signer(signer) {
-                        info!(
-                            "paykit-cap objects are now signed with the capability signing key \
-                             {key} (generation {})",
-                            session.generation()
-                        );
-                    }
                     writer = Some((session, Instant::now()));
                 }
                 let (session, _) = writer.as_ref().expect("signed in above");
+                ensure_signer(session, &secret, &cap).await?;
+                checked = Some(Instant::now());
+                let Some(current) = &describe else {
+                    return anyhow::Ok(None);
+                };
                 let (descriptor, bytes) = book.write().await.next(
-                    &current,
+                    current,
                     &owner,
                     session.generation(),
                     cap.signer().as_ref(),
                     crate::now_unix(),
                 )?;
                 session.put(DESCRIPTOR_PATH, bytes).await?;
-                anyhow::Ok(descriptor)
+                anyhow::Ok(Some(descriptor))
             };
             let outcome = tokio::time::timeout(ATTEMPT, attempt)
                 .await
@@ -129,23 +120,25 @@ pub(crate) fn spawn_descriptor_publisher(
                     Err(anyhow::anyhow!("no answer within {}s", ATTEMPT.as_secs()))
                 });
             match outcome {
-                Ok(descriptor) => {
-                    // Every refresh rewrites it, so only the first after a failure is news.
-                    let message = format!(
-                        "published the swap/1 descriptor: seq {}, offer {}, minimum {} sat, \
-                         valid until {}",
-                        descriptor.seq,
-                        current.offer_id,
-                        current.effective_min_amount_sat(),
-                        descriptor.valid_until
-                    );
-                    if quiet {
-                        debug!("{message}");
-                    } else {
-                        info!("{message}");
-                        quiet = true;
+                Ok(published) => {
+                    if let (Some(descriptor), Some(current)) = (published, &describe) {
+                        // Every refresh rewrites it, so only the first after a failure is news.
+                        let message = format!(
+                            "published the swap/1 descriptor: seq {}, offer {}, minimum {} sat, \
+                             valid until {}",
+                            descriptor.seq,
+                            current.offer_id,
+                            current.effective_min_amount_sat(),
+                            descriptor.valid_until
+                        );
+                        if quiet {
+                            debug!("{message}");
+                        } else {
+                            info!("{message}");
+                            quiet = true;
+                        }
+                        book.write().await.published(descriptor);
                     }
-                    book.write().await.published(descriptor);
                     backoff = POLL;
                     sleep(POLL).await;
                 }
@@ -154,8 +147,13 @@ pub(crate) fn spawn_descriptor_publisher(
                     // sign in again, checking them, before the next write.
                     writer = None;
                     quiet = false;
+                    let what = if describe.is_some() {
+                        "publish the swap/1 descriptor"
+                    } else {
+                        "check the capability signing key delegation"
+                    };
                     warn!(
-                        "could not publish the swap/1 descriptor, retrying in {}s: {e:#}",
+                        "could not {what}, retrying in {}s: {e:#}",
                         backoff.as_secs()
                     );
                     sleep(backoff).await;
@@ -164,6 +162,44 @@ pub(crate) fn spawn_descriptor_publisher(
             }
         }
     });
+}
+
+/// How long the provider may go between reads of its published delegation. Capabilities §5 has
+/// an app read it before sending a signed object. Quotes are signed on the request path, so
+/// instead of a homeserver read per quote the publisher reads it this often, and before each
+/// descriptor write.
+const DELEGATION_CHECK: Duration = Duration::from_secs(60);
+
+/// Make sure the published delegation names `session`'s generation, rewriting it if not, and
+/// sign `paykit-cap` objects with that generation's capability signing key.
+async fn ensure_signer(
+    session: &paykit_identity::DescriptorWriter,
+    secret: &[u8; 32],
+    cap: &crate::cap_adapter::CapState,
+) -> Result<()> {
+    let (change, keys) = session.ensure_delegation(secret).await?;
+    match change {
+        paykit_identity::Change::Unchanged => {}
+        paykit_identity::Change::Created => info!(
+            "published the capability signing key delegation for generation {}",
+            session.generation()
+        ),
+        paykit_identity::Change::Updated => info!(
+            "rewrote a stale capability signing key delegation for generation {}",
+            session.generation()
+        ),
+    }
+    let signer: Arc<dyn CapSigner> =
+        Arc::new(Ed25519Signer::from_secret(&keys.cap_signing_secret()));
+    let key = signer.public_key_hex();
+    if cap.set_signer(signer) {
+        info!(
+            "paykit-cap objects are now signed with the capability signing key {key} \
+             (generation {})",
+            session.generation()
+        );
+    }
+    Ok(())
 }
 
 pub async fn check(config: &ProviderConfig, report: &mut Report) {

@@ -374,15 +374,19 @@ both:
   `sig`. `sig` is the routing key's Ed25519 signature over `paykit-cap/subkey/v1`, `0x00`, then
   the JCS form without `sig`. It holds no timestamp, so every app of the identity writes the same
   bytes.
-- §5 leaves two encodings open, so this writes what pubky-swap writes elsewhere: `owner` as bare
-  z-base-32, and base64url without padding. A reader also accepts a `pubky`-prefixed `owner`.
+- Encodings, as pinned in §5 at `55e0bc2`: `owner` is bare z-base-32 (`PublicKey::z32()`, 52
+  lowercase characters, no `pubky` or `pk:` prefix), and base64url is RFC 4648 §5 without
+  padding. A reader refuses any other form rather than normalizing it.
 
 `--paykit-setup` writes the delegation after the authorization, and `--doctor` warns when it is
-missing or does not verify. The descriptor publisher writes it again on every sign-in if the
-file differs, then moves the `paykit-cap` signer to that generation's capability signing key,
-and only then signs the descriptor. A delegation is only ever written for the generation the
-published authorization names, so a provider still holding an older generation cannot overwrite
-a newer one. A rotation reaches the signer at the next sign-in, within an hour.
+missing or does not verify. The descriptor publisher reads it before each descriptor write and
+at least once a minute in between, and rewrites it if it is missing or not the current
+generation's. It then moves the `paykit-cap` signer to that generation's capability signing
+key, and only then signs the descriptor. Section 5 asks for that read before every signed
+object; quotes are signed on the request path, so the publisher's one-minute check stands in for
+a homeserver read per quote. A delegation is only ever written for the generation the published
+authorization names, read again just before the write, so a provider still holding an older
+generation cannot overwrite a newer one. A rotation reaches the signer within about a minute.
 
 A reader follows the chain with `paykit_identity::resolve_signing_key`: verify the Noise Key
 Authorization through paykit-rs, require the delegation's `owner` and `key_generation` to match
