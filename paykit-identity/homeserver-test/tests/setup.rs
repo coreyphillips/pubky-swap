@@ -5,8 +5,8 @@
 //! `cargo test --manifest-path paykit-identity/homeserver-test/Cargo.toml`.
 
 use paykit_identity::{
-    inspect, resolve_signing_key, setup, Change, DelegationState, GenerationKeys, RoutingSigner,
-    APP_ID, SIGNING_KEY_PATH,
+    inspect, resolve_signing_key, setup, Change, DelegationState, DescriptorWriter, GenerationKeys,
+    RoutingSigner, APP_ID, SIGNING_KEY_PATH,
 };
 use paykit_lib::{
     get_paykit_app_registry, get_paykit_noise_key_authorization, PaykitAppId,
@@ -206,9 +206,18 @@ async fn setup_publishes_a_delegation_a_reader_follows_to_the_signing_key() {
         DelegationState::Invalid(why) => assert!(why.contains("generation 1"), "{why}"),
         other => panic!("expected an invalid delegation, got {other:?}"),
     }
-    // Setup puts it right.
-    let repaired = setup(&session, &identity, 2).await.unwrap();
-    assert_eq!(repaired.delegation, Change::Updated);
+    // An app still holding generation 1 does not write, so it cannot make this worse.
+    let stale = DescriptorWriter::with_session(session.clone(), 1);
+    let Err(err) = stale.ensure_delegation(&secret).await else {
+        panic!("a writer at an older generation published a delegation");
+    };
+    assert!(err.to_string().contains("moved from 1 to 2"), "{err:#}");
+    assert_eq!(raw(&storage, &owner, SIGNING_KEY_PATH).await, first_bytes);
+    // An app on the published generation repairs it on its next check, then leaves it alone.
+    let current = DescriptorWriter::with_session(session.clone(), 2);
+    let (repaired, keys) = current.ensure_delegation(&secret).await.unwrap();
+    assert_eq!(repaired, Change::Updated);
+    assert_eq!(keys.cap_signing_public_key(), two.cap_signing_public_key());
     assert_eq!(
         resolve_signing_key(&storage, &owner)
             .await
@@ -217,4 +226,18 @@ async fn setup_publishes_a_delegation_a_reader_follows_to_the_signing_key() {
             .key_generation(),
         2
     );
+    let (again, _) = current.ensure_delegation(&secret).await.unwrap();
+    assert_eq!(again, Change::Unchanged);
+    // A removed delegation is written again too.
+    session.storage().delete(SIGNING_KEY_PATH).await.unwrap();
+    let (recreated, _) = current.ensure_delegation(&secret).await.unwrap();
+    assert_eq!(recreated, Change::Created);
+    // Setup puts it right as well.
+    session
+        .storage()
+        .put(SIGNING_KEY_PATH, first_bytes.clone())
+        .await
+        .unwrap();
+    let repaired = setup(&session, &identity, 2).await.unwrap();
+    assert_eq!(repaired.delegation, Change::Updated);
 }
