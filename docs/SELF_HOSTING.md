@@ -171,11 +171,14 @@ The config file key is `homeserver = false`.
 
 ## Set up the Paykit identity
 
-A provider becomes a Paykit peer by publishing two records on its homeserver, once:
+A provider becomes a Paykit peer by publishing three records on its homeserver, once:
 
 - an App Registry entry for `pubky-swap`, at `/pub/paykit/v0/app-registry.json`;
 - a Noise Key Authorization at `/pub/paykit-authority/v0/current-key.json`, signed by the
-  provider's Pubky identity, which approves the routing key for one key generation.
+  provider's Pubky identity, which approves the routing key for one key generation;
+- a capability signing key delegation at `/pub/paykit/ext/capabilities/v1/signing-key.json`,
+  signed by the routing key, which names the key that signs the descriptor, quotes and contracts
+  (Paykit Capabilities §5).
 
 ```bash
 swap-provider --paykit-setup
@@ -185,11 +188,14 @@ It needs the `paykit` feature, which `full` includes, and the same identity conf
 daemon. It signs in to the homeserver, prints the generation and routing key, and says for each
 record whether it was created, updated or left alone. Rerunning it writes nothing.
 
-The routing key is derived from the identity and the generation with paykit-rs's Paykit KDF v1,
-so nothing new needs backing up: the recovery phrase or file restores it. `--doctor` reads both
-records the way any peer does and prints a `paykit` line with the published generation. It fails
-when the published routing key is not the one this identity derives at that generation, and warns
-when nothing is published yet or the App Registry has fallen behind.
+The routing key and the capability signing key are derived from the identity and the generation
+with paykit-rs's Paykit KDF v1, so nothing new needs backing up: the recovery phrase or file
+restores them. `--doctor` reads the records the way any peer does and prints a `paykit` line with
+the published generation. It fails when the published routing key is not the one this identity
+derives at that generation, and warns when nothing is published yet, the App Registry has fallen
+behind, or the delegation is missing or does not verify. A running provider also writes the
+delegation itself when it signs in, so a provider set up before the delegation existed only needs
+a restart.
 
 ### Rotating the key
 
@@ -202,9 +208,10 @@ swap-provider --paykit-setup --paykit-generation 2
 
 Generations only move forward one at a time. Going back, skipping one, or publishing a different
 key at the published generation is refused. The App Registry moves first and the authorization
-second. Once the authorization is at the new generation, the provider refuses to sign with the
-old one, so anything it published under the old key has to be signed again. Peers that saw the
-old generation reject the old key from then on.
+second, then the delegation for the new generation. Once the authorization is at the new
+generation, the provider refuses to sign with the old one, so anything it published under the old
+key has to be signed again. Peers that saw the old generation reject the old key from then on. A
+running provider moves to the new capability signing key at its next sign-in, within an hour.
 
 ## Generic: point a provider at your LND
 

@@ -257,9 +257,11 @@ both bare z32, as Capabilities §10.1 lists both identities. A quote signed for 
 verify for another.
 
 The provider signs `terms_hash` in the quote and `contract_hash` in the contract, with Ed25519
-over the 32 hash bytes. `signer` is the public key as hex. Today it is the provider's root key,
-the one a client dials; whether a delegated subkey replaces it waits on pubky/paykit-rs#229. A
-commit names the `terms_hash` it accepts, and one that differs from the signed quote is refused.
+over the 32 hash bytes. `signer` is the public key as hex. With `paykit` and a homeserver it is
+the capability signing key (see "The capability signing key" below); otherwise, and until that
+key's delegation is published, it is the provider's root key, the one a client dials. A client
+built with `paykit` accepts either; without it, only the root key. A commit names the
+`terms_hash` it accepts, and one that differs from the signed quote is refused.
 
 A commit also carries the signed quote and the rfq it answered, as `quote: {rfq, signed}`.
 `commit_hash` does not cover it, because `terms_hash` already binds it. A provider that no longer
@@ -318,7 +320,8 @@ a signed `paykit-cap.descriptor` (Paykit Capabilities §6) at
 homeserver instead of asking every contact for an offer, so finding providers tells nobody that a
 swap is wanted. `swap_common::cap_descriptor` builds and verifies it. Nothing is written until
 `--paykit-setup` has published the App Registry entry and the Noise Key Authorization, since a
-reader drops a descriptor whose `app_id` the owner's registry does not list.
+reader drops a descriptor whose `app_id` the owner's registry does not list, and the capability
+signing key delegation is in place, since a reader verifies the descriptor through it.
 
 It has one `swap/1` entry, built from the current `SwapOffer`:
 
@@ -358,10 +361,46 @@ never falls below the Unix time, so it keeps rising across restarts without bein
 descriptor whose offer has expired is never written, and the status API's `/descriptor` returns
 404 once the published one lapses.
 
-What a reader cannot do yet: verify the signer under §5. Paykit Capabilities settled on a signing
-subkey delegated by the routing key (ask 3 on pubky/paykit-rs#229), published at
-`/pub/paykit/ext/capabilities/v1/signing-key.json`. Until that delegation is published, the
-signer is the provider's identity key, the one a client dials on `direct/1`.
+## The capability signing key
+
+Paykit Capabilities §5 has a capability signing key sign descriptors, terms and contracts, and
+the routing key sign only one delegation to it per key generation. `paykit_identity` implements
+both:
+
+- The key is Ed25519 with seed `derive_key("paykit/cap-signing", K_g)`, Paykit KDF v1's BLAKE3
+  `derive_key` under the generation's Paykit identity secret.
+- The delegation is a closed object at `/pub/paykit/ext/capabilities/v1/signing-key.json`:
+  `version` 1, `kind` `paykit-cap.signing_key`, `owner`, `key_generation`, `signing_key` and
+  `sig`. `sig` is the routing key's Ed25519 signature over `paykit-cap/subkey/v1`, `0x00`, then
+  the JCS form without `sig`. It holds no timestamp, so every app of the identity writes the same
+  bytes.
+- §5 leaves two encodings open, so this writes what pubky-swap writes elsewhere: `owner` as bare
+  z-base-32, and base64url without padding. A reader also accepts a `pubky`-prefixed `owner`.
+
+`--paykit-setup` writes the delegation after the authorization, and `--doctor` warns when it is
+missing or does not verify. The descriptor publisher writes it again on every sign-in if the
+file differs, then moves the `paykit-cap` signer to that generation's capability signing key,
+and only then signs the descriptor. A delegation is only ever written for the generation the
+published authorization names, so a provider still holding an older generation cannot overwrite
+a newer one. A rotation reaches the signer at the next sign-in, within an hour.
+
+A reader follows the chain with `paykit_identity::resolve_signing_key`: verify the Noise Key
+Authorization through paykit-rs, require the delegation's `owner` and `key_generation` to match
+it, verify the delegation with the authorized routing key, then verify the object with the
+delegated key. A delegation left at an older generation is refused. The client's `CapChannel`
+does this for a reply signed by any key other than the root key it dialed.
+
+Golden vector, from `paykit-identity/src/delegation.rs`
+(`the_delegation_bytes_match_the_golden_vector`), for Pubky secret `[7; 32]` at generation 1. It
+was recomputed independently from Paykit KDF v1 and §5 with Python's `blake3` and `pynacl`:
+
+```json
+{"key_generation":1,"kind":"paykit-cap.signing_key","owner":"7jfgaa9nutjyixzikb7tgmsf9gkwq7iqz498zr1nd5ig1fng4esy","sig":"Sj9Xps4rjkmNrqYv4EU8OuD7gyN4LGNb1SyAbjv0p9PEEg7HekF6unysSnkPRXDn_k9XOBHmll3-Xdo2xkrtAQ","signing_key":"7TrkHFnQPW67doNM4TipjT9CmZygnHHbriRjgBb4Ry8","version":1}
+```
+
+What this does not cover yet: `paykit-cap` messages carry no `key_generation` until the §8.1
+envelope lands, so a client checks a signer against the currently published generation only. A
+contract stored before a rotation, signed by the older generation's key, fails that check.
 
 ## Amounts and fees
 

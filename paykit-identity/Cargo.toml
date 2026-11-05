@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "The provider's Paykit identity: key derivation, App Registry entry and Noise Key Authorization"
+description = "The provider's Paykit identity: key derivation, App Registry entry, Noise Key Authorization and capability signing key delegation"
 
 [dependencies]
 # The same tree paykit-rs builds on (docs/BITKIT_HANDOFF.md, "Pubky dependency pins").
@@ -12,7 +12,18 @@ paykit-lib = { git = "https://github.com/pubky/paykit-rs", rev = "01de5dd232d2b2
 paykit-sdk = { git = "https://github.com/pubky/paykit-rs", rev = "01de5dd232d2b22f132d066697cce041700e7136" }
 pubky = { version = "=0.16.2", default-features = false }
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+hex.workspace = true
+# The capability signing key (Capabilities §5): its seed under Paykit KDF v1, its delegation's
+# unpadded base64url, and strict Ed25519 checks. All three are already in the lockfile.
+blake3.workspace = true
+base64 = "0.22"
+ed25519-dalek = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Checks the delegation's bytes against swap-common's JCS encoder, and a descriptor through the
+# whole §5 chain.
+swap-common.workspace = true
+uuid.workspace = true

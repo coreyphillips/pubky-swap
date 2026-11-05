@@ -1,9 +1,13 @@
-//! Setup, rerun and rotation against a local pubky 0.16 homeserver, read back by paykit-rs.
+//! Setup, rerun and rotation against a local pubky 0.16 homeserver, read back by paykit-rs, and
+//! the capability signing key delegation a reader follows from there (Capabilities §5).
 //!
 //! Needs Docker for Postgres, or `TEST_PUBKY_CONNECTION_STRING`. Run with
 //! `cargo test --manifest-path paykit-identity/homeserver-test/Cargo.toml`.
 
-use paykit_identity::{inspect, setup, Change, GenerationKeys, RoutingSigner, APP_ID};
+use paykit_identity::{
+    inspect, resolve_signing_key, setup, Change, DelegationState, GenerationKeys, RoutingSigner,
+    APP_ID, SIGNING_KEY_PATH,
+};
 use paykit_lib::{
     get_paykit_app_registry, get_paykit_noise_key_authorization, PaykitAppId,
     PaykitNoiseKeyAuthorization, PAYKIT_APP_REGISTRY_PATH, PAYKIT_NOISE_KEY_AUTHORIZATION_PATH,
@@ -134,4 +138,83 @@ async fn setup_is_idempotent_rotates_and_is_checked_by_a_paykit_reader() {
     assert!(!mismatch.is_healthy());
     assert!(RoutingSigner::new(&secret, &foreign).is_err());
     assert!(setup(&session, &identity, 3).await.is_err());
+}
+
+#[tokio::test]
+async fn setup_publishes_a_delegation_a_reader_follows_to_the_signing_key() {
+    let testnet = testnet().await;
+    let sdk = testnet.sdk().unwrap();
+    let identity = Keypair::random();
+    let owner = identity.public_key();
+    let secret = identity.secret_key();
+    let signer = sdk.signer(identity.clone());
+    signer
+        .signup(&testnet.homeserver_app().public_key(), None)
+        .await
+        .unwrap();
+    let session = signer
+        .signin(ClientId::new("pubky-swap.test").unwrap())
+        .await
+        .unwrap();
+    let storage = sdk.public_storage();
+    assert!(resolve_signing_key(&storage, &owner)
+        .await
+        .unwrap()
+        .is_none());
+
+    // Setup publishes the delegation, and a reader follows it to the derived key.
+    let first = setup(&session, &identity, 1).await.unwrap();
+    assert_eq!(first.delegation, Change::Created);
+    let resolved = resolve_signing_key(&storage, &owner)
+        .await
+        .unwrap()
+        .expect("the delegation is published");
+    assert_eq!(resolved.key_generation(), 1);
+    let one = GenerationKeys::derive(&secret, 1).unwrap();
+    assert_eq!(resolved.signing_key(), one.cap_signing_public_key());
+    // The file holds exactly the bytes any app of the identity writes.
+    let first_bytes = raw(&storage, &owner, SIGNING_KEY_PATH).await;
+    assert_eq!(first_bytes, resolved.to_bytes());
+    let inspected = inspect(&storage, &secret).await.unwrap();
+    assert_eq!(inspected.delegation, DelegationState::Current);
+
+    // Rerunning leaves it alone.
+    let again = setup(&session, &identity, 1).await.unwrap();
+    assert_eq!(again.delegation, Change::Unchanged);
+    assert_eq!(raw(&storage, &owner, SIGNING_KEY_PATH).await, first_bytes);
+
+    // Rotation rewrites it for the new generation's key, signed by the new routing key.
+    let rotated = setup(&session, &identity, 2).await.unwrap();
+    assert_eq!(rotated.delegation, Change::Updated);
+    let second = resolve_signing_key(&storage, &owner)
+        .await
+        .unwrap()
+        .expect("the delegation is published");
+    assert_eq!(second.key_generation(), 2);
+    let two = GenerationKeys::derive(&secret, 2).unwrap();
+    assert_eq!(second.signing_key(), two.cap_signing_public_key());
+    assert_ne!(second.signing_key(), resolved.signing_key());
+
+    // A delegation left at the old generation is refused, and the doctor says why.
+    session
+        .storage()
+        .put(SIGNING_KEY_PATH, first_bytes.clone())
+        .await
+        .unwrap();
+    assert!(resolve_signing_key(&storage, &owner).await.is_err());
+    match inspect(&storage, &secret).await.unwrap().delegation {
+        DelegationState::Invalid(why) => assert!(why.contains("generation 1"), "{why}"),
+        other => panic!("expected an invalid delegation, got {other:?}"),
+    }
+    // Setup puts it right.
+    let repaired = setup(&session, &identity, 2).await.unwrap();
+    assert_eq!(repaired.delegation, Change::Updated);
+    assert_eq!(
+        resolve_signing_key(&storage, &owner)
+            .await
+            .unwrap()
+            .expect("the delegation is published")
+            .key_generation(),
+        2
+    );
 }

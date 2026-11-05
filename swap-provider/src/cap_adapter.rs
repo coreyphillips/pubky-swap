@@ -4,7 +4,7 @@
 //! The engine never sees a kind, and the owner is always the carrier's authenticated sender.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use swap_common::paykit_cap::CapSigner;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -20,7 +20,12 @@ struct IssuedTerms {
 
 #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
 pub(crate) struct CapState {
-    signer: Arc<dyn CapSigner>,
+    /// The key quotes, contracts and the descriptor are signed with now. It starts as the
+    /// identity key and becomes the capability signing key once its delegation is published.
+    signer: RwLock<Arc<dyn CapSigner>>,
+    /// Every key this run has signed with, newest last. A quote signed just before the signer
+    /// changed is still this provider's own when its commit arrives.
+    own_keys: RwLock<Vec<String>>,
     /// This provider's pubky, which every quote it signs names beside the owner's.
     provider: String,
     terms: Mutex<HashMap<Uuid, IssuedTerms>>,
@@ -29,7 +34,8 @@ pub(crate) struct CapState {
 impl CapState {
     pub(crate) fn new(signer: Arc<dyn CapSigner>, provider: String) -> Self {
         Self {
-            signer,
+            own_keys: RwLock::new(vec![signer.public_key_hex()]),
+            signer: RwLock::new(signer),
             provider,
             terms: Mutex::new(HashMap::new()),
         }
@@ -42,9 +48,41 @@ impl CapState {
     }
 
     /// The signer, which the Capability Descriptor shares with the quotes and contracts.
-    #[cfg(feature = "paykit")]
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
     pub(crate) fn signer(&self) -> Arc<dyn CapSigner> {
-        self.signer.clone()
+        self.signer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Sign with `signer` from now on. Returns whether the key changed.
+    #[cfg(feature = "paykit")]
+    pub(crate) fn set_signer(&self, signer: Arc<dyn CapSigner>) -> bool {
+        let key = signer.public_key_hex();
+        let mut current = self.signer.write().unwrap_or_else(|e| e.into_inner());
+        if current.public_key_hex() == key {
+            return false;
+        }
+        *current = signer;
+        let mut own = self.own_keys.write().unwrap_or_else(|e| e.into_inner());
+        own.retain(|k| *k != key);
+        own.push(key);
+        // The identity key and the last two capability signing keys cover a rotation in flight.
+        if own.len() > 3 {
+            own.remove(1);
+        }
+        true
+    }
+
+    /// Whether `key_hex` is a key this run has signed with.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    pub(crate) fn signed_by_me(&self, key_hex: &str) -> bool {
+        self.own_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|k| k == key_hex)
     }
 
     /// A key nobody holds, for builds and tests that never sign anything they keep.
@@ -195,7 +233,7 @@ mod direct {
                     owner: sender.to_string(),
                     provider: ctx.cap.provider.clone(),
                 };
-                let signed = sign_quote(ctx.cap.signer.as_ref(), &parties, &rfq, &quote)?;
+                let signed = sign_quote(ctx.cap.signer().as_ref(), &parties, &rfq, &quote)?;
                 let now = now_unix();
                 let mut issued = ctx.cap.terms.lock().await;
                 issued.retain(|_, terms| terms.expires_at_unix > now);
@@ -281,7 +319,15 @@ mod direct {
             owner: sender.to_string(),
             provider: ctx.cap.provider.clone(),
         };
-        if let Err(error) = proof.check(&parties, &ctx.cap.signer.public_key_hex(), commit) {
+        // Any key this run signed with, so a quote signed before the signer moved to the
+        // capability signing key, or before a rotation, is still taken back.
+        let signer = proof.signed.signer.as_str();
+        let checked = if ctx.cap.signed_by_me(signer) {
+            proof.check(&parties, signer, commit)
+        } else {
+            Err(CapError::UnexpectedSigner)
+        };
+        if let Err(error) = checked {
             return Err(refuse(
                 RejectCode::InvalidRequest,
                 format!("signed quote refused: {error}"),
@@ -331,7 +377,7 @@ mod direct {
             return Ok(stored);
         }
         let signed = sign_contract(
-            ctx.cap.signer.as_ref(),
+            ctx.cap.signer().as_ref(),
             &commit.terms_hash,
             &commit.commit,
             accept,

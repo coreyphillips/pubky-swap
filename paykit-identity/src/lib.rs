@@ -3,7 +3,16 @@
 //! Paykit Capabilities §5 roots every signature in the identity-signed Noise Key Authorization at
 //! `/pub/paykit-authority/v0/current-key.json`, and §6.2 needs the descriptor's `app_id` in the
 //! owner's App Registry. This crate derives the keys for one generation, publishes both records
-//! and checks them. Every derivation, record and signature check is paykit-rs's own code.
+//! and checks them. Every derivation, record and signature check is paykit-rs's own code, except
+//! the capability signing key and its delegation (§5), which paykit-rs does not define yet.
+
+mod delegation;
+
+pub use delegation::{
+    derive_cap_signing_secret, fetch_delegation, resolve_published_signing_key,
+    resolve_signing_key, SigningKeyDelegation, CAP_SIGNING_CONTEXT, SIGNING_KEY_PATH,
+    SUBKEY_DOMAIN,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use paykit_lib::{
@@ -29,10 +38,12 @@ pub struct GenerationKeys {
     generation: u64,
     noise_secret: [u8; 32],
     routing_key: PublicKey,
+    cap_signing_secret: [u8; 32],
 }
 
 impl GenerationKeys {
-    /// Derive `K_g` from the Pubky identity secret, then the Noise key and routing key from it.
+    /// Derive `K_g` from the Pubky identity secret, then the Noise key, the routing key and the
+    /// capability signing key from it.
     pub fn derive(identity_secret: &[u8; 32], generation: u64) -> Result<Self> {
         let k_g = PubkyLocalSecretKey::from(*identity_secret)
             .derive_paykit_identity_secret_key(generation)
@@ -41,7 +52,20 @@ impl GenerationKeys {
             generation,
             noise_secret: paykit_lib::derive_paykit_noise_secret_key(k_g.as_bytes()),
             routing_key: paykit_lib::derive_paykit_noise_public_key(k_g.as_bytes()),
+            cap_signing_secret: derive_cap_signing_secret(k_g.as_bytes()),
         })
+    }
+
+    /// The capability signing key's Ed25519 seed (§5). Secret: it signs as the identity.
+    pub fn cap_signing_secret(&self) -> [u8; 32] {
+        self.cap_signing_secret
+    }
+
+    /// The capability signing key's public key, which the delegation names.
+    pub fn cap_signing_public_key(&self) -> [u8; 32] {
+        *Keypair::from_secret(&self.cap_signing_secret)
+            .public_key()
+            .as_bytes()
     }
 
     pub fn generation(&self) -> u64 {
@@ -76,14 +100,18 @@ pub struct SetupReport {
     pub routing_key: String,
     pub registry: Change,
     pub authorization: Change,
+    /// The capability signing key delegation at `signing-key.json` (Capabilities §5).
+    pub delegation: Change,
 }
 
-/// Publish the App Registry entry and the Noise Key Authorization for `generation`.
+/// Publish the App Registry entry, the Noise Key Authorization and the capability signing key
+/// delegation for `generation`.
 ///
 /// Rerunning with the published generation writes nothing. Rotation is the next generation: the
 /// registry advances first and the authorization second, the order paykit-sdk rotates in, so a
 /// reader never sees an authorization the registry does not advertise yet. paykit-rs refuses a
-/// lower generation, a skipped one, or a different key at the same one.
+/// lower generation, a skipped one, or a different key at the same one. The delegation comes
+/// last, because a reader verifies it against the authorization.
 pub async fn setup(
     session: &PubkySession,
     identity: &Keypair,
@@ -119,8 +147,8 @@ pub async fn setup(
     }
 
     let registry = publish_registry(session, &keys).await?;
-    let authorization = match published {
-        Some(current) if keys.matches(&current) => Change::Unchanged,
+    let (authorization, current) = match published {
+        Some(current) if keys.matches(&current) => (Change::Unchanged, current),
         previous => {
             let record =
                 PaykitNoiseKeyAuthorization::sign(identity, &keys.noise_secret, generation)
@@ -128,18 +156,47 @@ pub async fn setup(
             paykit_lib::publish_paykit_noise_key_authorization(session, &record)
                 .await
                 .map_err(|e| anyhow!("publish the Noise Key Authorization: {e}"))?;
-            if previous.is_some() {
+            let change = if previous.is_some() {
                 Change::Updated
             } else {
                 Change::Created
-            }
+            };
+            (change, record)
         }
     };
+    let delegation = publish_delegation(session, &identity.secret_key(), &current).await?;
     Ok(SetupReport {
         generation,
         routing_key: keys.routing_key.z32(),
         registry,
         authorization,
+        delegation,
+    })
+}
+
+/// Write the delegation `current` roots, unless the published file already has these bytes.
+///
+/// Every app of the identity writes the same bytes for one generation, so an equal file is left
+/// alone and a different one (absent, older generation, or corrupt) is replaced.
+async fn publish_delegation(
+    session: &PubkySession,
+    identity_secret: &[u8; 32],
+    current: &PaykitNoiseKeyAuthorization,
+) -> Result<Change> {
+    let bytes = SigningKeyDelegation::sign(identity_secret, current)?.to_bytes();
+    let previous = read(session, SIGNING_KEY_PATH).await?;
+    if previous.as_deref() == Some(bytes.as_slice()) {
+        return Ok(Change::Unchanged);
+    }
+    session
+        .storage()
+        .put(SIGNING_KEY_PATH, bytes)
+        .await
+        .with_context(|| format!("write {SIGNING_KEY_PATH}"))?;
+    Ok(if previous.is_some() {
+        Change::Updated
+    } else {
+        Change::Created
     })
 }
 
@@ -205,6 +262,33 @@ impl DescriptorWriter {
     /// The key generation the published authorization was at when this writer signed in.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Publish the capability signing key delegation for this writer's generation, if the file
+    /// does not hold it already, and return that generation's keys to sign with.
+    ///
+    /// The authorization is read again first and must still be at this generation, so a writer
+    /// whose generation has since been rotated away never writes over the newer delegation.
+    pub async fn ensure_delegation(
+        &self,
+        identity_secret: &[u8; 32],
+    ) -> Result<(Change, GenerationKeys)> {
+        let owner = Keypair::from_secret(identity_secret).public_key();
+        let current = read_authorization(&self.session, &owner)
+            .await?
+            .ok_or_else(|| anyhow!("the Noise Key Authorization is no longer published"))?;
+        if current.key_generation() != self.generation {
+            bail!(
+                "the published generation moved from {} to {}; sign in again",
+                self.generation,
+                current.key_generation()
+            );
+        }
+        let change = publish_delegation(&self.session, identity_secret, &current).await?;
+        Ok((
+            change,
+            GenerationKeys::derive(identity_secret, self.generation)?,
+        ))
     }
 
     pub async fn put(&self, path: &str, bytes: Vec<u8>) -> Result<()> {
@@ -340,9 +424,25 @@ pub struct Inspection {
     pub app_registered: bool,
     /// Whether the App Registry advertises the authorized key and generation.
     pub registry_matches: bool,
+    /// The published capability signing key delegation, against the authorization.
+    pub delegation: DelegationState,
+}
+
+/// The capability signing key delegation as a reader following §5 finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegationState {
+    /// No delegation is published, or there is no authorization to check one against.
+    Missing,
+    /// It verifies under the published authorization and names the key this identity derives.
+    Current,
+    /// Published but unusable, and why: another generation, another key, or a bad signature.
+    /// Readers drop everything the capability signing key signs until it is rewritten.
+    Invalid(String),
 }
 
 impl Inspection {
+    /// Whether the App Registry and the authorization are in place, which a descriptor needs.
+    /// The delegation is not part of it: whoever writes a descriptor writes the delegation first.
     pub fn is_healthy(&self) -> bool {
         self.generation.is_some()
             && self.routing_key_matches
@@ -351,7 +451,7 @@ impl Inspection {
     }
 }
 
-/// Read both records the way any peer does, unauthenticated, and compare them with the
+/// Read the records the way any peer does, unauthenticated, and compare them with the
 /// derivation at the published generation.
 pub async fn inspect(storage: &PublicStorage, identity_secret: &[u8; 32]) -> Result<Inspection> {
     let owner = Keypair::from_secret(identity_secret).public_key();
@@ -370,6 +470,7 @@ pub async fn inspect(storage: &PublicStorage, identity_secret: &[u8; 32]) -> Res
             routing_key_matches: false,
             app_registered,
             registry_matches: false,
+            delegation: DelegationState::Missing,
         });
     };
     let generation = authorization.key_generation();
@@ -378,11 +479,22 @@ pub async fn inspect(storage: &PublicStorage, identity_secret: &[u8; 32]) -> Res
         r.key_generation() == generation
             && r.noise_public_key() == Some(authorization.noise_public_key())
     });
+    let delegation = match fetch_delegation(storage, &owner).await? {
+        None => DelegationState::Missing,
+        Some(bytes) => match SigningKeyDelegation::verify(&bytes, &authorization) {
+            Ok(d) if d.signing_key() == keys.cap_signing_public_key() => DelegationState::Current,
+            Ok(_) => DelegationState::Invalid(
+                "it names a key this identity does not derive at this generation".into(),
+            ),
+            Err(e) => DelegationState::Invalid(format!("{e:#}")),
+        },
+    };
     Ok(Inspection {
         generation: Some(generation),
         routing_key_matches: keys.matches(&authorization),
         app_registered,
         registry_matches,
+        delegation,
     })
 }
 

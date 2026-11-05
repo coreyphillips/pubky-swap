@@ -3664,8 +3664,9 @@ async fn handle_direct_request(
     }
 }
 
-/// The `paykit-cap.*` signer. For now it is the provider's root key, the one a client dials;
-/// whether it becomes a delegated subkey waits on pubky/paykit-rs#229.
+/// The `paykit-cap.*` signer at startup: the provider's root key, the one a client dials. With
+/// `paykit`, the descriptor publisher replaces it with the capability signing key once that key's
+/// delegation is published (Capabilities §5), so a provider without a homeserver keeps this one.
 #[cfg(feature = "iroh")]
 fn cap_signer(identity: &swap_config::Identity) -> Result<cap_adapter::CapState> {
     let secret = pubky_transport::identity::secret_from_recovery(

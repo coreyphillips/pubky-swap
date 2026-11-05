@@ -574,8 +574,12 @@ pub fn sign_contract(
 /// their signatures and hashes check out.
 #[derive(Debug)]
 pub struct CapClient {
-    /// The provider's key as hex. Replies signed by any other key are refused.
+    /// The provider's key as hex. Replies signed by any other key, or by one in
+    /// `delegated_signers`, are refused.
     expected_signer: Option<String>,
+    /// Capability signing keys the provider's routing key delegated to (Capabilities §5), as hex.
+    /// The caller checks the delegation chain before adding one with [`CapClient::allow_signer`].
+    delegated_signers: Vec<String>,
     /// This client and the provider it talks to, which every quote it accepts names.
     parties: Parties,
     /// Each signed quote and the RFQ it answered, by quote id. A commit names its terms and
@@ -593,6 +597,7 @@ impl CapClient {
     pub fn new(expected_signer: Option<[u8; 32]>, parties: Parties) -> Self {
         Self {
             expected_signer: expected_signer.map(hex::encode),
+            delegated_signers: Vec::new(),
             parties,
             quotes: HashMap::new(),
             commits: HashMap::new(),
@@ -624,10 +629,29 @@ impl CapClient {
         }
     }
 
-    fn check_signer(&self, signer: &str) -> Result<(), CapError> {
+    /// Accept replies signed by `signer_hex` too, once its delegation from the provider's
+    /// routing key has been verified.
+    pub fn allow_signer(&mut self, signer_hex: String) {
+        if !self.delegated_signers.contains(&signer_hex) {
+            self.delegated_signers.push(signer_hex);
+        }
+    }
+
+    /// Whether a reply signed by `signer` would be accepted.
+    pub fn allows(&self, signer: &str) -> bool {
         match &self.expected_signer {
-            Some(expected) if expected != signer => Err(CapError::UnexpectedSigner),
-            _ => Ok(()),
+            Some(expected) => {
+                expected == signer || self.delegated_signers.iter().any(|key| key == signer)
+            }
+            None => true,
+        }
+    }
+
+    fn check_signer(&self, signer: &str) -> Result<(), CapError> {
+        if self.allows(signer) {
+            Ok(())
+        } else {
+            Err(CapError::UnexpectedSigner)
         }
     }
 
@@ -731,6 +755,19 @@ impl CapClient {
             }
             _ => Err(CapError::Unexpected("kind")),
         }
+    }
+}
+
+/// The key a reply is signed by, for a reply that carries a signature.
+pub fn reply_signer(reply: &CapMessage) -> Option<&str> {
+    match reply {
+        CapMessage::Quote(signed) => Some(&signed.signer),
+        CapMessage::Contract(contract) => Some(&contract.signed.signer),
+        CapMessage::Status(status) => status
+            .contract
+            .as_ref()
+            .map(|contract| contract.signed.signer.as_str()),
+        _ => None,
     }
 }
 
@@ -994,6 +1031,46 @@ mod tests {
             swap_id,
             quote_id,
         })
+    }
+
+    /// A capability signing key the caller verified is accepted beside the dialed key, and any
+    /// other key is still refused.
+    #[test]
+    fn the_client_accepts_a_delegated_signer_only_once_allowed() {
+        let provider = signer();
+        let key: [u8; 32] = hex::decode(provider.public_key_hex())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let delegated = Ed25519Signer::from_secret(&[5; 32]);
+        let mut client = CapClient::new(Some(key), parties());
+        let quote_request = quote_request();
+        client.request(&quote_request);
+        let by_delegate =
+            CapMessage::Quote(sign_quote(&delegated, &parties(), &rfq(), &quote()).unwrap());
+        assert_eq!(
+            reply_signer(&by_delegate),
+            Some(delegated.public_key_hex().as_str())
+        );
+        assert!(!client.allows(&delegated.public_key_hex()));
+        assert!(matches!(
+            client.reply(&quote_request, by_delegate.clone()),
+            Err(CapError::UnexpectedSigner)
+        ));
+
+        client.allow_signer(delegated.public_key_hex());
+        assert!(client.allows(&delegated.public_key_hex()));
+        assert!(client.allows(&provider.public_key_hex()));
+        let reply = client.reply(&quote_request, by_delegate).unwrap();
+        assert!(matches!(reply, SwapMessage::Quote(q) if q.quote_id == quote().quote_id));
+
+        let stranger = Ed25519Signer::from_secret(&[8; 32]);
+        let forged =
+            CapMessage::Quote(sign_quote(&stranger, &parties(), &rfq(), &quote()).unwrap());
+        assert!(matches!(
+            client.reply(&quote_request, forged),
+            Err(CapError::UnexpectedSigner)
+        ));
     }
 
     /// The client turns a full exchange into engine messages, and refuses a quote signed by a
