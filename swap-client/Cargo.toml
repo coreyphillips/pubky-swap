@@ -18,9 +18,13 @@ beignet = ["dep:beignet-backend"]
 bdk-wallet = ["swap-common/bdk-wallet"]
 # Everything needed to execute a swap end-to-end from the CLI, including ringing a provider's
 # doorbell: a provider that has never heard of us cannot find our message otherwise.
-full = ["lnd", "chain", "bdk-wallet", "iroh"]
+full = ["lnd", "chain", "bdk-wallet", "iroh", "paykit"]
 # Ring the provider's iroh P2P rendezvous (doorbell) so it starts polling us for the swap DM.
 iroh = ["pubky-transport/iroh"]
+# Accept `paykit-cap` replies signed by the provider's capability signing key, after checking its
+# delegation from the provider's routing key (Capabilities §5). Without it only the key the
+# client dialed is accepted.
+paykit = ["dep:paykit-identity", "iroh"]
 
 [dependencies]
 pubky-transport.workspace = true
@@ -30,6 +34,7 @@ serde.workspace = true
 serde_json.workspace = true
 lightning-backend.workspace = true
 beignet-backend = { workspace = true, optional = true }
+paykit-identity = { workspace = true, optional = true }
 bitcoin.workspace = true
 tokio.workspace = true
 clap.workspace = true

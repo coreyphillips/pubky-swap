@@ -1,8 +1,11 @@
 //! The provider's Paykit identity (feature `paykit`): `--paykit-setup`, the doctor's check, and
 //! the `swap/1` Capability Descriptor it publishes.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use swap_common::cap_descriptor::DESCRIPTOR_PATH;
+use swap_common::paykit_cap::{CapSigner, Ed25519Signer};
 use tokio::time::{sleep, Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -19,17 +22,19 @@ fn identity_secret(config: &ProviderConfig) -> Result<[u8; 32]> {
     )?)
 }
 
-/// Publish the App Registry entry and the Noise Key Authorization, and say what changed.
+/// Publish the App Registry entry, the Noise Key Authorization and the capability signing key
+/// delegation, and say what changed.
 pub async fn setup(config: &ProviderConfig, generation: Option<u64>) -> Result<String> {
     let report = paykit_identity::sign_in_and_setup(&identity_secret(config)?, generation).await?;
     Ok(format!(
         "Paykit generation {}, routing key {}\n  App Registry ({}): {:?}\n  Noise Key \
-         Authorization: {:?}\n",
+         Authorization: {:?}\n  Capability signing key delegation: {:?}\n",
         report.generation,
         report.routing_key,
         paykit_identity::APP_ID,
         report.registry,
         report.authorization,
+        report.delegation,
     ))
 }
 
@@ -37,11 +42,17 @@ pub async fn setup(config: &ProviderConfig, generation: Option<u64>) -> Result<S
 ///
 /// Each rebuilt offer is written once. A failed write or sign-in is retried with a growing delay,
 /// and nothing is written while the offer has expired, so the file lapses rather than lies.
+///
+/// Each sign-in also publishes the capability signing key delegation for the published
+/// generation, if it is not there already, and moves the `paykit-cap` signer to that
+/// generation's capability signing key (Capabilities §5). The descriptor is signed only after
+/// that, so a reader can always verify it, and a rotation reaches the signer with the next
+/// sign-in.
 pub(crate) fn spawn_descriptor_publisher(
     config: &ProviderConfig,
     offer: SharedOffer,
     book: SharedDescriptors,
-    cap: &crate::cap_adapter::CapState,
+    cap: &Arc<crate::cap_adapter::CapState>,
 ) {
     const POLL: Duration = Duration::from_secs(5);
     const MAX_BACKOFF: Duration = Duration::from_secs(1800);
@@ -55,7 +66,7 @@ pub(crate) fn spawn_descriptor_publisher(
         Ok(secret) => secret,
         Err(e) => return warn!("not publishing the swap/1 descriptor: {e:#}"),
     };
-    let signer = cap.signer();
+    let cap = cap.clone();
     let owner = cap.provider().to_string();
     tokio::spawn(async move {
         let mut writer: Option<(paykit_identity::DescriptorWriter, Instant)> = None;
@@ -82,6 +93,23 @@ pub(crate) fn spawn_descriptor_publisher(
             let attempt = async {
                 if writer.is_none() {
                     let session = paykit_identity::DescriptorWriter::sign_in(&secret).await?;
+                    let (change, keys) = session.ensure_delegation(&secret).await?;
+                    if change != paykit_identity::Change::Unchanged {
+                        info!(
+                            "published the capability signing key delegation for generation {}",
+                            session.generation()
+                        );
+                    }
+                    let signer: Arc<dyn CapSigner> =
+                        Arc::new(Ed25519Signer::from_secret(&keys.cap_signing_secret()));
+                    let key = signer.public_key_hex();
+                    if cap.set_signer(signer) {
+                        info!(
+                            "paykit-cap objects are now signed with the capability signing key \
+                             {key} (generation {})",
+                            session.generation()
+                        );
+                    }
                     writer = Some((session, Instant::now()));
                 }
                 let (session, _) = writer.as_ref().expect("signed in above");
@@ -89,7 +117,7 @@ pub(crate) fn spawn_descriptor_publisher(
                     &current,
                     &owner,
                     session.generation(),
-                    signer.as_ref(),
+                    cap.signer().as_ref(),
                     crate::now_unix(),
                 )?;
                 session.put(DESCRIPTOR_PATH, bytes).await?;
@@ -195,9 +223,34 @@ fn describe(inspection: Result<paykit_identity::Inspection>) -> Check {
         )
         .with_remedy("rerun swap-provider --paykit-setup");
     }
+    // Readers verify the descriptor and every signed quote through this delegation (§5).
+    let unusable = match &inspection.delegation {
+        paykit_identity::DelegationState::Current => None,
+        paykit_identity::DelegationState::Missing => {
+            Some("no capability signing key delegation is published".to_string())
+        }
+        paykit_identity::DelegationState::Invalid(why) => Some(format!(
+            "the capability signing key delegation does not verify: {why}"
+        )),
+    };
+    if let Some(problem) = unusable {
+        return Check::warn(
+            "paykit",
+            format!(
+                "generation {generation}, routing key matches, App Registry lists pubky-swap, \
+                 but {problem}, so readers drop what this provider signs"
+            ),
+        )
+        .with_remedy(
+            "rerun swap-provider --paykit-setup, or start the provider, which publishes it",
+        );
+    }
     Check::pass(
         "paykit",
-        format!("generation {generation}, routing key matches, App Registry lists pubky-swap"),
+        format!(
+            "generation {generation}, routing key matches, App Registry lists pubky-swap, \
+             capability signing key delegated"
+        ),
     )
 }
 
@@ -213,6 +266,28 @@ mod tests {
             routing_key_matches,
             app_registered: true,
             registry_matches: true,
+            delegation: paykit_identity::DelegationState::Current,
+        }
+    }
+
+    #[test]
+    fn a_missing_or_invalid_delegation_is_a_warning() {
+        for (state, expect) in [
+            (
+                paykit_identity::DelegationState::Missing,
+                "no capability signing key",
+            ),
+            (
+                paykit_identity::DelegationState::Invalid("another generation".into()),
+                "another generation",
+            ),
+        ] {
+            let mut seen = inspection(Some(2), true);
+            seen.delegation = state;
+            let check = describe(Ok(seen));
+            assert_eq!(check.status, Status::Warn);
+            assert!(check.detail.contains(expect), "{}", check.detail);
+            assert!(check.remedy.unwrap_or_default().contains("--paykit-setup"));
         }
     }
 
@@ -232,6 +307,7 @@ mod tests {
         let check = describe(Ok(inspection(Some(2), true)));
         assert_eq!(check.status, Status::Pass);
         assert!(check.detail.contains("generation 2"), "{}", check.detail);
+        assert!(check.detail.contains("delegated"), "{}", check.detail);
     }
 
     #[test]

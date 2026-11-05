@@ -3317,11 +3317,18 @@ name = "paykit-identity"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "hex",
  "paykit-lib",
  "paykit-sdk",
  "pubky",
+ "serde",
  "serde_json",
+ "swap-common",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4917,6 +4924,7 @@ dependencies = [
  "clap",
  "hex",
  "lightning-backend",
+ "paykit-identity",
  "pubky-transport",
  "rand 0.8.6",
  "serde",

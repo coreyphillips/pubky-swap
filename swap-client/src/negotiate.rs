@@ -193,12 +193,17 @@ impl Channel for IrohChannel {
 /// Requests over iroh `direct/1` in the `paykit-cap.*` kinds for `swap/1`.
 ///
 /// Quotes and contracts come back signed, and are checked against the provider's key before the
-/// engine sees them. A commit for a quote this channel did not see signed, and every kind the
-/// profile has no word for, goes as a plain [`SwapMessage`].
+/// engine sees them: the key the client dialed, or, with `paykit`, the capability signing key
+/// the provider's routing key delegated to (Capabilities §5). A commit for a quote this channel
+/// did not see signed, and every kind the profile has no word for, goes as a plain
+/// [`SwapMessage`].
 #[cfg(feature = "iroh")]
 pub struct CapChannel {
     client: pubky_transport::p2p::DirectRpcClient,
     cap: Mutex<swap_common::paykit_cap::CapClient>,
+    /// The provider's pubky, whose published delegation names its capability signing key.
+    #[cfg(feature = "paykit")]
+    provider: String,
 }
 
 #[cfg(feature = "iroh")]
@@ -213,11 +218,58 @@ impl CapChannel {
         let client = pubky_transport::p2p::DirectRpcClient::new(secret, provider).await?;
         Ok(Self {
             client,
+            #[cfg(feature = "paykit")]
+            provider: parties.provider.clone(),
             cap: Mutex::new(swap_common::paykit_cap::CapClient::new(
                 Some(signer),
                 parties,
             )),
         })
+    }
+
+    /// Accept the reply's signer if it is the provider's capability signing key, checked
+    /// through the provider's published Noise Key Authorization and delegation (Capabilities
+    /// §5). A reply signed by any other key is then refused by the check that follows.
+    #[cfg(feature = "paykit")]
+    async fn allow_delegated_signer(&self, reply: &swap_common::paykit_cap::CapMessage) {
+        // The Pubky clients set no request timeout.
+        const RESOLVE: std::time::Duration = std::time::Duration::from_secs(20);
+        let Some(signer) = swap_common::paykit_cap::reply_signer(reply).map(str::to_owned) else {
+            return;
+        };
+        if self
+            .cap
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .allows(&signer)
+        {
+            return;
+        }
+        // Boxed: nested inline, this future is deep enough that laying out the binary's `main`
+        // overflows rustc's query depth.
+        let resolved = tokio::time::timeout(
+            RESOLVE,
+            Box::pin(paykit_identity::resolve_published_signing_key(
+                &self.provider,
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("no answer within {}s", RESOLVE.as_secs())));
+        match resolved {
+            Ok(Some(delegation)) if delegation.signing_key_hex() == signer => self
+                .cap
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .allow_signer(signer),
+            Ok(Some(_)) => warn!("the reply's signer is not the key the provider delegated to"),
+            Ok(None) => warn!(
+                "the reply is signed by a key other than the provider's, and the provider \
+                 publishes no capability signing key delegation"
+            ),
+            Err(error) => {
+                warn!("could not check the provider's capability signing key: {error:#}")
+            }
+        }
     }
 }
 
@@ -257,6 +309,8 @@ impl Channel for CapChannel {
             use swap_common::paykit_cap::{CapError, CapMessage};
             let reply: CapMessage =
                 serde_json::from_slice(&bytes).map_err(|error| unreadable(error.to_string()))?;
+            #[cfg(feature = "paykit")]
+            self.allow_delegated_signer(&reply).await;
             let reply = self
                 .cap
                 .lock()
