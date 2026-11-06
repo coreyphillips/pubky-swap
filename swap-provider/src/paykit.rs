@@ -164,10 +164,9 @@ pub(crate) fn spawn_descriptor_publisher(
     });
 }
 
-/// How long the provider may go between reads of its published delegation. Capabilities §5 has
-/// an app read it before sending a signed object. Quotes are signed on the request path, so
-/// instead of a homeserver read per quote the publisher reads it this often, and before each
-/// descriptor write.
+/// How long the provider may go between reads of its published delegation while it signs, the
+/// bound Capabilities §5 sets. Quotes need no read of their own: one signed while the delegation
+/// is stale is rejected only until the next check repairs it, and the owner can ask again.
 const DELEGATION_CHECK: Duration = Duration::from_secs(60);
 
 /// Make sure the published delegation names `session`'s generation, rewriting it if not, and
