@@ -379,14 +379,15 @@ both:
   padding. A reader refuses any other form rather than normalizing it.
 
 `--paykit-setup` writes the delegation after the authorization, and `--doctor` warns when it is
-missing or does not verify. The descriptor publisher reads it before each descriptor write and
-at least once a minute in between, and rewrites it if it is missing or not the current
-generation's. It then moves the `paykit-cap` signer to that generation's capability signing
-key, and only then signs the descriptor. Section 5 asks for that read before every signed
-object; quotes are signed on the request path, so the publisher's one-minute check stands in for
-a homeserver read per quote. A delegation is only ever written for the generation the published
-authorization names, read again just before the write, so a provider still holding an older
-generation cannot overwrite a newer one. A rotation reaches the signer within about a minute.
+missing or does not verify. The descriptor publisher reads it when it starts, before each
+descriptor write and at least once a minute in between, which is the check §5 asks for, and
+rewrites it if it is missing or not the current generation's. It then moves the `paykit-cap`
+signer to that generation's capability signing key, and only then signs the descriptor. Quotes
+need no read of their own: one signed while the delegation is stale is rejected only until the
+next check repairs it, and the owner can ask again. A delegation is only ever written for the
+generation the published authorization names, read again just before the write, so a provider
+still holding an older generation cannot overwrite a newer one. A rotation reaches the signer
+within about a minute.
 
 A reader follows the chain with `paykit_identity::resolve_signing_key`: verify the Noise Key
 Authorization through paykit-rs, require the delegation's `owner` and `key_generation` to match
