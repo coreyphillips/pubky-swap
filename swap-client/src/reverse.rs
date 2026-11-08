@@ -117,6 +117,16 @@ pub async fn execute_reverse_swap(
             true
         }
     };
+    // A restored swap's invoice came from the provider's listing, and nothing checked its hash or
+    // its amount against a quote, so paying it could pay anything. Only a payment the node
+    // already made is claimed.
+    if resume.restored_from_listing && !already_paying {
+        return Err(anyhow!(
+            "this swap was restored from the provider's listing and the node has no payment for \
+             it, so there is nothing to claim. Its invoice was never checked against a quote, so \
+             it is not paid."
+        ));
+    }
 
     let pay_task = if already_paying {
         None
@@ -455,6 +465,107 @@ mod tests {
         }
     }
 
+    /// Drive a swap restored from a provider's listing, with its lockup funded and confirmed,
+    /// against a node that reports `status` for its payment.
+    async fn run_restored(
+        status: lightning_backend::PaymentStatus,
+    ) -> (
+        Result<Txid>,
+        Arc<MockLn>,
+        Arc<MockChain>,
+        OutPoint,
+        [u8; 32],
+    ) {
+        let secp = Secp256k1::new();
+        let (claim_sk, claim_pk) = random_keypair(&secp);
+        let (_r, refund_pk) = random_keypair(&secp);
+        let preimage = generate_preimage();
+        let ph = payment_hash(&preimage);
+        let script = build_htlc_script(&ph, &claim_pk, &refund_pk, TIMEOUT);
+        let htlc_spk = htlc_p2wsh_address(&script, Network::Regtest).script_pubkey();
+        let outpoint = OutPoint {
+            txid: BTxid::from_str(
+                "5555555555555555555555555555555555555555555555555555555555555555",
+            )
+            .unwrap(),
+            vout: 0,
+        };
+        let ln = Arc::new(MockLn::new(preimage).with_status(status));
+        let mc = Arc::new(
+            MockChain::new()
+                .with_funding(FundingUtxo {
+                    outpoint,
+                    value_sat: AMOUNT,
+                    confirmations: 2,
+                })
+                .always_final(),
+        );
+        let claim = ReverseClaim {
+            htlc_script: script,
+            htlc_spk,
+            onchain_amount_sat: AMOUNT,
+            // Whatever the provider listed: another hash, another amount.
+            invoice: "lnbcrt-listed-by-the-provider".into(),
+            preimage,
+            claim_key: claim_sk,
+            dest_spk: ScriptBuf::from_hex("0014abababababababababababababababababababab").unwrap(),
+            fee_rate_sat_vb: 5,
+            timeout_height: TIMEOUT,
+        };
+        // What `reverse_resume` hands a restored record.
+        let resume = Resume {
+            invoice_pay_started_at_unix: Some(0),
+            restored_from_listing: true,
+            ..Resume::default()
+        };
+        let result = execute_reverse_swap(
+            ln.clone(),
+            mc.clone(),
+            claim,
+            10_000,
+            1,
+            Duration::from_millis(0),
+            &resume,
+            &(),
+        )
+        .await;
+        (result, ln, mc, outpoint, ph)
+    }
+
+    /// A restored swap's invoice is the provider's word, never checked against a quote. A node
+    /// with no payment for it, or a failed one, is never asked to pay it, however the lockup
+    /// looks, and the preimage stays secret.
+    #[tokio::test]
+    async fn a_restored_swap_never_pays_its_listed_invoice() {
+        for status in [
+            lightning_backend::PaymentStatus::NotFound,
+            lightning_backend::PaymentStatus::Failed("no route".into()),
+        ] {
+            let (result, ln, mc, _, _) = run_restored(status).await;
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("never checked"), "{err:#}");
+            assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+            assert!(mc.broadcasts().is_empty());
+        }
+    }
+
+    /// A restored swap whose payment the node already made is claimed as any other, without
+    /// paying again.
+    #[tokio::test]
+    async fn a_restored_swap_claims_a_payment_the_node_already_made() {
+        for status in [
+            lightning_backend::PaymentStatus::InFlight,
+            lightning_backend::PaymentStatus::Unknown,
+        ] {
+            let (result, ln, mc, outpoint, ph) = run_restored(status).await;
+            result.unwrap();
+            assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+            let broadcasts = mc.broadcasts();
+            assert_eq!(broadcasts.len(), 1);
+            assert!(extract_preimage(&broadcasts[0], &outpoint, &ph).is_some());
+        }
+    }
+
     #[tokio::test]
     async fn client_pays_and_claims() {
         let secp = Secp256k1::new();
@@ -724,6 +835,7 @@ mod tests {
                 funding_intent_at_height: None,
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
+                restored_from_listing: false,
             },
             &(),
         )

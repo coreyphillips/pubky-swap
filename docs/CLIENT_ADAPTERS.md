@@ -170,8 +170,11 @@ comes back against the listed contract (`verify_contract`) and the payment hash,
 record that `resume` drives like any other. Terminal swaps, swaps already in the store, and
 snapshots the resolver cannot key are reported rather than written. Only reverse swaps are
 rebuilt: a submarine refund needs the client's own invoice, which the listing does not carry.
-A restored reverse record carries no saved request, so `resume` asks the node whether the hold
-invoice was already paid before paying it.
+A listing is the provider's word, so a restored reverse record is held to two more rules. It
+never pays its invoice, because nothing checked the invoice against a quote: `resume` claims it
+only when the node already has a payment for its hash. And it waits for at least the
+confirmations a fresh swap on the same network would (`ClientPolicy::for_network`), whatever the
+listing says. Restore does not yet check the lockup's amount against what the node paid.
 
 The final `SwapStatusUpdate` names the transaction behind its outcome in `reference`, which is
 the `evidence` of a terminal Paykit intent status:
