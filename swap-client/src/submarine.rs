@@ -667,6 +667,7 @@ mod tests {
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
                 invoice_pay_started_at_unix: None,
+                restored_from_listing: false,
             },
             &(),
         )
@@ -711,6 +712,7 @@ mod tests {
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
                 invoice_pay_started_at_unix: None,
+                restored_from_listing: false,
             },
             &(),
         )
@@ -850,6 +852,7 @@ mod tests {
                 our_spends: vec![our_txid],
                 reorg_seen_at_height: None,
                 invoice_pay_started_at_unix: None,
+                restored_from_listing: false,
             },
             &(),
         )

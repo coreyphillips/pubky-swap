@@ -144,7 +144,8 @@ async fn resume_reverse(
 
 /// Legacy records predate the payment marker, so absence cannot prove no submission happened.
 /// A restored record has no saved request either, and for the same reason: this device does not
-/// know what an earlier one sent.
+/// know what an earlier one sent. A restored record is also never paid
+/// ([`Resume::restored_from_listing`]).
 pub(crate) fn reverse_resume(record: &SwapRecord) -> Resume {
     let mut resume = record.resume();
     if record.swap_request.is_none() && resume.invoice_pay_started_at_unix.is_none() {

@@ -1778,6 +1778,7 @@ mod tests {
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
                 invoice_pay_started_at_unix: None,
+                restored_from_listing: false,
             },
             &(),
         )
@@ -1876,6 +1877,7 @@ mod tests {
                     our_spends: Vec::new(),
                     reorg_seen_at_height: Some(MOCK_TIP - 2),
                     invoice_pay_started_at_unix: None,
+                    restored_from_listing: false,
                 },
                 &(),
             ),
@@ -1919,6 +1921,7 @@ mod tests {
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
                 invoice_pay_started_at_unix: None,
+                restored_from_listing: false,
             },
             &(),
         )
@@ -2031,6 +2034,7 @@ mod tests {
                 our_spends: Vec::new(),
                 reorg_seen_at_height: None,
                 invoice_pay_started_at_unix: None,
+                restored_from_listing: false,
             },
             &(),
         )

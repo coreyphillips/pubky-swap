@@ -8,7 +8,9 @@
 //! derives them from its seed, by the index it put in `owner_ref` or by scanning around the
 //! listed creation time, supplies them through a resolver. Everything it supplies is checked
 //! against the listed contract before a record is written, and the record is one `resume` drives
-//! like any other.
+//! like any other, with two limits. The listing is the provider's word, so a restored swap's
+//! invoice is never paid: it is claimed only when the node already has a payment for its hash.
+//! And it never waits for fewer confirmations than a fresh swap on the same network would.
 //!
 //! Only reverse swaps are rebuilt. A submarine swap's refund needs the client's own invoice,
 //! which the listing does not carry, so those are reported for the caller to handle.
@@ -21,7 +23,8 @@ use swap_common::htlc::{build_htlc_script, payment_hash};
 use swap_common::messages::{RejectCode, SwapScript, SwapStatusSnapshot, SWAP_LIST_FEATURE};
 use swap_common::store::{SwapRecord, SwapRole, SwapStore};
 use swap_common::taproot::BoltzTaprootSwap;
-use swap_common::validate::verify_contract;
+use swap_common::timelock::TimelockParams;
+use swap_common::validate::{verify_contract, ClientPolicy};
 use swap_common::{NetworkSpec, SwapDirection, SwapState};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -202,7 +205,14 @@ fn reverse_record(
         secret_key_hex: hex::encode(keys.branch_key.secret_bytes()),
         preimage_hex: Some(hex::encode(preimage)),
         invoice,
-        required_confirmations: snapshot.required_confirmations,
+        // The listing's number is the provider's word. Zero would have the claim reveal the
+        // preimage on a lockup the provider can still replace, so it never goes below the floor
+        // a fresh swap on this network gets.
+        required_confirmations: ClientPolicy::for_network(
+            restore.network,
+            TimelockParams::default(),
+        )
+        .effective_confirmations(snapshot.required_confirmations),
         fee_rate_sat_vb: restore.fee_rate_sat_vb,
         htlc_script_hex,
         taproot,
@@ -216,6 +226,8 @@ fn reverse_record(
         // treats the invoice payment as possibly started and asks the node before paying.
         client_creation_started: true,
         client_execution_ready: true,
+        // The invoice is the listing's too, never checked against a quote, so it is never paid.
+        restored_from_listing: true,
         state: restored_state(snapshot),
         created_at_unix: snapshot.created_at_unix,
         ..SwapRecord::new_progress()
@@ -358,8 +370,12 @@ mod tests {
                     .to_hex_string()
             );
             assert_eq!(record.dest_spk().unwrap(), Some(restore(&store).dest_spk));
-            // `resume` treats the payment as possibly started, so it asks the node first.
+            // `resume` treats the payment as possibly started, so it asks the node first, and it
+            // never pays the listed invoice.
             assert!(!crate::resume::reverse_resume(&record).is_fresh());
+            assert!(record.restored_from_listing);
+            assert!(crate::resume::reverse_resume(&record).restored_from_listing);
+            assert_eq!(record.required_confirmations, 1);
             assert_eq!(crate::store::unfinished(&store).unwrap().len(), 1);
 
             // Listing it again changes nothing.
@@ -367,6 +383,37 @@ mod tests {
                 restore_snapshots(&restore(&store), "provider", &[listed.snapshot], |_| None)
                     .unwrap();
             assert_eq!(again.known, vec![record.swap_id]);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    /// The listed confirmations are the provider's word, and zero would have the claim reveal the
+    /// preimage on a lockup the provider can still replace. A restored record waits for at least
+    /// the floor a fresh swap on the same network gets, and for more when the listing says so.
+    #[test]
+    fn a_restored_record_waits_for_at_least_the_network_confirmation_floor() {
+        for (listed_confirmations, kept) in [(0, 1), (1, 1), (3, 3)] {
+            let (store, directory) = temp_store();
+            let mut listed = listed(SwapScript::P2wsh, SwapState::InvoicePaid);
+            listed.snapshot.required_confirmations = listed_confirmations;
+            let report = restore_snapshots(
+                &restore(&store),
+                "provider",
+                std::slice::from_ref(&listed.snapshot),
+                |_| {
+                    Some(RestoredKeys {
+                        branch_key: listed.claim_key,
+                        preimage: Some(listed.preimage),
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(report.restored, vec![listed.snapshot.accept.swap_id]);
+            let record = store.get(listed.snapshot.accept.swap_id).unwrap().unwrap();
+            assert_eq!(
+                record.required_confirmations, kept,
+                "listed {listed_confirmations}"
+            );
             std::fs::remove_dir_all(directory).unwrap();
         }
     }

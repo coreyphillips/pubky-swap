@@ -204,6 +204,11 @@ pub struct SwapRecord {
     /// Full contract and invoice validation completed before an execution driver may run.
     #[serde(default)]
     pub client_execution_ready: bool,
+    /// Client side: rebuilt from a provider's listing for a wallet restored from its seed, not
+    /// negotiated by this client. Its invoice is the provider's word and was never checked
+    /// against a quote, so a driver never pays it.
+    #[serde(default)]
+    pub restored_from_listing: bool,
     /// The `paykit-cap.contract` signed for this swap, kept so a replayed commit and every
     /// `status_request` get the same bytes. The first one stored is the one that stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -307,6 +312,7 @@ impl std::fmt::Debug for SwapRecord {
             .field("state", &self.state)
             .field("funding_txid_hex", &self.funding_txid_hex)
             .field("funding_vout", &self.funding_vout)
+            .field("restored_from_listing", &self.restored_from_listing)
             .field("last_error", &self.last_error)
             .finish_non_exhaustive()
     }
@@ -340,6 +346,10 @@ pub struct Resume {
     /// watched it confirm. A reorg is the one event that can make it untrue after the fact, so a
     /// driver that sees this goes back to the chain instead of trusting what it wrote down.
     pub reorg_seen_at_height: Option<u32>,
+    /// The record was rebuilt from a provider's listing, so nothing checked its invoice against a
+    /// quote: the provider chose the hash and the amount. A driver never pays it, and claims only
+    /// a payment the node already has.
+    pub restored_from_listing: bool,
 }
 
 impl Resume {
@@ -413,6 +423,7 @@ impl SwapRecord {
             client_creation_started: false,
             client_creation_tip: None,
             client_execution_ready: false,
+            restored_from_listing: false,
             last_error: None,
             retry_count: 0,
             next_retry_at_unix: None,
@@ -508,6 +519,7 @@ impl SwapRecord {
             funding_intent_at_height: self.funding_intent_at_height,
             our_spends: self.our_spends(),
             reorg_seen_at_height: self.reorg_seen_at_height,
+            restored_from_listing: self.restored_from_listing,
         }
     }
 
