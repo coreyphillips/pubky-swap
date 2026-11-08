@@ -39,6 +39,9 @@ pub const MIN_MAINNET_CONFIRMATIONS: u32 = 2;
 /// the client's Lightning payment is held while it waits for a funding to bury.
 pub const MAX_REQUIRED_CONFIRMATIONS: u32 = 12;
 
+/// The most a client pays in total fees by default, in basis points of the swap amount: 5%.
+pub const DEFAULT_MAX_SWAP_FEE_BPS: u16 = 500;
+
 /// What a client will and will not accept from a provider.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientPolicy {
@@ -64,7 +67,7 @@ impl ClientPolicy {
                 _ => 1,
             },
             max_required_confirmations: MAX_REQUIRED_CONFIRMATIONS,
-            max_fee_bps: 500, // 5%
+            max_fee_bps: DEFAULT_MAX_SWAP_FEE_BPS,
             max_total_sat: u64::MAX,
             timelock,
         }
@@ -593,6 +596,20 @@ pub fn validate_hold_invoice(
         });
     }
     Ok(())
+}
+
+/// The least a reverse swap's lockup can hold when its hold invoice was for `paid_msat`.
+///
+/// A quote's fee is at most `max_fee_bps` of its amount, and its invoice is the amount plus that
+/// fee, so a smaller lockup is one no quote within the bound could have offered for the payment.
+/// A swap restored from a provider's listing has no quote, only the listed lockup and what its
+/// own node paid, and this is how the two are compared. It holds a provider to the fee bound,
+/// not to the fee it actually quoted, which the listing cannot prove.
+pub fn min_reverse_lockup_sat(paid_msat: u64, max_fee_bps: u16) -> u64 {
+    let scaled = u128::from(paid_msat) * 10_000;
+    let per_sat = (10_000 + u128::from(max_fee_bps)) * 1_000;
+    // No more than `paid_msat / 1000` rounded up, so it fits.
+    scaled.div_ceil(per_sat) as u64
 }
 
 #[cfg(test)]
@@ -1144,5 +1161,26 @@ mod tests {
             validate_hold_invoice(&inv, &q, &ph, NOW, &policy()),
             Err(ValidationError::InvoiceExpiresTooSoon { .. })
         ));
+    }
+
+    /// A quote at the fee bound needs a lockup of exactly its amount, and a payment one satoshi
+    /// larger needs more than any quote within the bound would lock.
+    #[test]
+    fn the_lockup_floor_is_the_amount_of_a_quote_at_the_fee_bound() {
+        let bps = policy().max_fee_bps;
+        for amount in [1_000u64, 100_000, 100_001, 123_457, 21_000_000] {
+            // The bound `validate_quote` applies.
+            let max_fee = (u128::from(amount) * u128::from(bps) / 10_000) as u64;
+            for fee in [0, max_fee / 2, max_fee] {
+                let paid_msat = (amount + fee) * 1_000;
+                assert!(min_reverse_lockup_sat(paid_msat, bps) <= amount);
+            }
+            let at_bound = (amount + max_fee) * 1_000;
+            assert_eq!(min_reverse_lockup_sat(at_bound, bps), amount);
+            assert!(min_reverse_lockup_sat(at_bound + 1_000, bps) > amount);
+        }
+        // With no fee allowed, the lockup covers the whole payment, rounded up to a satoshi.
+        assert_eq!(min_reverse_lockup_sat(100_000_500, 0), 100_001);
+        assert!(min_reverse_lockup_sat(u64::MAX, bps) < u64::MAX / 1_000);
     }
 }

@@ -170,11 +170,15 @@ comes back against the listed contract (`verify_contract`) and the payment hash,
 record that `resume` drives like any other. Terminal swaps, swaps already in the store, and
 snapshots the resolver cannot key are reported rather than written. Only reverse swaps are
 rebuilt: a submarine refund needs the client's own invoice, which the listing does not carry.
-A listing is the provider's word, so a restored reverse record is held to two more rules. It
+A listing is the provider's word, so a restored reverse record is held to three more rules. It
 never pays its invoice, because nothing checked the invoice against a quote: `resume` claims it
-only when the node already has a payment for its hash. And it waits for at least the
-confirmations a fresh swap on the same network would (`ClientPolicy::for_network`), whatever the
-listing says. Restore does not yet check the lockup's amount against what the node paid.
+only when the node already has a payment for its hash. Its lockup must be one a quote within the
+default 5% fee bound could have offered for what the node paid (`min_reverse_lockup_sat`), so
+`resume` reads the paid amount from `PaymentStatus::InFlight` and leaves the preimage secret when
+the node does not report it. A payment that already settled is claimed whatever the lockup holds,
+since the provider has the preimage. And it waits for at least the confirmations a fresh swap on
+the same network would (`ClientPolicy::for_network`), whatever the listing says. A custom
+`LightningBackend` has to fill `InFlight.amount_msat` for a restored swap to be claimed.
 
 The final `SwapStatusUpdate` names the transaction behind its outcome in `reference`, which is
 the `evidence` of a terminal Paykit intent status:

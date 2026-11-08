@@ -8,9 +8,11 @@
 //! derives them from its seed, by the index it put in `owner_ref` or by scanning around the
 //! listed creation time, supplies them through a resolver. Everything it supplies is checked
 //! against the listed contract before a record is written, and the record is one `resume` drives
-//! like any other, with two limits. The listing is the provider's word, so a restored swap's
+//! like any other, with three limits. The listing is the provider's word, so a restored swap's
 //! invoice is never paid: it is claimed only when the node already has a payment for its hash.
-//! And it never waits for fewer confirmations than a fresh swap on the same network would.
+//! Its lockup is claimed only if a quote within the default fee bound could have offered it for
+//! what the node paid. And it never waits for fewer confirmations than a fresh swap on the same
+//! network would.
 //!
 //! Only reverse swaps are rebuilt. A submarine swap's refund needs the client's own invoice,
 //! which the listing does not carry, so those are reported for the caller to handle.
