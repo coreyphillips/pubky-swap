@@ -436,11 +436,42 @@ async fn payment_status_maps_the_node_answer() {
         let matched = matches!(
             (&status, check),
             (PaymentStatus::Succeeded(_), "succeeded")
-                | (PaymentStatus::InFlight, "inflight")
+                | (PaymentStatus::InFlight { .. }, "inflight")
                 | (PaymentStatus::Failed(_), "failed")
                 | (PaymentStatus::Unknown, "unknown")
         );
         assert!(matched, "{reported} mapped to {status:?}");
+    }
+}
+
+/// A pending payment reports what it pays, which a restored swap checks its lockup against. A
+/// daemon that leaves the amount out, or reports zero, gives no amount rather than a free one.
+#[tokio::test]
+async fn a_pending_payment_reports_its_amount() {
+    for (reported, want) in [
+        (Some(100_700), Some(100_700_000)),
+        (Some(0), None),
+        (None, None),
+    ] {
+        let server = MockServer::start().await;
+        let mut body = serde_json::json!({ "paymentHash": HASH, "status": "PENDING" });
+        if let Some(sats) = reported {
+            body["amountSats"] = serde_json::json!(sats);
+        }
+        Mock::given(method("GET"))
+            .and(path("/payment"))
+            .respond_with(ok(body))
+            .mount(&server)
+            .await;
+        let status = backend(&server)
+            .await
+            .payment_status(hash_bytes())
+            .await
+            .unwrap();
+        assert!(
+            matches!(status, PaymentStatus::InFlight { amount_msat } if amount_msat == want),
+            "{reported:?} sat mapped to {status:?}"
+        );
     }
 }
 

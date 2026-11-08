@@ -205,8 +205,9 @@ pub struct SwapRecord {
     #[serde(default)]
     pub client_execution_ready: bool,
     /// Client side: rebuilt from a provider's listing for a wallet restored from its seed, not
-    /// negotiated by this client. Its invoice is the provider's word and was never checked
-    /// against a quote, so a driver never pays it.
+    /// negotiated by this client. Its invoice and lockup are the provider's word and were never
+    /// checked against a quote, so a driver never pays the invoice, and claims the lockup only if
+    /// it fits what the node paid.
     #[serde(default)]
     pub restored_from_listing: bool,
     /// The `paykit-cap.contract` signed for this swap, kept so a replayed commit and every
@@ -348,7 +349,8 @@ pub struct Resume {
     pub reorg_seen_at_height: Option<u32>,
     /// The record was rebuilt from a provider's listing, so nothing checked its invoice against a
     /// quote: the provider chose the hash and the amount. A driver never pays it, and claims only
-    /// a payment the node already has.
+    /// a payment the node already has, against a lockup a quote within the default fee bound
+    /// could have offered for it.
     pub restored_from_listing: bool,
 }
 

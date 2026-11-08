@@ -75,7 +75,11 @@ pub enum PaymentStatus {
     /// The authoritative node lookup confirms no payment exists for this hash.
     NotFound,
     /// An attempt is in flight.
-    InFlight,
+    ///
+    /// `amount_msat` is what it pays the payee, routing fees excluded, or `None` when the backend
+    /// does not say. A swap restored from a provider's listing checks its lockup against this
+    /// before revealing the preimage, because nothing else it holds is the wallet's own figure.
+    InFlight { amount_msat: Option<u64> },
     /// Settled, with the preimage.
     Succeeded(PaymentResult),
     /// Permanently failed, so paying again is safe.

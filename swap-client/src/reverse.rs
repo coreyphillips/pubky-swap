@@ -24,6 +24,7 @@ use swap_common::onchain::{
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::store::Resume;
 use swap_common::timelock::claim_start_is_safe;
+use swap_common::validate::{min_reverse_lockup_sat, DEFAULT_MAX_SWAP_FEE_BPS};
 use tokio::time::sleep;
 use tracing::{info, warn};
 
@@ -97,12 +98,13 @@ pub async fn execute_reverse_swap(
     // ambiguous prior submission. An in-flight or settled payment must not be started again. The invoice is held either way until the provider settles it, which only
     // happens after we claim on-chain and reveal the preimage.
     // A restart before funding or spending leaves a default Resume even if payment began.
-    let already_paying = match ln.payment_status(claim.payment_hash()).await {
+    let status = ln.payment_status(claim.payment_hash()).await;
+    let already_paying = match &status {
         Ok(PaymentStatus::Succeeded { .. }) => {
             info!("Client: the hold invoice was already paid by an earlier run");
             true
         }
-        Ok(PaymentStatus::InFlight) => {
+        Ok(PaymentStatus::InFlight { .. }) => {
             info!("Client: a payment for this invoice is still in flight");
             true
         }
@@ -117,15 +119,8 @@ pub async fn execute_reverse_swap(
             true
         }
     };
-    // A restored swap's invoice came from the provider's listing, and nothing checked its hash or
-    // its amount against a quote, so paying it could pay anything. Only a payment the node
-    // already made is claimed.
-    if resume.restored_from_listing && !already_paying {
-        return Err(anyhow!(
-            "this swap was restored from the provider's listing and the node has no payment for \
-             it, so there is nothing to claim. Its invoice was never checked against a quote, so \
-             it is not paid."
-        ));
+    if resume.restored_from_listing {
+        check_restored_payment(&status, claim.onchain_amount_sat)?;
     }
 
     let pay_task = if already_paying {
@@ -326,6 +321,52 @@ pub async fn execute_reverse_swap(
     Ok(txid)
 }
 
+/// Whether a swap restored from a provider's listing may go on to its claim, from what the node
+/// says about its payment.
+///
+/// The listing named the invoice and the lockup, and nothing checked either against a quote. So
+/// the invoice is never paid, and a lockup is claimed only if a quote within
+/// [`DEFAULT_MAX_SWAP_FEE_BPS`] could have offered it for what the node did pay, the one figure
+/// the provider did not choose. A node that cannot say what it paid leaves the preimage secret:
+/// the provider cannot settle, and the payment fails back when its HTLC expires. A payment that
+/// already settled is claimed whatever the lockup holds, because the provider has the preimage
+/// and declining would only leave it the lockup as well.
+fn check_restored_payment(
+    status: &lightning_backend::Result<PaymentStatus>,
+    listed_lockup_sat: u64,
+) -> Result<()> {
+    let paid_msat = match status {
+        Ok(PaymentStatus::Succeeded(_)) => return Ok(()),
+        Ok(PaymentStatus::InFlight {
+            amount_msat: Some(paid_msat),
+        }) => *paid_msat,
+        Ok(PaymentStatus::NotFound) | Ok(PaymentStatus::Failed(_)) => {
+            return Err(anyhow!(
+                "this swap was restored from the provider's listing and the node has no payment \
+                 for it, so there is nothing to claim. Its invoice was never checked against a \
+                 quote, so it is not paid."
+            ))
+        }
+        Ok(PaymentStatus::InFlight { amount_msat: None }) | Ok(PaymentStatus::Unknown) | Err(_) => {
+            return Err(anyhow!(
+                "this swap was restored from the provider's listing and the node does not say \
+                 what it paid for it, so the lockup cannot be checked and the preimage stays \
+                 secret. Resume it again once the node reports the payment."
+            ))
+        }
+    };
+    let min_sat = min_reverse_lockup_sat(paid_msat, DEFAULT_MAX_SWAP_FEE_BPS);
+    if listed_lockup_sat < min_sat {
+        return Err(anyhow!(
+            "this swap was restored from the provider's listing, which locks {listed_lockup_sat} \
+             sat for a payment of {paid_msat} msat. Within the default fee bound that payment \
+             buys at least {min_sat} sat, so the preimage stays secret and the payment fails back \
+             when its HTLC expires."
+        ));
+    }
+    Ok(())
+}
+
 struct AbortPayment(tokio::task::AbortHandle);
 impl Drop for AbortPayment {
     fn drop(&mut self) {
@@ -465,10 +506,11 @@ mod tests {
         }
     }
 
-    /// Drive a swap restored from a provider's listing, with its lockup funded and confirmed,
-    /// against a node that reports `status` for its payment.
+    /// Drive a swap restored from a provider's listing, whose lockup of `lockup_sat` is funded as
+    /// listed and confirmed, against `ln`.
     async fn run_restored(
-        status: lightning_backend::PaymentStatus,
+        ln: MockLn,
+        lockup_sat: u64,
     ) -> (
         Result<Txid>,
         Arc<MockLn>,
@@ -490,12 +532,12 @@ mod tests {
             .unwrap(),
             vout: 0,
         };
-        let ln = Arc::new(MockLn::new(preimage).with_status(status));
+        let ln = Arc::new(ln);
         let mc = Arc::new(
             MockChain::new()
                 .with_funding(FundingUtxo {
                     outpoint,
-                    value_sat: AMOUNT,
+                    value_sat: lockup_sat,
                     confirmations: 2,
                 })
                 .always_final(),
@@ -503,7 +545,7 @@ mod tests {
         let claim = ReverseClaim {
             htlc_script: script,
             htlc_spk,
-            onchain_amount_sat: AMOUNT,
+            onchain_amount_sat: lockup_sat,
             // Whatever the provider listed: another hash, another amount.
             invoice: "lnbcrt-listed-by-the-provider".into(),
             preimage,
@@ -532,6 +574,21 @@ mod tests {
         (result, ln, mc, outpoint, ph)
     }
 
+    /// A node reporting `status`. A restored swap never pays, so its preimage is never asked for.
+    fn node(status: lightning_backend::PaymentStatus) -> MockLn {
+        MockLn::new([0; 32]).with_status(status)
+    }
+
+    /// A payment in flight for `sat`, as the node reports it.
+    fn in_flight(sat: u64) -> lightning_backend::PaymentStatus {
+        lightning_backend::PaymentStatus::InFlight {
+            amount_msat: Some(sat * 1_000),
+        }
+    }
+
+    /// The most a quote for [`AMOUNT`] can charge within the default fee bound.
+    const MAX_FEE: u64 = AMOUNT * DEFAULT_MAX_SWAP_FEE_BPS as u64 / 10_000;
+
     /// A restored swap's invoice is the provider's word, never checked against a quote. A node
     /// with no payment for it, or a failed one, is never asked to pay it, however the lockup
     /// looks, and the preimage stays secret.
@@ -541,7 +598,7 @@ mod tests {
             lightning_backend::PaymentStatus::NotFound,
             lightning_backend::PaymentStatus::Failed("no route".into()),
         ] {
-            let (result, ln, mc, _, _) = run_restored(status).await;
+            let (result, ln, mc, _, _) = run_restored(node(status), AMOUNT).await;
             let err = result.unwrap_err();
             assert!(err.to_string().contains("never checked"), "{err:#}");
             assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
@@ -550,20 +607,68 @@ mod tests {
     }
 
     /// A restored swap whose payment the node already made is claimed as any other, without
-    /// paying again.
+    /// paying again, when its lockup is one a quote within the fee bound could have offered for
+    /// that payment.
     #[tokio::test]
     async fn a_restored_swap_claims_a_payment_the_node_already_made() {
-        for status in [
-            lightning_backend::PaymentStatus::InFlight,
-            lightning_backend::PaymentStatus::Unknown,
-        ] {
-            let (result, ln, mc, outpoint, ph) = run_restored(status).await;
+        for paid in [AMOUNT, AMOUNT + 700, AMOUNT + MAX_FEE] {
+            let (result, ln, mc, outpoint, ph) = run_restored(node(in_flight(paid)), AMOUNT).await;
             result.unwrap();
             assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
             let broadcasts = mc.broadcasts();
             assert_eq!(broadcasts.len(), 1);
             assert!(extract_preimage(&broadcasts[0], &outpoint, &ph).is_some());
         }
+    }
+
+    /// The provider listed the lockup, so it can list and fund less than the node paid and settle
+    /// the full payment once the claim reveals the preimage. A lockup smaller than any quote
+    /// within the fee bound would offer for the payment is not claimed.
+    #[tokio::test]
+    async fn a_restored_swap_keeps_the_preimage_from_a_lockup_short_of_its_payment() {
+        for lockup in [AMOUNT - 1, AMOUNT / 2] {
+            let (result, ln, mc, _, _) =
+                run_restored(node(in_flight(AMOUNT + MAX_FEE)), lockup).await;
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("stays secret"), "{err:#}");
+            assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+            assert!(mc.broadcasts().is_empty());
+        }
+    }
+
+    /// Without the node's own figure there is nothing to check the listed lockup against, so a
+    /// restored swap waits rather than revealing the preimage.
+    #[tokio::test]
+    async fn a_restored_swap_waits_for_the_node_to_say_what_it_paid() {
+        let mut unreadable = MockLn::new([0; 32]);
+        unreadable.status_error = true;
+        for ln in [
+            node(lightning_backend::PaymentStatus::InFlight { amount_msat: None }),
+            node(lightning_backend::PaymentStatus::Unknown),
+            unreadable,
+        ] {
+            let (result, ln, mc, _, _) = run_restored(ln, AMOUNT).await;
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("does not say"), "{err:#}");
+            assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+            assert!(mc.broadcasts().is_empty());
+        }
+    }
+
+    /// A settled payment means the provider already has the preimage. Declining to claim would
+    /// leave it the lockup as well as the payment, so the claim goes out whatever the lockup holds.
+    #[tokio::test]
+    async fn a_restored_swap_whose_payment_settled_is_claimed_whatever_its_lockup() {
+        let settled = lightning_backend::PaymentStatus::Succeeded(PaymentResult {
+            preimage: [0; 32],
+            fee_msat: 0,
+        });
+        let (result, ln, mc, outpoint, ph) = run_restored(node(settled), AMOUNT / 2).await;
+        result.unwrap();
+        assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+        let broadcasts = mc.broadcasts();
+        assert_eq!(broadcasts.len(), 1);
+        assert!(extract_preimage(&broadcasts[0], &outpoint, &ph).is_some());
     }
 
     #[tokio::test]
@@ -798,8 +903,10 @@ mod tests {
             vout: 0,
         };
 
-        let ln =
-            Arc::new(MockLn::new(preimage).with_status(lightning_backend::PaymentStatus::InFlight));
+        let ln = Arc::new(
+            MockLn::new(preimage)
+                .with_status(lightning_backend::PaymentStatus::InFlight { amount_msat: None }),
+        );
         let mc = Arc::new(
             MockChain::new()
                 .with_funding(FundingUtxo {
@@ -950,7 +1057,7 @@ mod tests {
             let (claim, outpoint) = recovery_claim();
             let mut backend = MockLn::new(claim.preimage);
             match scenario {
-                0 => backend.status = PaymentStatus::InFlight,
+                0 => backend.status = PaymentStatus::InFlight { amount_msat: None },
                 1 => {
                     backend.status = PaymentStatus::Succeeded(PaymentResult {
                         preimage: claim.preimage,

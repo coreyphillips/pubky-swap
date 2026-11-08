@@ -355,7 +355,7 @@ pub async fn drive_submarine_swap(
                 payment = Some(p);
                 break;
             }
-            PaymentStatus::InFlight => {
+            PaymentStatus::InFlight { .. } => {
                 // Wait it out rather than launching a second attempt. The payment's own CLTV
                 // limit bounds how long this can go on.
                 info!("Submarine swap: a payment is already in flight; waiting for it to settle");
@@ -1640,7 +1640,10 @@ mod tests {
     /// driver hands back rather than going terminal.
     #[tokio::test]
     async fn an_unresolved_payment_past_the_claim_window_is_not_abandoned() {
-        for status in [PaymentStatus::InFlight, PaymentStatus::Unknown] {
+        for status in [
+            PaymentStatus::InFlight { amount_msat: None },
+            PaymentStatus::Unknown,
+        ] {
             let preimage = generate_preimage();
             let ln = MockLn::new(payment_hash(&preimage), Some(preimage)).with_status(status);
             let (swap, _) = make_swap(&ln).await;

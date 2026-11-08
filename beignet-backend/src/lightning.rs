@@ -326,7 +326,13 @@ impl LightningBackend for BeignetLightningBackend {
         };
         Ok(match payment.status.as_str() {
             "COMPLETED" => PaymentStatus::Succeeded(payment_result(&payment, self).await?),
-            "PENDING" => PaymentStatus::InFlight,
+            "PENDING" => PaymentStatus::InFlight {
+                // beignet reports whole satoshis. A zero is no amount, not a free payment.
+                amount_msat: payment
+                    .amount_sats
+                    .filter(|&sats| sats > 0)
+                    .and_then(|sats| sats.checked_mul(1000)),
+            },
             "FAILED" => PaymentStatus::Failed(
                 payment
                     .failure_reason

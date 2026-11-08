@@ -129,6 +129,9 @@ pub struct PaymentInfo {
     pub payment_hash: String,
     /// `COMPLETED` | `PENDING` | `FAILED`.
     pub status: String,
+    /// What the payment pays the payee, fees excluded.
+    #[serde(default)]
+    pub amount_sats: Option<u64>,
     #[serde(default)]
     pub preimage: Option<String>,
     #[serde(default)]

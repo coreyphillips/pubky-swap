@@ -481,7 +481,9 @@ impl LightningBackend for LndBackend {
             3 => PaymentStatus::Failed(format!("reason {}", payment.failure_reason)),
             // INITIATED is a payment LND has recorded but not yet sent an HTLC for. Reporting it
             // as unknown would let a caller pay a second time.
-            1 | 4 => PaymentStatus::InFlight,
+            1 | 4 => PaymentStatus::InFlight {
+                amount_msat: u64::try_from(payment.value_msat).ok().filter(|&v| v > 0),
+            },
             _ => PaymentStatus::Unknown,
         })
     }
