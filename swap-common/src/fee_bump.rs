@@ -272,7 +272,22 @@ pub async fn confirm_or_bump(
             // reorg orphaned it. Either way, get it back on the wire.
             None => {
                 debug!("spend {txid} is not in the mempool or a block; re-broadcasting");
-                if let Ok(tx) = build(rate) {
+                // A spend the node refused, often for paying too little, lands here on every poll
+                // and never reaches the bump below. Retrying it at the same rate never gets it in.
+                let next = if cfg.stop_at_deadline {
+                    rate
+                } else {
+                    deadline_fee_rate(
+                        tip,
+                        cfg.deadline_height,
+                        rate,
+                        &estimate,
+                        cfg.floor_rate_sat_vb,
+                        cfg.cap_rate_sat_vb,
+                    )
+                };
+                if let Ok(tx) = build(next) {
+                    rate = next;
                     on_spend(tx.compute_txid());
                     if let Ok(id) = run_blocking(|| chain.broadcast(&tx)) {
                         ours.insert(id);
@@ -588,6 +603,34 @@ mod tests {
     #[tokio::test]
     async fn a_claim_bumping_past_its_deadline_goes_to_the_cap_and_confirms() {
         let chain = chain(vec![Some(0), Some(0), Some(0), Some(2)]);
+        let rates: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            confirm_or_bump(
+                &chain,
+                spk().as_script(),
+                htlc_outpoint(),
+                &cfg(Some(799_990)).bumping_past_deadline(),
+                None,
+                &|_| {},
+                |rate| {
+                    rates.lock().unwrap().push(rate);
+                    Ok(tx_paying(100_000 - rate))
+                },
+            ),
+        )
+        .await
+        .expect("must not loop forever")
+        .unwrap();
+        assert!(matches!(out, SpendOutcome::Confirmed { .. }), "{out:?}");
+        assert_eq!(*rates.lock().unwrap(), vec![5, 1_000]);
+    }
+
+    /// A claim past its deadline whose spend is nowhere to be seen, as when the node refused it
+    /// for paying too little, goes back out at the cap rather than at the rate that failed.
+    #[tokio::test]
+    async fn a_missing_claim_past_its_deadline_is_retried_at_the_cap() {
+        let chain = chain(vec![None, Some(2)]);
         let rates: Mutex<Vec<u64>> = Mutex::new(Vec::new());
         let out = tokio::time::timeout(
             Duration::from_secs(5),
