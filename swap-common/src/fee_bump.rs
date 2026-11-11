@@ -58,11 +58,19 @@ pub struct SpendWatchConfig {
     /// The height by which this spend must confirm.
     ///
     /// `Some` for a **claim**, which races the counterparty's refund window: the fee escalates
-    /// toward the cap as this approaches, and the call gives up once it passes.
+    /// toward the cap as this approaches, and the call gives up once it passes unless
+    /// [`stop_at_deadline`](Self::stop_at_deadline) is off.
     ///
     /// `None` for a **refund**, where there is nothing to race and giving up would mean
     /// abandoning the money.
     pub deadline_height: Option<u32>,
+    /// Whether the call gives up once the tip reaches `deadline_height`.
+    ///
+    /// `false` keeps the deadline as the escalation schedule, so the rate sits at the cap once it
+    /// has passed, but goes on until the spend or a rival's confirms. That is the right call for
+    /// a claim whose preimage the counterparty already holds: stopping cannot keep it secret, and
+    /// only hands the counterparty the output as well.
+    pub stop_at_deadline: bool,
     /// Wall-clock ceiling for one call.
     pub max_wall_duration: Duration,
     /// Iteration ceiling for one call.
@@ -93,6 +101,7 @@ impl SpendWatchConfig {
             poll,
             min_confirmations,
             deadline_height: Some(deadline_height),
+            stop_at_deadline: true,
             max_wall_duration: DEFAULT_MAX_WALL_DURATION,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             known_ours: Vec::new(),
@@ -102,6 +111,13 @@ impl SpendWatchConfig {
     /// Adopt spends a previous run of this swap put on the wire.
     pub fn with_known_ours(mut self, txids: Vec<Txid>) -> Self {
         self.known_ours = txids;
+        self
+    }
+
+    /// Keep bumping past the deadline instead of giving up there. See
+    /// [`stop_at_deadline`](Self::stop_at_deadline).
+    pub fn bumping_past_deadline(mut self) -> Self {
+        self.stop_at_deadline = false;
         self
     }
 
@@ -120,6 +136,7 @@ impl SpendWatchConfig {
             poll,
             min_confirmations,
             deadline_height: None,
+            stop_at_deadline: true,
             max_wall_duration: DEFAULT_MAX_WALL_DURATION,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             known_ours: Vec::new(),
@@ -294,7 +311,7 @@ pub async fn confirm_or_bump(
         // Terminate rather than spin. A claim past its deadline cannot be won; a call that has
         // run for hours, or spun for a very large number of iterations, has stopped making
         // progress and should hand control back.
-        if let Some(deadline) = cfg.deadline_height {
+        if let Some(deadline) = cfg.deadline_height.filter(|_| cfg.stop_at_deadline) {
             if tip >= deadline {
                 warn!("spend {txid} did not confirm before its deadline at height {deadline}");
                 return Ok(SpendOutcome::DeadlineExceeded {
@@ -361,6 +378,7 @@ mod tests {
             poll: Duration::from_millis(0),
             min_confirmations: 2,
             deadline_height: deadline,
+            stop_at_deadline: true,
             max_wall_duration: Duration::from_secs(5),
             max_iterations: 50,
             known_ours: Vec::new(),
@@ -544,6 +562,34 @@ mod tests {
         .expect("must not loop forever")
         .unwrap();
         assert!(matches!(out, SpendOutcome::DeadlineExceeded { .. }));
+    }
+
+    /// Past its deadline, a claim told to keep going goes straight to the cap and waits for a
+    /// confirmation instead of handing back.
+    #[tokio::test]
+    async fn a_claim_bumping_past_its_deadline_goes_to_the_cap_and_confirms() {
+        let chain = chain(vec![Some(0), Some(0), Some(0), Some(2)]);
+        let rates: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            confirm_or_bump(
+                &chain,
+                spk().as_script(),
+                htlc_outpoint(),
+                &cfg(Some(799_990)).bumping_past_deadline(),
+                None,
+                &|_| {},
+                |rate| {
+                    rates.lock().unwrap().push(rate);
+                    Ok(tx_paying(100_000 - rate))
+                },
+            ),
+        )
+        .await
+        .expect("must not loop forever")
+        .unwrap();
+        assert!(matches!(out, SpendOutcome::Confirmed { .. }), "{out:?}");
+        assert_eq!(*rates.lock().unwrap(), vec![5, 1_000]);
     }
 
     /// A refund has no chain deadline, but must still hand control back rather than running for

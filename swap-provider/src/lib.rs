@@ -1816,7 +1816,7 @@ fn build_offer(
             }
             if cfg!(feature = "iroh") && config.rendezvous_iroh {
                 features.push("session-rpc-v1".into());
-                features.push("direct-rpc-v1".into());
+                features.push(swap_common::cap_descriptor::DIRECT_RPC_FEATURE.into());
                 // The `paykit-cap.*` kinds ride `direct/1` (`cap_adapter`).
                 features.push(PAYKIT_CAP_FEATURE.into());
             }
