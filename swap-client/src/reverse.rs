@@ -208,10 +208,7 @@ pub async fn execute_reverse_swap(
                     lockup_pending = true;
                 }
                 Some(SpentLockup::Refunded(refund)) => {
-                    return Err(anyhow!(
-                        "the provider refunded the HTLC ({refund}) after the payment settled; \
-                         there is nothing left to claim"
-                    ));
+                    return Err(refunded_after_settling(refund));
                 }
                 None => {}
             },
@@ -338,6 +335,11 @@ pub async fn execute_reverse_swap(
     .map_err(|e| anyhow!("claim broadcast/bump: {e}"))?
     {
         SpendOutcome::Confirmed { txid } => txid,
+        // A settled claim outbids a refund in the mempool, so this is a confirmed one. The
+        // provider settled the invoice as well, so nothing fails back.
+        SpendOutcome::ConflictingSpend { tx } if settled => {
+            return Err(refunded_after_settling(tx.compute_txid()));
+        }
         // The provider refunded first. Pushing another claim would only burn fees against a
         // confirmed spend, and our Lightning payment fails back on its own.
         SpendOutcome::ConflictingSpend { tx } => {
@@ -430,6 +432,15 @@ fn check_restored_payment(
         ));
     }
     Ok(())
+}
+
+/// The error for a settled swap whose lockup the provider's refund took. Unlike an unsettled
+/// swap's, its payment does not fail back: the provider settled the invoice and kept the lockup.
+fn refunded_after_settling(refund: Txid) -> anyhow::Error {
+    anyhow!(
+        "the provider refunded the HTLC ({refund}) after the payment settled, so the payment is \
+         not returned and there is nothing left to claim"
+    )
 }
 
 /// What took a lockup out of the unspent set.
@@ -1314,7 +1325,10 @@ mod tests {
         let ln = MockLn::new(claim.preimage).with_status(settled());
         let (result, _, chain) = run_resumed(ln, refunded, claim).await;
         let err = result.unwrap_err();
-        assert!(err.to_string().contains("refunded"), "{err:#}");
+        assert!(
+            err.to_string().contains("the payment is not returned"),
+            "{err:#}"
+        );
         assert!(chain.broadcasts().is_empty());
 
         let (claim, _) = recovery_claim();
@@ -1350,6 +1364,38 @@ mod tests {
             extract_preimage(&broadcasts[1], &outpoint, &ph),
             Some(preimage)
         );
+    }
+
+    /// A refund that confirms under a settled swap's claim takes the lockup after the provider
+    /// settled the invoice, so the error says the payment is gone. An unsettled swap's payment
+    /// still fails back, and its error still says so.
+    #[tokio::test]
+    async fn a_refund_under_a_settled_claim_says_the_payment_is_not_returned() {
+        for (tip, status, settled_payment) in [
+            (TIMEOUT + 1, settled(), true),
+            (MOCK_TIP, in_flight(AMOUNT), false),
+        ] {
+            let (claim, outpoint) = recovery_claim();
+            let chain = MockChain::new()
+                .with_tip(tip)
+                .with_funding(confirmed_lockup(outpoint))
+                .with_spend(refund_of(outpoint))
+                .with_confirmations(vec![Some(1)]);
+            let ln = MockLn::new(claim.preimage).with_status(status);
+            let (result, _, chain) = run_resumed(ln, chain, claim).await;
+            let err = result.unwrap_err().to_string();
+            assert_eq!(chain.broadcasts().len(), 1, "{err}");
+            assert_eq!(
+                err.contains("the payment is not returned"),
+                settled_payment,
+                "{err}"
+            );
+            assert_eq!(
+                err.contains("the payment returned"),
+                !settled_payment,
+                "{err}"
+            );
+        }
     }
 
     /// Short of a settled payment the preimage is still the client's to keep, so past the window
