@@ -13,13 +13,14 @@ use lightning_backend::{LightningBackend, PaymentStatus};
 use std::sync::Arc;
 use std::time::Duration;
 use swap_common::chain::{
-    run_blocking, select_funding, ChainWatcher, FundingSelection, DEFAULT_MAX_OVERPAY_SAT,
+    run_blocking, select_funding, ChainWatcher, FundingSelection, FundingUtxo,
+    DEFAULT_MAX_OVERPAY_SAT,
 };
 use swap_common::fee_bump::{confirm_or_bump, SpendOutcome, SpendWatchConfig};
 use swap_common::htlc::{payment_hash, Preimage};
 use swap_common::onchain::{
-    build_claim_tx, estimate_spend_fee, fee_rate_cap, spend_vsize, ABSOLUTE_MAX_FEE_RATE_SAT_VB,
-    CLAIM_FEE_TARGET_BLOCKS, DEFAULT_MAX_FEE_BPS,
+    build_claim_tx, estimate_spend_fee, extract_preimage, fee_rate_cap, spend_vsize,
+    ABSOLUTE_MAX_FEE_RATE_SAT_VB, CLAIM_FEE_TARGET_BLOCKS, DEFAULT_MAX_FEE_BPS,
 };
 use swap_common::reorg::FINALITY_DEPTH;
 use swap_common::store::Resume;
@@ -122,6 +123,12 @@ pub async fn execute_reverse_swap(
     if resume.restored_from_listing {
         check_restored_payment(&status, claim.onchain_amount_sat)?;
     }
+    // A settled payment means the provider has the preimage. Keeping it secret past the claim
+    // window protects nothing, and stopping there only leaves the provider the lockup as well, so
+    // a settled swap claims and bumps whatever the window says. Every other status, including
+    // one the node cannot report, keeps the window.
+    let settled = matches!(status, Ok(PaymentStatus::Succeeded(_)));
+    let mut known_ours = resume.our_spends.clone();
 
     let pay_task = if already_paying {
         None
@@ -153,11 +160,14 @@ pub async fn execute_reverse_swap(
     let funding = loop {
         let outputs = run_blocking(|| chain.find_outputs(&claim.htlc_spk))
             .map_err(|e| anyhow!("find_outputs: {e}"))?;
+        // A lockup is there but still short of its confirmations.
+        let mut lockup_pending = false;
         match select_funding(&outputs, claim.onchain_amount_sat, DEFAULT_MAX_OVERPAY_SAT) {
             FundingSelection::Exact(u) | FundingSelection::Overpaid { utxo: u, .. } => {
                 if u.confirmations >= required_confirmations {
                     break u;
                 }
+                lockup_pending = true;
             }
             FundingSelection::Underpaid { got_sat } => {
                 return Err(anyhow!(
@@ -180,19 +190,56 @@ pub async fn execute_reverse_swap(
                     utxos.len()
                 ));
             }
+            // The provider settles once it sees a claim in the mempool, so a settled swap's lockup
+            // is usually already spent by an earlier run's claim, which the unspent set no longer
+            // shows. The script's history says whether that claim is there to drive or the
+            // provider's refund has taken the lockup.
+            FundingSelection::None if settled => match spent_lockup(chain.as_ref(), &claim)? {
+                Some(SpentLockup::Claimed { funding, claim }) => {
+                    info!("Client: the payment settled and claim {claim} is on chain; driving it");
+                    known_ours.push(claim);
+                    break funding;
+                }
+                Some(SpentLockup::Refunding(u)) => {
+                    if u.confirmations >= required_confirmations {
+                        info!("Client: the payment settled; outbidding an unconfirmed refund");
+                        break u;
+                    }
+                    lockup_pending = true;
+                }
+                Some(SpentLockup::Refunded(refund)) => {
+                    return Err(anyhow!(
+                        "the provider refunded the HTLC ({refund}) after the payment settled; \
+                         there is nothing left to claim"
+                    ));
+                }
+                None => {}
+            },
             FundingSelection::None => {}
         }
         // The provider's refund branch opens at the timeout. Past it there is nothing left to
         // claim, and a resumed client has no `pay_task` to end this loop for it: its payment was
         // started by a previous run, so the only other exit is the chain. Without this the loop
         // polls forever and the swap never reaches its refund-or-give-up conclusion.
+        //
+        // A settled swap waits past the window only for a lockup that is there. One that never
+        // appeared, or that a reorg took away, still ends here.
         let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip_height: {e}"))?;
         if !claim_start_is_safe(tip, claim.timeout_height) {
-            return Err(anyhow!(
-                "the provider's HTLC did not confirm in time: tip {tip} against a timeout at {}. \
-                 The provider refunds its own funding; nothing of ours is locked on chain.",
-                claim.timeout_height
-            ));
+            if !settled {
+                return Err(anyhow!(
+                    "the provider's HTLC did not confirm in time: tip {tip} against a timeout at \
+                     {}. The provider refunds its own funding; nothing of ours is locked on chain.",
+                    claim.timeout_height
+                ));
+            }
+            if !lockup_pending {
+                return Err(anyhow!(
+                    "the payment settled, but nothing pays the provider's HTLC at tip {tip}, \
+                     past the claim window before its timeout at {}; there is no lockup to claim",
+                    claim.timeout_height
+                ));
+            }
         }
         // If the payment terminated before funding appeared, there's nothing to claim.
         if pay_task.as_ref().is_some_and(|t| t.is_finished()) {
@@ -217,14 +264,19 @@ pub async fn execute_reverse_swap(
     // confirm at the last moment, and polling itself takes blocks.
     //
     // `claim_start_is_safe` existed for exactly this and was called from nowhere.
-    let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip_height: {e}"))?;
-    if !claim_start_is_safe(tip, claim.timeout_height) {
-        return Err(anyhow!(
-            "the provider's HTLC confirmed too close to its refund at height {} (tip {tip}) to \
-             claim safely, so the preimage stays secret. The provider refunds its own funding \
-             and the hold invoice expires unsettled.",
-            claim.timeout_height
-        ));
+    //
+    // A settled payment has already given the provider the preimage, so there is no reveal left
+    // to gate.
+    if !settled {
+        let tip = run_blocking(|| chain.tip_height()).map_err(|e| anyhow!("tip_height: {e}"))?;
+        if !claim_start_is_safe(tip, claim.timeout_height) {
+            return Err(anyhow!(
+                "the provider's HTLC confirmed too close to its refund at height {} (tip {tip}) \
+                 to claim safely, so the preimage stays secret. The provider refunds its own \
+                 funding and the hold invoice expires unsettled.",
+                claim.timeout_height
+            ));
+        }
     }
     info!("Client: provider HTLC funded; claiming with the preimage");
 
@@ -250,10 +302,12 @@ pub async fn execute_reverse_swap(
     // spend from here, so RBF is the only bump mechanism: no CPFP fallback.
     //
     // It races the provider's refund branch, so the fee escalates as that height approaches.
+    // Past it a claim normally gives up, but a settled one is the only way left to the lockup, so
+    // it stays at the fee cap until it or the refund wins.
     let deadline = claim
         .timeout_height
         .saturating_sub(swap_common::timelock::CLAIM_ABORT_MARGIN);
-    let cfg = SpendWatchConfig::claim(
+    let mut cfg = SpendWatchConfig::claim(
         CLAIM_FEE_TARGET_BLOCKS,
         claim.fee_rate_sat_vb,
         fee_rate_cap(
@@ -267,7 +321,10 @@ pub async fn execute_reverse_swap(
         FINALITY_DEPTH,
         deadline,
     )
-    .with_known_ours(resume.our_spends.clone());
+    .with_known_ours(known_ours);
+    if settled {
+        cfg = cfg.bumping_past_deadline();
+    }
     let txid = match confirm_or_bump(
         chain.as_ref(),
         &claim.htlc_spk,
@@ -288,6 +345,14 @@ pub async fn execute_reverse_swap(
                 "the provider refunded the HTLC ({}) before our claim confirmed; the hold \
                  invoice will be cancelled and the payment returned",
                 tx.compute_txid()
+            ));
+        }
+        // Without a deadline to stop at, a settled claim only ends here on the driver's wall-clock
+        // or iteration cap.
+        SpendOutcome::DeadlineExceeded { last_txid, tip } if settled => {
+            return Err(anyhow!(
+                "claim {last_txid} has not confirmed by height {tip}. The payment settled, so \
+                 resume this swap to keep bumping it."
             ));
         }
         SpendOutcome::DeadlineExceeded { last_txid, tip } => {
@@ -367,6 +432,54 @@ fn check_restored_payment(
     Ok(())
 }
 
+/// What took a lockup out of the unspent set.
+enum SpentLockup {
+    /// A claim carrying our preimage, from an earlier run or another device.
+    Claimed { funding: FundingUtxo, claim: Txid },
+    /// Anything else, which can only be the provider's refund: the claim branch is the one that
+    /// reveals the preimage. Unconfirmed, a claim paying more can still replace it.
+    Refunding(FundingUtxo),
+    /// The provider's refund, confirmed.
+    Refunded(Txid),
+}
+
+/// Read the HTLC script's history for a lockup that has been spent. `None` when nothing that paid
+/// the script has been.
+fn spent_lockup(chain: &dyn ChainWatcher, claim: &ReverseClaim) -> Result<Option<SpentLockup>> {
+    let history = run_blocking(|| chain.find_historical_outputs(&claim.htlc_spk))
+        .map_err(|e| anyhow!("script history: {e}"))?;
+    let mut refund = None;
+    for output in history.iter().filter(|o| o.spent_by.is_some()) {
+        let Some(spend) = run_blocking(|| chain.find_spend(&claim.htlc_spk, &output.outpoint))
+            .map_err(|e| anyhow!("find_spend: {e}"))?
+        else {
+            continue;
+        };
+        let funding = FundingUtxo {
+            outpoint: output.outpoint,
+            value_sat: output.value_sat,
+            confirmations: output.confirmations,
+        };
+        let spend_txid = spend.compute_txid();
+        if extract_preimage(&spend, &output.outpoint, &claim.payment_hash()).is_some() {
+            return Ok(Some(SpentLockup::Claimed {
+                funding,
+                claim: spend_txid,
+            }));
+        }
+        if refund.is_none() {
+            let confirmations =
+                run_blocking(|| chain.tx_confirmations(&claim.htlc_spk, &spend_txid))
+                    .map_err(|e| anyhow!("tx_confirmations: {e}"))?;
+            refund = Some(match confirmations {
+                Some(c) if c > 0 => SpentLockup::Refunded(spend_txid),
+                _ => SpentLockup::Refunding(funding),
+            });
+        }
+    }
+    Ok(refund)
+}
+
 struct AbortPayment(tokio::task::AbortHandle);
 impl Drop for AbortPayment {
     fn drop(&mut self) {
@@ -383,12 +496,11 @@ mod tests {
     use std::str::FromStr;
 
     use swap_common::chain::mock::MockChain;
-    use swap_common::chain::FundingUtxo;
     use swap_common::htlc::{
         build_htlc_script, generate_preimage, htlc_p2wsh_address, payment_hash,
     };
-    use swap_common::onchain::extract_preimage;
     use swap_common::random_keypair;
+    use swap_common::timelock::CLAIM_ABORT_MARGIN;
 
     const AMOUNT: u64 = 100_000;
     const MOCK_TIP: u32 = 700_000;
@@ -1049,6 +1161,224 @@ mod tests {
                 vout: 0,
             },
         )
+    }
+
+    fn settled() -> PaymentStatus {
+        PaymentStatus::Succeeded(PaymentResult {
+            preimage: [0; 32],
+            fee_msat: 0,
+        })
+    }
+
+    /// The recovery claim's lockup, unspent and confirmed.
+    fn confirmed_lockup(outpoint: OutPoint) -> FundingUtxo {
+        FundingUtxo {
+            outpoint,
+            value_sat: AMOUNT,
+            confirmations: 2,
+        }
+    }
+
+    /// Drive a swap an earlier run started paying, with the node reporting `ln`'s status.
+    async fn run_resumed(
+        ln: MockLn,
+        chain: MockChain,
+        claim: ReverseClaim,
+    ) -> (Result<Txid>, Arc<MockLn>, Arc<MockChain>) {
+        let ln = Arc::new(ln);
+        let chain = Arc::new(chain);
+        let resume = Resume {
+            invoice_pay_started_at_unix: Some(1),
+            ..Resume::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            execute_reverse_swap(
+                ln.clone(),
+                chain.clone(),
+                claim,
+                10_000,
+                1,
+                Duration::ZERO,
+                &resume,
+                &(),
+            ),
+        )
+        .await
+        .expect("the driver must not wait forever");
+        (result, ln, chain)
+    }
+
+    /// Once the payment settled, the provider has the preimage, so a lockup confirmed past the
+    /// claim window, or past the timeout itself, is still claimed.
+    #[tokio::test]
+    async fn a_settled_payment_is_claimed_past_the_claim_window() {
+        for tip in [TIMEOUT - CLAIM_ABORT_MARGIN, TIMEOUT, TIMEOUT + 10] {
+            let (claim, outpoint) = recovery_claim();
+            let (preimage, ph) = (claim.preimage, claim.payment_hash());
+            let chain = MockChain::new()
+                .with_tip(tip)
+                .with_funding(confirmed_lockup(outpoint))
+                .always_final();
+            let ln = MockLn::new(preimage).with_status(settled());
+            let (result, ln, chain) = run_resumed(ln, chain, claim).await;
+            result.unwrap_or_else(|e| panic!("tip {tip}: {e:#}"));
+            assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+            let broadcasts = chain.broadcasts();
+            assert_eq!(broadcasts.len(), 1, "tip {tip}");
+            assert_eq!(
+                extract_preimage(&broadcasts[0], &outpoint, &ph),
+                Some(preimage)
+            );
+        }
+    }
+
+    /// A settled claim past its deadline goes to the fee cap and stays there until it confirms,
+    /// where an unsettled one would give up and leave the lockup to the refund.
+    #[tokio::test]
+    async fn a_settled_claim_is_bumped_past_its_deadline() {
+        let (claim, outpoint) = recovery_claim();
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT + 1)
+            .with_funding(confirmed_lockup(outpoint))
+            .with_confirmations(vec![Some(0), Some(0), Some(0), Some(FINALITY_DEPTH)]);
+        let ln = MockLn::new(claim.preimage).with_status(settled());
+        let (result, _, chain) = run_resumed(ln, chain, claim).await;
+        let txid = result.unwrap();
+        let broadcasts = chain.broadcasts();
+        assert_eq!(
+            broadcasts.len(),
+            2,
+            "the first claim and one bump to the cap"
+        );
+        assert!(broadcasts[1].output[0].value < broadcasts[0].output[0].value);
+        assert_eq!(txid, broadcasts[1].compute_txid());
+    }
+
+    /// The provider settles on seeing a claim in the mempool, which also takes the lockup out of
+    /// the unspent set. A settled swap finds that claim in the script's history and drives it
+    /// rather than waiting for a lockup that will never reappear, even when this device has no
+    /// record of broadcasting it.
+    #[tokio::test]
+    async fn a_settled_swap_drives_a_claim_already_on_chain() {
+        let (claim, outpoint) = recovery_claim();
+        let earlier = build_claim_tx(
+            outpoint,
+            AMOUNT,
+            &claim.htlc_script,
+            claim.dest_spk.clone(),
+            1_000,
+            claim.preimage,
+            &claim.claim_key,
+        )
+        .unwrap();
+        let earlier_txid = earlier.compute_txid();
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT + 1)
+            .with_spent_output(outpoint, AMOUNT, earlier_txid)
+            .with_spend(earlier)
+            .always_final();
+        let ln = MockLn::new(claim.preimage).with_status(settled());
+        let (result, _, chain) = run_resumed(ln, chain, claim).await;
+        assert_eq!(result.unwrap(), earlier_txid);
+        assert!(
+            chain.broadcasts().is_empty(),
+            "the claim on chain is adopted"
+        );
+    }
+
+    /// A transaction spending `outpoint` without the preimage, as the provider's refund does.
+    fn refund_of(outpoint: OutPoint) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                ..Default::default()
+            }],
+            output: vec![],
+        }
+    }
+
+    /// Past the window, a settled swap whose lockup the provider refunded, or that nothing ever
+    /// paid, ends rather than polling for a lockup that is gone.
+    #[tokio::test]
+    async fn a_settled_swap_with_no_lockup_left_stops_waiting() {
+        let (claim, outpoint) = recovery_claim();
+        let refund = refund_of(outpoint);
+        let refunded = MockChain::new()
+            .with_tip(TIMEOUT + 1)
+            .with_spent_output(outpoint, AMOUNT, refund.compute_txid())
+            .with_spend(refund)
+            .with_confirmations(vec![Some(1)]);
+        let ln = MockLn::new(claim.preimage).with_status(settled());
+        let (result, _, chain) = run_resumed(ln, refunded, claim).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("refunded"), "{err:#}");
+        assert!(chain.broadcasts().is_empty());
+
+        let (claim, _) = recovery_claim();
+        let ln = MockLn::new(claim.preimage).with_status(settled());
+        let empty = MockChain::new().with_tip(TIMEOUT - CLAIM_ABORT_MARGIN);
+        let (result, _, chain) = run_resumed(ln, empty, claim).await;
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("no lockup"), "{err:#}");
+        assert!(chain.broadcasts().is_empty());
+    }
+
+    /// A refund still in the mempool has not won: a settled swap claims over it at the cap.
+    #[tokio::test]
+    async fn a_settled_swap_outbids_an_unconfirmed_refund() {
+        let (claim, outpoint) = recovery_claim();
+        let (preimage, ph) = (claim.preimage, claim.payment_hash());
+        let refund = refund_of(outpoint);
+        // The refund twice (seen by the wait loop, then by the claim driver), our first claim
+        // displaced by it, the refund again, then our claim at the cap buried.
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT + 1)
+            .with_spent_output(outpoint, AMOUNT, refund.compute_txid())
+            .with_spend(refund)
+            .with_confirmations(vec![Some(0), Some(0), None, Some(0), Some(FINALITY_DEPTH)]);
+        let ln = MockLn::new(preimage).with_status(settled());
+        let (result, _, chain) = run_resumed(ln, chain, claim).await;
+        let txid = result.unwrap();
+        let broadcasts = chain.broadcasts();
+        assert_eq!(broadcasts.len(), 2, "the first claim and one at the cap");
+        assert!(broadcasts[1].output[0].value < broadcasts[0].output[0].value);
+        assert_eq!(txid, broadcasts[1].compute_txid());
+        assert_eq!(
+            extract_preimage(&broadcasts[1], &outpoint, &ph),
+            Some(preimage)
+        );
+    }
+
+    /// Short of a settled payment the preimage is still the client's to keep, so past the window
+    /// a payment in flight, one the node cannot report, or a failed lookup claims nothing.
+    #[tokio::test]
+    async fn an_unsettled_payment_past_the_window_keeps_the_preimage_secret() {
+        for tip in [TIMEOUT - CLAIM_ABORT_MARGIN, TIMEOUT + 10] {
+            for case in 0..4 {
+                let (claim, outpoint) = recovery_claim();
+                let mut ln = MockLn::new(claim.preimage);
+                match case {
+                    0 => ln.status = in_flight(AMOUNT),
+                    1 => ln.status = PaymentStatus::InFlight { amount_msat: None },
+                    2 => ln.status = PaymentStatus::Unknown,
+                    _ => ln.status_error = true,
+                }
+                let chain = MockChain::new()
+                    .with_tip(tip)
+                    .with_funding(confirmed_lockup(outpoint))
+                    .always_final();
+                let (result, ln, chain) = run_resumed(ln, chain, claim).await;
+                assert!(result.is_err(), "tip {tip}, case {case}");
+                assert_eq!(*ln.pay_calls.lock().unwrap(), 0);
+                assert!(
+                    chain.broadcasts().is_empty(),
+                    "tip {tip}, case {case}: the claim would reveal the preimage"
+                );
+            }
+        }
     }
 
     #[tokio::test]

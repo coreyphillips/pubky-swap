@@ -58,11 +58,20 @@ pub struct SpendWatchConfig {
     /// The height by which this spend must confirm.
     ///
     /// `Some` for a **claim**, which races the counterparty's refund window: the fee escalates
-    /// toward the cap as this approaches, and the call gives up once it passes.
+    /// toward the cap as this approaches, and the call gives up once it passes unless
+    /// [`stop_at_deadline`](Self::stop_at_deadline) is off.
     ///
     /// `None` for a **refund**, where there is nothing to race and giving up would mean
     /// abandoning the money.
     pub deadline_height: Option<u32>,
+    /// Whether the call gives up once the tip reaches `deadline_height`.
+    ///
+    /// `false` keeps the deadline as the escalation schedule, so the rate sits at the cap once it
+    /// has passed, but goes on until the spend or a rival's confirms. A rival still in the mempool
+    /// is outbid at the cap rather than conceded to. That is the right call for a claim whose
+    /// preimage the counterparty already holds: stopping cannot keep it secret, and only hands the
+    /// counterparty the output as well.
+    pub stop_at_deadline: bool,
     /// Wall-clock ceiling for one call.
     pub max_wall_duration: Duration,
     /// Iteration ceiling for one call.
@@ -93,6 +102,7 @@ impl SpendWatchConfig {
             poll,
             min_confirmations,
             deadline_height: Some(deadline_height),
+            stop_at_deadline: true,
             max_wall_duration: DEFAULT_MAX_WALL_DURATION,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             known_ours: Vec::new(),
@@ -102,6 +112,13 @@ impl SpendWatchConfig {
     /// Adopt spends a previous run of this swap put on the wire.
     pub fn with_known_ours(mut self, txids: Vec<Txid>) -> Self {
         self.known_ours = txids;
+        self
+    }
+
+    /// Keep bumping past the deadline instead of giving up there. See
+    /// [`stop_at_deadline`](Self::stop_at_deadline).
+    pub fn bumping_past_deadline(mut self) -> Self {
+        self.stop_at_deadline = false;
         self
     }
 
@@ -120,6 +137,7 @@ impl SpendWatchConfig {
             poll,
             min_confirmations,
             deadline_height: None,
+            stop_at_deadline: true,
             max_wall_duration: DEFAULT_MAX_WALL_DURATION,
             max_iterations: DEFAULT_MAX_ITERATIONS,
             known_ours: Vec::new(),
@@ -197,7 +215,16 @@ pub async fn confirm_or_bump(
         None => {
             let initial = build(rate)?;
             on_spend(initial.compute_txid());
-            run_blocking(|| chain.broadcast(&initial))?
+            match run_blocking(|| chain.broadcast(&initial)) {
+                Ok(id) => id,
+                // A rival in the mempool refuses a spend that pays less than it. The loop outbids
+                // it at the cap, so this is not the end of a call that keeps going.
+                Err(e) if !cfg.stop_at_deadline => {
+                    warn!("initial spend rejected ({e}); retrying from the watch loop");
+                    initial.compute_txid()
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
     ours.insert(txid);
@@ -215,14 +242,23 @@ pub async fn confirm_or_bump(
         if let Some(spend) = run_blocking(|| chain.find_spend(htlc_spk, &htlc_outpoint))? {
             let spend_txid = spend.compute_txid();
             if !ours.contains(&spend_txid) {
-                warn!(
-                    "the HTLC output was spent by {spend_txid}, which we did not broadcast; \
-                     handing it back to the caller"
-                );
-                return Ok(SpendOutcome::ConflictingSpend { tx: spend });
-            }
-            // One of ours, possibly an earlier replacement. Track it as the live one.
-            if spend_txid != txid {
+                let rival_unconfirmed = !cfg.stop_at_deadline
+                    && !matches!(
+                        run_blocking(|| chain.tx_confirmations(htlc_spk, &spend_txid))?,
+                        Some(c) if c > 0
+                    );
+                if !rival_unconfirmed {
+                    warn!(
+                        "the HTLC output was spent by {spend_txid}, which we did not broadcast; \
+                         handing it back to the caller"
+                    );
+                    return Ok(SpendOutcome::ConflictingSpend { tx: spend });
+                }
+                // Ours is displaced, so the rebuild below goes out at this rate.
+                debug!("{spend_txid} spends the HTLC output from the mempool; outbidding it");
+                rate = rate.max(cfg.cap_rate_sat_vb);
+            } else if spend_txid != txid {
+                // One of ours, possibly an earlier replacement. Track it as the live one.
                 debug!("an earlier replacement of ours ({spend_txid}) is the live spend");
                 txid = spend_txid;
             }
@@ -236,7 +272,22 @@ pub async fn confirm_or_bump(
             // reorg orphaned it. Either way, get it back on the wire.
             None => {
                 debug!("spend {txid} is not in the mempool or a block; re-broadcasting");
-                if let Ok(tx) = build(rate) {
+                // A spend the node refused, often for paying too little, lands here on every poll
+                // and never reaches the bump below. Retrying it at the same rate never gets it in.
+                let next = if cfg.stop_at_deadline {
+                    rate
+                } else {
+                    deadline_fee_rate(
+                        tip,
+                        cfg.deadline_height,
+                        rate,
+                        &estimate,
+                        cfg.floor_rate_sat_vb,
+                        cfg.cap_rate_sat_vb,
+                    )
+                };
+                if let Ok(tx) = build(next) {
+                    rate = next;
                     on_spend(tx.compute_txid());
                     if let Ok(id) = run_blocking(|| chain.broadcast(&tx)) {
                         ours.insert(id);
@@ -294,7 +345,7 @@ pub async fn confirm_or_bump(
         // Terminate rather than spin. A claim past its deadline cannot be won; a call that has
         // run for hours, or spun for a very large number of iterations, has stopped making
         // progress and should hand control back.
-        if let Some(deadline) = cfg.deadline_height {
+        if let Some(deadline) = cfg.deadline_height.filter(|_| cfg.stop_at_deadline) {
             if tip >= deadline {
                 warn!("spend {txid} did not confirm before its deadline at height {deadline}");
                 return Ok(SpendOutcome::DeadlineExceeded {
@@ -361,6 +412,7 @@ mod tests {
             poll: Duration::from_millis(0),
             min_confirmations: 2,
             deadline_height: deadline,
+            stop_at_deadline: true,
             max_wall_duration: Duration::from_secs(5),
             max_iterations: 50,
             known_ours: Vec::new(),
@@ -544,6 +596,62 @@ mod tests {
         .expect("must not loop forever")
         .unwrap();
         assert!(matches!(out, SpendOutcome::DeadlineExceeded { .. }));
+    }
+
+    /// Past its deadline, a claim told to keep going goes straight to the cap and waits for a
+    /// confirmation instead of handing back.
+    #[tokio::test]
+    async fn a_claim_bumping_past_its_deadline_goes_to_the_cap_and_confirms() {
+        let chain = chain(vec![Some(0), Some(0), Some(0), Some(2)]);
+        let rates: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            confirm_or_bump(
+                &chain,
+                spk().as_script(),
+                htlc_outpoint(),
+                &cfg(Some(799_990)).bumping_past_deadline(),
+                None,
+                &|_| {},
+                |rate| {
+                    rates.lock().unwrap().push(rate);
+                    Ok(tx_paying(100_000 - rate))
+                },
+            ),
+        )
+        .await
+        .expect("must not loop forever")
+        .unwrap();
+        assert!(matches!(out, SpendOutcome::Confirmed { .. }), "{out:?}");
+        assert_eq!(*rates.lock().unwrap(), vec![5, 1_000]);
+    }
+
+    /// A claim past its deadline whose spend is nowhere to be seen, as when the node refused it
+    /// for paying too little, goes back out at the cap rather than at the rate that failed.
+    #[tokio::test]
+    async fn a_missing_claim_past_its_deadline_is_retried_at_the_cap() {
+        let chain = chain(vec![None, Some(2)]);
+        let rates: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            confirm_or_bump(
+                &chain,
+                spk().as_script(),
+                htlc_outpoint(),
+                &cfg(Some(799_990)).bumping_past_deadline(),
+                None,
+                &|_| {},
+                |rate| {
+                    rates.lock().unwrap().push(rate);
+                    Ok(tx_paying(100_000 - rate))
+                },
+            ),
+        )
+        .await
+        .expect("must not loop forever")
+        .unwrap();
+        assert!(matches!(out, SpendOutcome::Confirmed { .. }), "{out:?}");
+        assert_eq!(*rates.lock().unwrap(), vec![5, 1_000]);
     }
 
     /// A refund has no chain deadline, but must still hand control back rather than running for
