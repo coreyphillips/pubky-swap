@@ -67,9 +67,10 @@ pub struct SpendWatchConfig {
     /// Whether the call gives up once the tip reaches `deadline_height`.
     ///
     /// `false` keeps the deadline as the escalation schedule, so the rate sits at the cap once it
-    /// has passed, but goes on until the spend or a rival's confirms. That is the right call for
-    /// a claim whose preimage the counterparty already holds: stopping cannot keep it secret, and
-    /// only hands the counterparty the output as well.
+    /// has passed, but goes on until the spend or a rival's confirms. A rival still in the mempool
+    /// is outbid at the cap rather than conceded to. That is the right call for a claim whose
+    /// preimage the counterparty already holds: stopping cannot keep it secret, and only hands the
+    /// counterparty the output as well.
     pub stop_at_deadline: bool,
     /// Wall-clock ceiling for one call.
     pub max_wall_duration: Duration,
@@ -214,7 +215,16 @@ pub async fn confirm_or_bump(
         None => {
             let initial = build(rate)?;
             on_spend(initial.compute_txid());
-            run_blocking(|| chain.broadcast(&initial))?
+            match run_blocking(|| chain.broadcast(&initial)) {
+                Ok(id) => id,
+                // A rival in the mempool refuses a spend that pays less than it. The loop outbids
+                // it at the cap, so this is not the end of a call that keeps going.
+                Err(e) if !cfg.stop_at_deadline => {
+                    warn!("initial spend rejected ({e}); retrying from the watch loop");
+                    initial.compute_txid()
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
     ours.insert(txid);
@@ -232,14 +242,23 @@ pub async fn confirm_or_bump(
         if let Some(spend) = run_blocking(|| chain.find_spend(htlc_spk, &htlc_outpoint))? {
             let spend_txid = spend.compute_txid();
             if !ours.contains(&spend_txid) {
-                warn!(
-                    "the HTLC output was spent by {spend_txid}, which we did not broadcast; \
-                     handing it back to the caller"
-                );
-                return Ok(SpendOutcome::ConflictingSpend { tx: spend });
-            }
-            // One of ours, possibly an earlier replacement. Track it as the live one.
-            if spend_txid != txid {
+                let rival_unconfirmed = !cfg.stop_at_deadline
+                    && !matches!(
+                        run_blocking(|| chain.tx_confirmations(htlc_spk, &spend_txid))?,
+                        Some(c) if c > 0
+                    );
+                if !rival_unconfirmed {
+                    warn!(
+                        "the HTLC output was spent by {spend_txid}, which we did not broadcast; \
+                         handing it back to the caller"
+                    );
+                    return Ok(SpendOutcome::ConflictingSpend { tx: spend });
+                }
+                // Ours is displaced, so the rebuild below goes out at this rate.
+                debug!("{spend_txid} spends the HTLC output from the mempool; outbidding it");
+                rate = rate.max(cfg.cap_rate_sat_vb);
+            } else if spend_txid != txid {
+                // One of ours, possibly an earlier replacement. Track it as the live one.
                 debug!("an earlier replacement of ours ({spend_txid}) is the live spend");
                 txid = spend_txid;
             }

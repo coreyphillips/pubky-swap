@@ -200,6 +200,13 @@ pub async fn execute_reverse_swap(
                     known_ours.push(claim);
                     break funding;
                 }
+                Some(SpentLockup::Refunding(u)) => {
+                    if u.confirmations >= required_confirmations {
+                        info!("Client: the payment settled; outbidding an unconfirmed refund");
+                        break u;
+                    }
+                    lockup_pending = true;
+                }
                 Some(SpentLockup::Refunded(refund)) => {
                     return Err(anyhow!(
                         "the provider refunded the HTLC ({refund}) after the payment settled; \
@@ -430,7 +437,9 @@ enum SpentLockup {
     /// A claim carrying our preimage, from an earlier run or another device.
     Claimed { funding: FundingUtxo, claim: Txid },
     /// Anything else, which can only be the provider's refund: the claim branch is the one that
-    /// reveals the preimage.
+    /// reveals the preimage. Unconfirmed, a claim paying more can still replace it.
+    Refunding(FundingUtxo),
+    /// The provider's refund, confirmed.
     Refunded(Txid),
 }
 
@@ -446,19 +455,29 @@ fn spent_lockup(chain: &dyn ChainWatcher, claim: &ReverseClaim) -> Result<Option
         else {
             continue;
         };
+        let funding = FundingUtxo {
+            outpoint: output.outpoint,
+            value_sat: output.value_sat,
+            confirmations: output.confirmations,
+        };
+        let spend_txid = spend.compute_txid();
         if extract_preimage(&spend, &output.outpoint, &claim.payment_hash()).is_some() {
             return Ok(Some(SpentLockup::Claimed {
-                funding: FundingUtxo {
-                    outpoint: output.outpoint,
-                    value_sat: output.value_sat,
-                    confirmations: output.confirmations,
-                },
-                claim: spend.compute_txid(),
+                funding,
+                claim: spend_txid,
             }));
         }
-        refund.get_or_insert(spend.compute_txid());
+        if refund.is_none() {
+            let confirmations =
+                run_blocking(|| chain.tx_confirmations(&claim.htlc_spk, &spend_txid))
+                    .map_err(|e| anyhow!("tx_confirmations: {e}"))?;
+            refund = Some(match confirmations {
+                Some(c) if c > 0 => SpentLockup::Refunded(spend_txid),
+                _ => SpentLockup::Refunding(funding),
+            });
+        }
     }
-    Ok(refund.map(SpentLockup::Refunded))
+    Ok(refund)
 }
 
 struct AbortPayment(tokio::task::AbortHandle);
@@ -1268,12 +1287,9 @@ mod tests {
         );
     }
 
-    /// Past the window, a settled swap whose lockup the provider refunded, or that nothing ever
-    /// paid, ends rather than polling for a lockup that is gone.
-    #[tokio::test]
-    async fn a_settled_swap_with_no_lockup_left_stops_waiting() {
-        let (claim, outpoint) = recovery_claim();
-        let refund = bitcoin::Transaction {
+    /// A transaction spending `outpoint` without the preimage, as the provider's refund does.
+    fn refund_of(outpoint: OutPoint) -> bitcoin::Transaction {
+        bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::absolute::LockTime::ZERO,
             input: vec![bitcoin::TxIn {
@@ -1281,11 +1297,20 @@ mod tests {
                 ..Default::default()
             }],
             output: vec![],
-        };
+        }
+    }
+
+    /// Past the window, a settled swap whose lockup the provider refunded, or that nothing ever
+    /// paid, ends rather than polling for a lockup that is gone.
+    #[tokio::test]
+    async fn a_settled_swap_with_no_lockup_left_stops_waiting() {
+        let (claim, outpoint) = recovery_claim();
+        let refund = refund_of(outpoint);
         let refunded = MockChain::new()
             .with_tip(TIMEOUT + 1)
             .with_spent_output(outpoint, AMOUNT, refund.compute_txid())
-            .with_spend(refund);
+            .with_spend(refund)
+            .with_confirmations(vec![Some(1)]);
         let ln = MockLn::new(claim.preimage).with_status(settled());
         let (result, _, chain) = run_resumed(ln, refunded, claim).await;
         let err = result.unwrap_err();
@@ -1299,6 +1324,32 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.to_string().contains("no lockup"), "{err:#}");
         assert!(chain.broadcasts().is_empty());
+    }
+
+    /// A refund still in the mempool has not won: a settled swap claims over it at the cap.
+    #[tokio::test]
+    async fn a_settled_swap_outbids_an_unconfirmed_refund() {
+        let (claim, outpoint) = recovery_claim();
+        let (preimage, ph) = (claim.preimage, claim.payment_hash());
+        let refund = refund_of(outpoint);
+        // The refund twice (seen by the wait loop, then by the claim driver), our first claim
+        // displaced by it, the refund again, then our claim at the cap buried.
+        let chain = MockChain::new()
+            .with_tip(TIMEOUT + 1)
+            .with_spent_output(outpoint, AMOUNT, refund.compute_txid())
+            .with_spend(refund)
+            .with_confirmations(vec![Some(0), Some(0), None, Some(0), Some(FINALITY_DEPTH)]);
+        let ln = MockLn::new(preimage).with_status(settled());
+        let (result, _, chain) = run_resumed(ln, chain, claim).await;
+        let txid = result.unwrap();
+        let broadcasts = chain.broadcasts();
+        assert_eq!(broadcasts.len(), 2, "the first claim and one at the cap");
+        assert!(broadcasts[1].output[0].value < broadcasts[0].output[0].value);
+        assert_eq!(txid, broadcasts[1].compute_txid());
+        assert_eq!(
+            extract_preimage(&broadcasts[1], &outpoint, &ph),
+            Some(preimage)
+        );
     }
 
     /// Short of a settled payment the preimage is still the client's to keep, so past the window
