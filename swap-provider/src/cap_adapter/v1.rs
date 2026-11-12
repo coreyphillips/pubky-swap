@@ -200,8 +200,12 @@ fn begin<'a>(
         };
         return Err(Box::new(reply));
     }
+    // Only a finished reply makes room. Dropping the mark of an event still being answered would
+    // admit another message under its id beside it.
     if replies.len() >= REPLIES_KEPT {
-        replies.pop_front();
+        if let Some(oldest) = replies.iter().position(|r| r.reply.is_some()) {
+            replies.remove(oldest);
+        }
     }
     replies.push_back(Replied {
         sender: sender.to_string(),
@@ -469,15 +473,18 @@ async fn terms_for(
     let terms = match (held, &commit.quote) {
         (Some(terms), _) => terms,
         (None, Some(signed)) => {
-            let key = cap
-                .own_key(signed.terms.provider_key_generation)
-                .ok_or_else(|| invalid("the quote is not signed by this provider"))?;
             if signed.terms.provider != cap.provider {
                 return Err(invalid("the quote names another provider"));
             }
-            signed
-                .check(commit, &key)
-                .map_err(|e| invalid(&format!("signed quote refused: {e}")))?;
+            match cap.own_key(signed.terms.provider_key_generation) {
+                Some(key) => signed
+                    .check(commit, &key)
+                    .map_err(|e| invalid(&format!("signed quote refused: {e}")))?,
+                // A restart drops the keys of earlier generations, but a contract stored for
+                // this very commit shows its terms were checked under one.
+                None if contracted(ctx, commit, &signed.terms)? => {}
+                None => return Err(invalid("the quote is not signed by this provider")),
+            }
             signed.terms.clone()
         }
         (None, None) => {
@@ -498,6 +505,28 @@ async fn terms_for(
     }
     restore_quote(ctx, sender, &terms).await?;
     Ok(terms)
+}
+
+/// Whether `terms` are `commit`'s and the swap for their quote stored a contract for `commit`.
+/// `commit_hash` covers `terms_hash`, so those are the terms that contract was signed on.
+fn contracted(ctx: &ExecCtx, commit: &Commit, terms: &Terms) -> Result<bool, (RejectCode, String)> {
+    let check = || -> anyhow::Result<bool> {
+        if hex::encode(terms.hash()?) != commit.terms_hash {
+            return Ok(false);
+        }
+        let commit_hash = hex::encode(commit.commit_hash()?);
+        let record = crate::swap_for_quote(ctx.store.as_ref(), terms.quote.body.quote_id)?;
+        Ok(record
+            .and_then(|record| record.cap_v1_contract)
+            .is_some_and(|stored| stored.commit_hash == commit_hash))
+    };
+    check().map_err(|error| {
+        warn!("could not look up the contract for a commit: {error:#}");
+        (
+            RejectCode::InternalError,
+            "could not check the quote".into(),
+        )
+    })
 }
 
 /// Put `terms`' quote back in the book when the book no longer holds it. The request that
@@ -683,5 +712,36 @@ pub(crate) fn status_of(
             detail: name(serde_json::to_value(&snapshot.state)),
             reference: None,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A full cache makes room from finished replies, so an event still being answered keeps
+    /// its mark and its id cannot be reused beside it.
+    #[test]
+    fn a_full_cache_keeps_the_mark_of_an_event_being_answered() {
+        let cap = CapState::ephemeral();
+        let sender = pubky_transport::identity_from_secret(&[1; 32]);
+        let answering = Uuid::new_v4();
+        let _mark = begin(&cap, &sender, answering, [1; 32], Uuid::nil()).unwrap();
+        for _ in 0..REPLIES_KEPT {
+            let event_id = Uuid::new_v4();
+            let done = begin(&cap, &sender, event_id, [2; 32], Uuid::nil()).unwrap();
+            let to = Answering {
+                flow_id: Uuid::nil(),
+                rfq: Some(event_id),
+                commit: None,
+            };
+            done.keep(&cap.refusal(to, RejectCode::InvalidRequest, "answered"));
+        }
+        let reused = begin(&cap, &sender, answering, [3; 32], Uuid::nil());
+        match reused.err().as_deref() {
+            Some(Message::Refusal(refusal)) => assert_eq!(refusal.body.code, "invalid_request"),
+            Some(other) => panic!("expected a refusal, got {other:?}"),
+            None => panic!("a second message was admitted under an id still being answered"),
+        }
     }
 }

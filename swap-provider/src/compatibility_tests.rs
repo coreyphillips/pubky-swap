@@ -1633,19 +1633,29 @@ mod direct_requests {
                 quote_ttl_secs: 2,
                 ..provider(&directory)
             };
+            // Signing with a delegated key, which a restart does not remember.
+            assert!(ctx
+                .cap
+                .set_signer(Arc::new(Ed25519Signer::from_secret(&[75; 32])), 1));
             let owner = pubky_transport::identity_from_secret(&[61; 32]);
-            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let rfq = rfq(Uuid::new_v4());
+            let reply = exchange(&ctx, &owner, &wire::Message::Rfq(rfq.clone())).await;
+            let wire::Message::Quote(quote) = reply else {
+                panic!("expected a quote, got {reply:?}");
+            };
+            let terms = wire::terms(&owner, &rfq, ctx.cap.provider(), &quote);
+            assert_eq!(terms.provider_key_generation, 1);
             let commit = commit(&quote, &terms, [73; 32], None);
             let first = exchange(&ctx, &owner, &as_commit(&commit)).await;
             assert!(matches!(first, wire::Message::Contract(_)), "{first:?}");
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-            // Restarted: the same store, an empty book, no replies or terms in memory, and a
-            // new signing key.
+            // Restarted: the same store, an empty book, no replies or terms in memory, and the
+            // next generation's key.
             let ctx = provider(&directory);
             assert!(ctx
                 .cap
-                .set_signer(Arc::new(Ed25519Signer::from_secret(&[74; 32])), 1));
+                .set_signer(Arc::new(Ed25519Signer::from_secret(&[74; 32])), 2));
             let replayed = exchange(&ctx, &owner, &as_commit(&commit)).await;
             assert_eq!(replayed, first);
             std::fs::remove_dir_all(directory).unwrap();
