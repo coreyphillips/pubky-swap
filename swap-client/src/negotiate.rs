@@ -46,6 +46,9 @@ pub enum Negotiation {
     /// [`PAYKIT_CAP_FEATURE`].
     #[serde(rename = "paykit-cap")]
     PaykitCap,
+    /// [`Negotiation::PaykitCap`] in the `version` wire of Paykit Capabilities §8.1 and §13.1.
+    #[serde(rename = "paykit-cap-core")]
+    PaykitCapCore,
 }
 
 impl Negotiation {
@@ -56,6 +59,7 @@ impl Negotiation {
             Self::Iroh => "iroh",
             Self::Dm => "dm",
             Self::PaykitCap => "paykit-cap",
+            Self::PaykitCapCore => "paykit-cap-core",
         }
     }
 
@@ -74,6 +78,7 @@ impl std::str::FromStr for Negotiation {
             "iroh" => Ok(Self::Iroh),
             "dm" => Ok(Self::Dm),
             "paykit-cap" => Ok(Self::PaykitCap),
+            "paykit-cap-core" => Ok(Self::PaykitCapCore),
             other => Err(anyhow!("unknown negotiation transport: {other}")),
         }
     }
@@ -333,6 +338,205 @@ impl Channel for CapChannel {
             }
         } else {
             serde_json::from_slice(&bytes).map_err(|error| unreadable(error.to_string()))?
+        };
+        if reply_matches(request, &reply)
+            && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
+        {
+            Ok(reply)
+        } else {
+            Err(ExchangeError::Uncertain(anyhow!(
+                "provider replied with an unexpected message"
+            )))
+        }
+    }
+}
+
+/// Requests over iroh `direct/1` in the `version` wire of Paykit Capabilities §8.1 and §13.1.
+///
+/// The quote and the contract are checked against the provider's key for the generation their
+/// envelope names: the key the client dialed at generation 0 or, with `paykit`, the capability
+/// signing key the provider's published delegation names for that generation (§5). Everything
+/// else goes as a plain [`SwapMessage`].
+#[cfg(feature = "iroh")]
+pub struct CapV1Channel {
+    client: pubky_transport::p2p::DirectRpcClient,
+    cap: Mutex<swap_common::paykit_cap::v1::Client>,
+    #[cfg(feature = "paykit")]
+    provider: String,
+}
+
+#[cfg(feature = "iroh")]
+impl CapV1Channel {
+    pub async fn new(secret: [u8; 32], provider: &str) -> Result<Self> {
+        let root = *pubky_transport::p2p::pubky_to_endpoint_id(provider)?.as_bytes();
+        let provider = pubky_transport::canonical_pubky(provider)?;
+        let client = pubky_transport::p2p::DirectRpcClient::new(secret, &provider).await?;
+        Ok(Self {
+            client,
+            cap: Mutex::new(swap_common::paykit_cap::v1::Client::new(
+                pubky_transport::identity_from_secret(&secret),
+                provider.clone(),
+                Some(root),
+            )),
+            #[cfg(feature = "paykit")]
+            provider,
+        })
+    }
+
+    fn cap(&self) -> std::sync::MutexGuard<'_, swap_common::paykit_cap::v1::Client> {
+        self.cap.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Learn the provider's key for the generation `reply` is signed under, through its
+    /// published Noise Key Authorization and delegation. A reply under any other key is then
+    /// refused by the check that follows.
+    #[cfg(feature = "paykit")]
+    async fn resolve_key(&self, reply: &swap_common::paykit_cap::v1::Message) {
+        const RESOLVE: std::time::Duration = std::time::Duration::from_secs(20);
+        let Some(generation) = self.cap().missing_key(reply) else {
+            return;
+        };
+        let resolved = tokio::time::timeout(
+            RESOLVE,
+            Box::pin(paykit_identity::resolve_published_signing_key(
+                &self.provider,
+            )),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow!("no answer within {}s", RESOLVE.as_secs())));
+        match resolved {
+            Ok(Some(delegation)) if delegation.key_generation() == generation => {
+                self.cap().allow_key(generation, delegation.signing_key())
+            }
+            Ok(Some(_)) => {
+                warn!("the provider publishes no delegation for generation {generation}")
+            }
+            Ok(None) => warn!("the provider publishes no capability signing key delegation"),
+            Err(error) => {
+                warn!("could not check the provider's capability signing key: {error:#}")
+            }
+        }
+    }
+
+    async fn request(
+        &self,
+        message: serde_json::Value,
+    ) -> std::result::Result<Vec<u8>, ExchangeError> {
+        use pubky_transport::TransportError;
+        let envelope = pubky_transport::p2p::DirectRequest { message };
+        match self.client.request(&envelope).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error @ TransportError::NotSent(_)) => Err(ExchangeError::NotSent(error.into())),
+            Err(error) => Err(ExchangeError::Uncertain(error.into())),
+        }
+    }
+
+    async fn kind(
+        &self,
+        bytes: &[u8],
+    ) -> std::result::Result<swap_common::paykit_cap::v1::Message, ExchangeError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(unreadable)?;
+        let reply = swap_common::paykit_cap::v1::Message::parse(value).map_err(unreadable)?;
+        #[cfg(feature = "paykit")]
+        self.resolve_key(&reply).await;
+        Ok(reply)
+    }
+
+    /// Send `request`, as its kind when it has one, and translate the reply.
+    async fn send(&self, request: &SwapMessage) -> std::result::Result<SwapMessage, ExchangeError> {
+        let sent = self.cap().request(request);
+        let message = match &sent {
+            Some(sent) => serde_json::to_value(sent),
+            None => serde_json::to_value(request),
+        }
+        .map_err(|error| ExchangeError::NotSent(error.into()))?;
+        let bytes = self.request(message).await?;
+        match &sent {
+            Some(sent) => {
+                let reply = self.kind(&bytes).await?;
+                self.cap().reply(request, sent, reply).map_err(unreadable)
+            }
+            None => {
+                let reply: SwapMessage = serde_json::from_slice(&bytes).map_err(unreadable)?;
+                self.cap().observe(&reply);
+                Ok(reply)
+            }
+        }
+    }
+
+    /// Status by quote for a creation this client committed to, with the swap's terms from the
+    /// contract the provider signed rather than from the snapshot, which carries no signature.
+    /// The commit is sent again for it, and the provider answers that event with the contract it
+    /// signed first. `None` when no commit was sent for the quote.
+    async fn recover(
+        &self,
+        query: &SwapStatusRequest,
+    ) -> std::result::Result<Option<SwapMessage>, ExchangeError> {
+        use swap_common::paykit_cap::v1::Message;
+        let (None, Some(quote_id)) = (query.swap_id, query.quote_id) else {
+            return Ok(None);
+        };
+        let Some(commit) = self.cap().sent_commit(quote_id) else {
+            return Ok(None);
+        };
+        let message = serde_json::to_value(Message::Commit(Box::new(commit)))
+            .map_err(|error| ExchangeError::NotSent(error.into()))?;
+        let reply = self.kind(&self.request(message).await?).await?;
+        let reject = |code: String, reason: String| {
+            Ok(Some(SwapMessage::Reject(Reject {
+                code: Some(code),
+                request_id: query.request_id,
+                swap_id: None,
+                quote_id: Some(quote_id),
+                reason,
+            })))
+        };
+        let accept = match &reply {
+            Message::Contract(_) => self.cap().recovered(quote_id, &reply).map_err(unreadable)?,
+            Message::Status(_) => {
+                return reject(
+                    RejectCode::Pending.as_str().into(),
+                    "the swap is still being admitted".into(),
+                )
+            }
+            Message::Refusal(refusal) => {
+                return reject(refusal.body.code.clone(), refusal.body.reason.clone())
+            }
+            _ => return Err(unreadable("a reply of another kind")),
+        };
+        let mut reply = self
+            .send(&SwapMessage::SwapStatusRequest(query.clone()))
+            .await?;
+        if let SwapMessage::SwapStatusSnapshot(snapshot) = &mut reply {
+            snapshot.accept = accept;
+        }
+        Ok(Some(reply))
+    }
+}
+
+#[cfg(feature = "iroh")]
+fn unreadable(error: impl std::fmt::Display) -> ExchangeError {
+    ExchangeError::Uncertain(anyhow!("unreadable reply: {error}"))
+}
+
+#[cfg(feature = "iroh")]
+impl Channel for CapV1Channel {
+    const NAME: &'static str = "paykit-cap-core";
+    async fn close(&self) {
+        self.client.close().await;
+    }
+    async fn exchange(
+        &self,
+        request: &SwapMessage,
+        expected: fn(&SwapMessage) -> bool,
+    ) -> std::result::Result<SwapMessage, ExchangeError> {
+        let reply = match request {
+            SwapMessage::SwapStatusRequest(query) => self.recover(query).await?,
+            _ => None,
+        };
+        let reply = match reply {
+            Some(reply) => reply,
+            None => self.send(request).await?,
         };
         if reply_matches(request, &reply)
             && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))
@@ -1103,6 +1307,7 @@ fn rejection(reply: SwapMessage) -> Error {
 pub enum Preferred {
     Iroh(IrohChannel),
     Cap(CapChannel),
+    CapV1(CapV1Channel),
 }
 
 #[cfg(feature = "iroh")]
@@ -1116,6 +1321,7 @@ impl Channel for Preferred {
         match self {
             Self::Iroh(channel) => channel.exchange(request, expected).await,
             Self::Cap(channel) => channel.exchange(request, expected).await,
+            Self::CapV1(channel) => channel.exchange(request, expected).await,
         }
     }
 
@@ -1123,6 +1329,7 @@ impl Channel for Preferred {
         match self {
             Self::Iroh(channel) => channel.acknowledge(request),
             Self::Cap(channel) => channel.acknowledge(request),
+            Self::CapV1(channel) => channel.acknowledge(request),
         }
     }
 
@@ -1130,6 +1337,7 @@ impl Channel for Preferred {
         match self {
             Self::Iroh(channel) => Channel::close(channel).await,
             Self::Cap(channel) => Channel::close(channel).await,
+            Self::CapV1(channel) => Channel::close(channel).await,
         }
     }
 
@@ -1137,6 +1345,7 @@ impl Channel for Preferred {
         match self {
             Self::Iroh(channel) => channel.maintain().await,
             Self::Cap(channel) => channel.maintain().await,
+            Self::CapV1(channel) => channel.maintain().await,
         }
     }
 }
@@ -1225,6 +1434,9 @@ async fn connect_inner(
             Negotiation::PaykitCap => {
                 Some(Preferred::Cap(CapChannel::new(secret, provider).await?))
             }
+            Negotiation::PaykitCapCore => {
+                Some(Preferred::CapV1(CapV1Channel::new(secret, provider).await?))
+            }
         };
         // Signing in waits until a request actually needs DMs.
         let fallback = match preference.uses_dm().then(dm).transpose() {
@@ -1273,6 +1485,7 @@ mod tests {
             Negotiation::Iroh,
             Negotiation::Dm,
             Negotiation::PaykitCap,
+            Negotiation::PaykitCapCore,
         ] {
             assert_eq!(mode.as_str().parse::<Negotiation>().unwrap(), mode);
             assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
@@ -1289,6 +1502,7 @@ mod tests {
         assert!(Negotiation::Dm.uses_dm());
         assert!(!Negotiation::Iroh.uses_dm());
         assert!(!Negotiation::PaykitCap.uses_dm());
+        assert!(!Negotiation::PaykitCapCore.uses_dm());
     }
 
     /// A provider that admits one swap per quote and replays it for the same request.

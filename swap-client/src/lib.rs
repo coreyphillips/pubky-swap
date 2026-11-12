@@ -92,8 +92,9 @@ pub struct ClientConfig {
     /// know it should look.
     pub rendezvous_iroh: bool,
     /// Transport for offer, quote, creation and status requests: `auto` (iroh when the provider
-    /// supports it, Pubky DMs otherwise), `iroh`, `dm`, or `paykit-cap` (iroh in the signed
-    /// `paykit-cap.*` kinds, never DMs). See [`negotiate`].
+    /// supports it, Pubky DMs otherwise), `iroh`, `dm`, `paykit-cap` (iroh in the signed
+    /// `paykit-cap.*` kinds, never DMs), or `paykit-cap-core` (the same in the Capabilities §13.1
+    /// wire). See [`negotiate`].
     pub negotiation: Negotiation,
     /// Confirmations this client requires before acting, whatever the provider quotes. `0` means
     /// "use the network default" (2 on mainnet, 1 elsewhere).
@@ -376,14 +377,14 @@ pub async fn run(config: ClientConfig) -> Result<()> {
     result
 }
 
-/// Refuse a provider whose offer lacks [`PAYKIT_CAP_FEATURE`], for `negotiation = "paykit-cap"`.
+/// Refuse a provider whose offer lacks [`PAYKIT_CAP_FEATURE`], for either `paykit-cap` wire.
 fn require_paykit_cap(offer: &SwapOffer) -> Result<()> {
     if offer.features.iter().any(|f| f == PAYKIT_CAP_FEATURE) {
         Ok(())
     } else {
         Err(anyhow!(
             "the provider does not advertise {PAYKIT_CAP_FEATURE}, so it cannot answer \
-             negotiation = \"paykit-cap\"; use auto or iroh"
+             the paykit-cap kinds; use auto or iroh"
         ))
     }
 }
@@ -397,7 +398,10 @@ async fn run_negotiation<P: Channel, F: Channel>(
 ) -> Result<()> {
     // A provider without the signed kinds drops them unanswered, so check its offer first rather
     // than wait on a quote that never comes.
-    if config.negotiation == Negotiation::PaykitCap {
+    if matches!(
+        config.negotiation,
+        Negotiation::PaykitCap | Negotiation::PaykitCapCore
+    ) {
         require_paykit_cap(&negotiator.offer().await?)?;
     }
 

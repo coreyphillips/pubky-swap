@@ -1283,6 +1283,603 @@ mod direct_requests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
+    /// The `version` wire of Capabilities §8.1 and §13.1, beside the older one.
+    mod cap_v1 {
+        use super::*;
+        use serde_json::{json, Value};
+        use swap_common::cap_descriptor::{onchain_rail, LIGHTNING_IDENTIFIER};
+        use swap_common::paykit_cap::v1::{self as wire, *};
+        use swap_common::paykit_cap::{CapSigner, Ed25519Signer};
+
+        /// The owner's key generation in every envelope it sends.
+        const GENERATION: u64 = 3;
+        /// The owner's capability signing secret at [`GENERATION`].
+        const OWNER_CAP_SECRET: [u8; 32] = [62; 32];
+
+        fn key(secret: &[u8; 32]) -> [u8; 32] {
+            hex::decode(Ed25519Signer::from_secret(secret).public_key_hex())
+                .unwrap()
+                .try_into()
+                .unwrap()
+        }
+
+        /// [`signing_provider`], finding the owner's key for [`GENERATION`] as its published
+        /// delegation would name it, and holding wake grants.
+        fn provider(directory: &std::path::Path) -> ExecCtx {
+            let store = Arc::new(JsonFileSwapStore::new(directory).unwrap());
+            let cap = crate::cap_adapter::CapState::new(
+                Arc::new(Ed25519Signer::from_secret(&PROVIDER_SECRET)),
+                pubky_transport::identity_from_secret(&PROVIDER_SECRET),
+            )
+            .with_owner_keys(Arc::new(|_, generation| {
+                Box::pin(async move {
+                    // A lookup takes a while, so another try of the same event can arrive.
+                    tokio::task::yield_now().await;
+                    Ok((generation == GENERATION).then(|| key(&OWNER_CAP_SECRET)))
+                })
+            }));
+            ExecCtx {
+                cap: Arc::new(cap),
+                wake: Arc::new(crate::wake::Waker::new(&["https://wake.example".into()])),
+                ..signing_provider(store)
+            }
+        }
+
+        async fn send(ctx: &ExecCtx, owner: &str, message: Value) -> Value {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let request = DirectRpc {
+                remote_key: owner.into(),
+                message,
+                reply,
+            };
+            handle_direct_request(ctx.clone(), offer(), request).await;
+            serde_json::from_slice(&answer.await.unwrap()).unwrap()
+        }
+
+        async fn exchange(ctx: &ExecCtx, owner: &str, message: &wire::Message) -> wire::Message {
+            let reply = send(ctx, owner, serde_json::to_value(message).unwrap()).await;
+            wire::Message::parse(reply.clone()).unwrap_or_else(|e| panic!("{e}: {reply}"))
+        }
+
+        fn refusal_code(reply: &wire::Message) -> &str {
+            match reply {
+                wire::Message::Refusal(refusal) => &refusal.body.code,
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
+
+        fn rfq(flow_id: Uuid) -> wire::Rfq {
+            let now = crate::now_unix();
+            wire::Rfq {
+                envelope: Envelope::new("bitkit", flow_id, GENERATION),
+                event_id: Uuid::new_v4(),
+                body: RfqBody {
+                    offer_id: Uuid::nil(),
+                    dir: SwapDirection::Reverse,
+                    from: LIGHTNING_IDENTIFIER.into(),
+                    to: format!("btc-{}-p2wsh", onchain_rail(NetworkSpec::Regtest)),
+                    amount_sat: Sat(100_000),
+                },
+                atomicity_min: "hash".into(),
+                respond_by: now + 30,
+                valid_until: now + 60,
+            }
+        }
+
+        /// A quote for `owner`, checked against the provider's key, and the terms it signs.
+        async fn quote(ctx: &ExecCtx, owner: &str, rfq: &wire::Rfq) -> (wire::Quote, Terms) {
+            let reply = exchange(ctx, owner, &wire::Message::Rfq(rfq.clone())).await;
+            let wire::Message::Quote(quote) = reply else {
+                panic!("expected a quote, got {reply:?}");
+            };
+            let terms = wire::terms(owner, rfq, ctx.cap.provider(), &quote);
+            wire::verify(&key(&PROVIDER_SECRET), &terms.hash().unwrap(), &quote.sig).unwrap();
+            (quote, terms)
+        }
+
+        fn commit(
+            quote: &wire::Quote,
+            terms: &Terms,
+            preimage: [u8; 32],
+            owner_ref: Option<String>,
+        ) -> wire::Commit {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let (_, claim) = swap_common::random_keypair(&secp);
+            wire::Commit {
+                envelope: Envelope::new("bitkit", terms.flow_id, GENERATION),
+                event_id: Uuid::new_v4(),
+                quote_event_id: quote.event_id,
+                terms_hash: hex::encode(terms.hash().unwrap()),
+                body: CommitBody {
+                    lock_profile: SwapScript::P2wsh,
+                    payment_hash: hex::encode(payment_hash(&preimage)),
+                    claim_pubkey: Some(hex::encode(claim.to_bytes())),
+                    refund_pubkey: None,
+                    invoice: None,
+                    owner_ref,
+                },
+                quote: Some(SignedTerms {
+                    terms: terms.clone(),
+                    sig: quote.sig.clone(),
+                }),
+                sig: None,
+            }
+        }
+
+        fn as_commit(commit: &wire::Commit) -> wire::Message {
+            wire::Message::Commit(Box::new(commit.clone()))
+        }
+
+        /// RFQ, quote, an unsigned commit and its contract, then the swap's status, wake grant
+        /// and listing, all over the `version` wire. A retried event gets the same reply.
+        #[tokio::test]
+        async fn a_reverse_swap_runs_from_rfq_to_listing() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let rfq = rfq(Uuid::new_v4());
+            let (quote, terms) = quote(&ctx, &owner, &rfq).await;
+            assert_eq!(quote.rfq_event_id, rfq.event_id);
+            assert_eq!(quote.envelope.flow_id, rfq.envelope.flow_id);
+            assert_eq!(quote.envelope.app_id, PROVIDER_APP_ID);
+            assert_eq!(quote.body.dir, SwapDirection::Reverse);
+            assert!(quote.body.lock_profiles.contains(&SwapScript::P2wsh));
+            assert_eq!(
+                quote.body.service_fee_sat.0 + quote.body.onchain_fee_sat.0 + 100_000,
+                quote.body.total_sat.0
+            );
+            let retried = exchange(&ctx, &owner, &wire::Message::Rfq(rfq.clone())).await;
+            assert_eq!(retried, wire::Message::Quote(quote.clone()));
+
+            // Bitkit's index is 58 characters.
+            let owner_ref = "k".repeat(58);
+            let commit = commit(&quote, &terms, [63; 32], Some(owner_ref.clone()));
+            let reply = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            let wire::Message::Contract(contract) = reply else {
+                panic!("expected a contract, got {reply:?}");
+            };
+            assert_eq!(contract.commit_event_id, commit.event_id);
+            assert_eq!(
+                contract.commit_hash,
+                hex::encode(commit.commit_hash().unwrap())
+            );
+            contract.verify(&key(&PROVIDER_SECRET)).unwrap();
+            let accept = contract.open(&terms).unwrap();
+            assert_eq!(accept.quote_id, quote.body.quote_id);
+            assert!(accept.invoice.is_some());
+            let replayed = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            assert_eq!(replayed, wire::Message::Contract(contract.clone()));
+
+            let record = ctx.store.get(accept.swap_id).unwrap().unwrap();
+            assert!(
+                record.claimable_hint,
+                "the RFQ had no features to ask for it"
+            );
+            let grant = SwapWakeCapability {
+                request_id: Some(Uuid::new_v4()),
+                swap_id: accept.swap_id,
+                capability: WakeCapability {
+                    v: 1,
+                    gateway: "https://wake.example".into(),
+                    topics: vec![swap_common::messages::SWAP_WAKE_TOPIC.into()],
+                    token: "wkg_v1".into(),
+                    expires_at: u64::MAX,
+                },
+            };
+            let reply = ask(&ctx, &owner, SwapMessage::SwapWakeCapability(grant)).await;
+            assert!(
+                matches!(&reply, Some(SwapMessage::SwapStatusSnapshot(_))),
+                "{reply:?}"
+            );
+            assert!(ctx.wake.holds(accept.swap_id));
+
+            let listed = page(&ctx, &owner, None, None, false).await;
+            assert_eq!(listed.snapshots.len(), 1);
+            assert_eq!(
+                listed.snapshots[0].owner_ref.as_deref(),
+                Some(owner_ref.as_str())
+            );
+
+            let request = wire::Message::StatusRequest(StatusRequest {
+                envelope: Envelope::new("bitkit", terms.flow_id, GENERATION),
+                event_id: Uuid::new_v4(),
+                body: StatusRequestBody {
+                    swap_id: Some(accept.swap_id),
+                    quote_id: None,
+                },
+            });
+            let reply = exchange(&ctx, &owner, &request).await;
+            let wire::Message::Status(status) = reply else {
+                panic!("expected a status, got {reply:?}");
+            };
+            assert_eq!(status.body.swap_id, accept.swap_id);
+            assert_eq!(status.body.state, "pending");
+            assert_eq!(status.body.detail, "created");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// A commit's `sig` is optional on `direct/1`, but one that is there must be the owner's
+        /// capability signing key for the generation its envelope names.
+        #[tokio::test]
+        async fn a_signed_commit_must_verify_under_its_generation() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-sig-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+
+            let mut forged = commit(&quote, &terms, [64; 32], None);
+            forged.sign(&Ed25519Signer::from_secret(&[65; 32])).unwrap();
+            let reply = exchange(&ctx, &owner, &as_commit(&forged)).await;
+            assert_eq!(refusal_code(&reply), "invalid_request");
+            let wire::Message::Refusal(refusal) = &reply else {
+                unreachable!()
+            };
+            assert_eq!(refusal.commit_event_id, Some(forged.event_id));
+
+            let mut signed = commit(&quote, &terms, [64; 32], None);
+            signed
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let reply = exchange(&ctx, &owner, &as_commit(&signed)).await;
+            assert!(matches!(reply, wire::Message::Contract(_)), "{reply:?}");
+
+            // Generation 0 is the owner's root key, which no delegation names.
+            let mut root_rfq = rfq(Uuid::new_v4());
+            root_rfq.envelope.key_generation = 0;
+            let (quote, terms) = self::quote(&ctx, &owner, &root_rfq).await;
+            let mut wrong = commit(&quote, &terms, [70; 32], None);
+            wrong.envelope.key_generation = 0;
+            wrong
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let reply = exchange(&ctx, &owner, &as_commit(&wrong)).await;
+            assert_eq!(refusal_code(&reply), "invalid_request");
+            let mut root = commit(&quote, &terms, [70; 32], None);
+            root.envelope.key_generation = 0;
+            root.sign(&Ed25519Signer::from_secret(&[61; 32])).unwrap();
+            let reply = exchange(&ctx, &owner, &as_commit(&root)).await;
+            assert!(matches!(reply, wire::Message::Contract(_)), "{reply:?}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// A commit names its terms' profile, flow and owner key generation, and the terms
+        /// carried with it must be the ones the provider signed. A restarted provider takes the
+        /// carried quote back, with the claimable hint a reverse quote on this wire always has.
+        #[tokio::test]
+        async fn a_commit_under_other_terms_is_refused_and_a_restart_takes_the_quote_back() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-terms-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+
+            let mut other_flow = commit(&quote, &terms, [66; 32], None);
+            other_flow.envelope.flow_id = Uuid::new_v4();
+            let mut other_generation = commit(&quote, &terms, [66; 32], None);
+            other_generation.envelope.key_generation = GENERATION + 1;
+            let mut other_terms = commit(&quote, &terms, [66; 32], None);
+            other_terms.quote.as_mut().unwrap().terms.flow_id = Uuid::new_v4();
+            other_terms.terms_hash =
+                hex::encode(other_terms.quote.as_ref().unwrap().terms.hash().unwrap());
+            for refused in [&other_flow, &other_generation, &other_terms] {
+                let reply = exchange(&ctx, &owner, &as_commit(refused)).await;
+                assert_eq!(refusal_code(&reply), "invalid_request", "{refused:?}");
+            }
+            let mut other_profile = commit(&quote, &terms, [66; 32], None);
+            other_profile.envelope.profile = "swap/2".into();
+            let reply = exchange(&ctx, &owner, &as_commit(&other_profile)).await;
+            assert_eq!(refusal_code(&reply), "unsupported_protocol");
+            // A stranger presenting the owner's terms gets nothing.
+            let stranger = pubky_transport::identity_from_secret(&[67; 32]);
+            let commit = commit(&quote, &terms, [66; 32], None);
+            let reply = exchange(&ctx, &stranger, &as_commit(&commit)).await;
+            assert_eq!(refusal_code(&reply), "invalid_request");
+
+            // Restarted: the same store and key, an empty book and no terms in memory.
+            let ctx = provider(&directory);
+            let reply = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            let wire::Message::Contract(contract) = reply else {
+                panic!("expected a contract, got {reply:?}");
+            };
+            let record = ctx.store.get(contract.body.swap_id).unwrap().unwrap();
+            assert!(record.claimable_hint);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// Two tries of one event at once admit one swap. While the first is being answered,
+        /// the same bytes are told to wait and other bytes are refused.
+        #[tokio::test]
+        async fn an_event_tried_twice_at_once_is_admitted_once() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-race-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let mut first = commit(&quote, &terms, [71; 32], None);
+            first
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let mut other = commit(&quote, &terms, [72; 32], None);
+            other.event_id = first.event_id;
+            other
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let (first, other) = (as_commit(&first), as_commit(&other));
+            let (admitted, same, reused) = tokio::join!(
+                exchange(&ctx, &owner, &first),
+                exchange(&ctx, &owner, &first),
+                exchange(&ctx, &owner, &other),
+            );
+            assert!(
+                matches!(admitted, wire::Message::Contract(_)),
+                "{admitted:?}"
+            );
+            assert_eq!(refusal_code(&same), "pending");
+            assert_eq!(refusal_code(&reused), "invalid_request");
+            assert_eq!(
+                page(&ctx, &owner, None, None, false).await.snapshots.len(),
+                1
+            );
+            let retried = exchange(&ctx, &owner, &first).await;
+            assert_eq!(retried, admitted);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// A lost contract is fetched again by sending its commit again, and gets the bytes
+        /// first signed, after a restart, the quote's expiry and a rotation of the signing key.
+        #[cfg(feature = "paykit")]
+        #[tokio::test]
+        async fn a_replayed_commit_gets_its_first_contract_after_a_restart_and_a_rotation() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-lost-{}", Uuid::new_v4()));
+            let ctx = ExecCtx {
+                quote_ttl_secs: 2,
+                ..provider(&directory)
+            };
+            // Signing with a delegated key, which a restart does not remember.
+            assert!(ctx
+                .cap
+                .set_signer(Arc::new(Ed25519Signer::from_secret(&[75; 32])), 1));
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let rfq = rfq(Uuid::new_v4());
+            let reply = exchange(&ctx, &owner, &wire::Message::Rfq(rfq.clone())).await;
+            let wire::Message::Quote(quote) = reply else {
+                panic!("expected a quote, got {reply:?}");
+            };
+            let terms = wire::terms(&owner, &rfq, ctx.cap.provider(), &quote);
+            assert_eq!(terms.provider_key_generation, 1);
+            let commit = commit(&quote, &terms, [73; 32], None);
+            let first = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            assert!(matches!(first, wire::Message::Contract(_)), "{first:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // Restarted: the same store, an empty book, no replies or terms in memory, and the
+            // next generation's key.
+            let ctx = provider(&directory);
+            assert!(ctx
+                .cap
+                .set_signer(Arc::new(Ed25519Signer::from_secret(&[74; 32])), 2));
+            let replayed = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            assert_eq!(replayed, first);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// A signed commit is checked when it is admitted. Sent again after a restart, once the
+        /// owner publishes only its next generation's key, it still gets its first contract,
+        /// while a new commit signed under the old generation is refused.
+        #[tokio::test]
+        async fn a_replayed_signed_commit_gets_its_contract_after_the_owner_rotates() {
+            let directory =
+                std::env::temp_dir().join(format!("cap-v1-owner-rotated-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let mut signed = commit(&quote, &terms, [76; 32], None);
+            signed
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let first = exchange(&ctx, &owner, &as_commit(&signed)).await;
+            assert!(matches!(first, wire::Message::Contract(_)), "{first:?}");
+
+            // Restarted, with no replies or terms in memory, and the owner's delegation now
+            // names only the next generation's key.
+            let rotated = crate::cap_adapter::CapState::new(
+                Arc::new(Ed25519Signer::from_secret(&PROVIDER_SECRET)),
+                pubky_transport::identity_from_secret(&PROVIDER_SECRET),
+            )
+            .with_owner_keys(Arc::new(|_, generation| {
+                Box::pin(async move { Ok((generation == GENERATION + 1).then(|| key(&[77; 32]))) })
+            }));
+            let ctx = ExecCtx {
+                cap: Arc::new(rotated),
+                ..provider(&directory)
+            };
+            let replayed = exchange(&ctx, &owner, &as_commit(&signed)).await;
+            assert_eq!(replayed, first);
+
+            let (quote, terms) = self::quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let mut stale = commit(&quote, &terms, [78; 32], None);
+            stale
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let reply = exchange(&ctx, &owner, &as_commit(&stale)).await;
+            assert_eq!(refusal_code(&reply), "invalid_request");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// An RFQ is a closed object with string amounts, on one of the provider's edges, at an
+        /// atomicity `hash` meets. A commit's `owner_ref` is capped at 63 characters here.
+        #[tokio::test]
+        async fn malformed_rfqs_and_long_owner_refs_are_refused() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-rfq-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let base = serde_json::to_value(wire::Message::Rfq(rfq(Uuid::new_v4()))).unwrap();
+            let code = |reply: Value| {
+                wire::Message::parse(reply.clone())
+                    .map(|m| refusal_code(&m).to_string())
+                    .unwrap_or_else(|e| panic!("{e}: {reply}"))
+            };
+
+            let mut unknown = base.clone();
+            unknown["features"] = json!(["claimable-hint-v1"]);
+            assert_eq!(code(send(&ctx, &owner, unknown).await), "invalid_request");
+            let mut unknown_in_body = base.clone();
+            unknown_in_body["body"]["direction"] = json!("reverse");
+            assert_eq!(
+                code(send(&ctx, &owner, unknown_in_body).await),
+                "invalid_request"
+            );
+            let mut integer = base.clone();
+            integer["body"]["amount_sat"] = json!(100_000);
+            assert_eq!(code(send(&ctx, &owner, integer).await), "invalid_request");
+            let mut off_edge = base.clone();
+            off_edge["body"]["to"] = json!("btc-mainnet-p2wsh");
+            assert_eq!(
+                code(send(&ctx, &owner, off_edge).await),
+                "unsupported_route"
+            );
+            let mut backwards = base.clone();
+            backwards["body"]["dir"] = json!("submarine");
+            assert_eq!(
+                code(send(&ctx, &owner, backwards).await),
+                "unsupported_route"
+            );
+            let mut atomicity = base.clone();
+            atomicity["atomicity_min"] = json!("telepathy");
+            assert_eq!(
+                code(send(&ctx, &owner, atomicity).await),
+                "atomicity_unsupported"
+            );
+
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let long = commit(&quote, &terms, [68; 32], Some("k".repeat(64)));
+            let reply = exchange(&ctx, &owner, &as_commit(&long)).await;
+            assert_eq!(refusal_code(&reply), "invalid_request");
+            // The quote is unspent: the same commit within the cap is admitted.
+            let short = commit(&quote, &terms, [68; 32], Some("k".repeat(63)));
+            let reply = exchange(&ctx, &owner, &as_commit(&short)).await;
+            assert!(matches!(reply, wire::Message::Contract(_)), "{reply:?}");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// The client's half of this wire against the provider: a quote and a contract that
+        /// check out become the engine's own `Quote` and `SwapAccept`.
+        #[tokio::test]
+        async fn the_client_negotiates_a_swap_and_refuses_replies_under_other_terms() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-client-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let mut client = wire::Client::new(
+                owner.clone(),
+                ctx.cap.provider().to_string(),
+                Some(key(&PROVIDER_SECRET)),
+            );
+            let current = offer().read().await.clone().unwrap();
+            let fee_rate_sat_vb = current.fee_rate_sat_vb;
+            client.observe(&SwapMessage::Offer(current));
+
+            let asked =
+                SwapMessage::QuoteRequest(quote_request(&owner, SwapDirection::Reverse, 100_000));
+            let rfq = client.request(&asked).expect("an rfq");
+            assert_eq!(
+                client.request(&asked),
+                Some(rfq.clone()),
+                "a retry is the same event"
+            );
+            let reply = exchange(&ctx, &owner, &rfq).await;
+            let wire::Message::Quote(signed) = reply.clone() else {
+                panic!("expected a quote, got {reply:?}");
+            };
+            // A reply under another flow, generation or profile is refused.
+            let mut other_flow = signed.clone();
+            other_flow.envelope.flow_id = Uuid::new_v4();
+            let mut other_generation = signed.clone();
+            other_generation.envelope.key_generation += 1;
+            let mut other_profile = signed.clone();
+            other_profile.envelope.profile = "swap/2".into();
+            for refused in [other_flow, other_generation, other_profile] {
+                let refused = client.reply(&asked, &rfq, wire::Message::Quote(refused));
+                assert!(refused.is_err(), "{refused:?}");
+            }
+            let Ok(SwapMessage::Quote(quote)) = client.reply(&asked, &rfq, reply) else {
+                panic!("the quote does not check out");
+            };
+            assert_eq!(quote.fee_sat, quote.service_fee_sat + quote.onchain_fee_sat);
+            assert_eq!(
+                quote.fee_rate_sat_vb, fee_rate_sat_vb,
+                "taken from the offer"
+            );
+
+            let mut request = reverse_request(&owner, quote.quote_id, [69; 32]);
+            request.owner_ref = Some("k".repeat(58));
+            let asked = SwapMessage::SwapRequest(request);
+            let commit = client.request(&asked).expect("a commit");
+            let reply = exchange(&ctx, &owner, &commit).await;
+            let wire::Message::Contract(contract) = reply.clone() else {
+                panic!("expected a contract, got {reply:?}");
+            };
+            let mut other_generation = contract.clone();
+            other_generation.envelope.key_generation += 1;
+            assert!(client
+                .reply(&asked, &commit, wire::Message::Contract(other_generation))
+                .is_err());
+            let Ok(SwapMessage::SwapAccept(accept)) = client.reply(&asked, &commit, reply) else {
+                panic!("the contract does not check out");
+            };
+            assert_eq!(accept.quote_id, quote.quote_id);
+            // A retry is the same event, and gets the same contract.
+            assert_eq!(client.request(&asked), Some(commit.clone()));
+            let replayed = exchange(&ctx, &owner, &commit).await;
+            assert_eq!(replayed, wire::Message::Contract(contract.clone()));
+            // Recovery sends that commit and checks the contract it gets like the first.
+            let wire::Message::Commit(sent) = &commit else {
+                unreachable!()
+            };
+            assert_eq!(client.sent_commit(quote.quote_id).as_ref(), Some(&**sent));
+            assert_eq!(client.recovered(quote.quote_id, &replayed).unwrap(), accept);
+            let mut forged = contract;
+            forged.body.swap_id = Uuid::new_v4();
+            assert!(client
+                .recovered(quote.quote_id, &wire::Message::Contract(forged))
+                .is_err());
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// A message without `version` takes today's path, so a client from before this wire
+        /// keeps getting today's replies.
+        #[tokio::test]
+        async fn a_message_without_version_gets_todays_reply() {
+            use swap_common::paykit_cap::{CapMessage, Parties, Rfq, RfqConstraints};
+            let directory = std::env::temp_dir().join(format!("cap-v1-old-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let constraints = RfqConstraints {
+                offer_id: Uuid::nil(),
+                direction: SwapDirection::Reverse,
+                amount_sat: 100_000,
+            };
+            let rfq = CapMessage::Rfq(Rfq {
+                request_id: Some(Uuid::new_v4()),
+                constraints: constraints.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                features: Vec::new(),
+            });
+            let reply = send(&ctx, &owner, serde_json::to_value(&rfq).unwrap()).await;
+            assert!(!wire::is_v1(&reply), "{reply}");
+            let CapMessage::Quote(signed) = serde_json::from_value(reply.clone()).unwrap() else {
+                panic!("expected today's quote, got {reply}");
+            };
+            let parties = Parties {
+                owner: owner.clone(),
+                provider: ctx.cap.provider().to_string(),
+            };
+            signed.verify(&parties, &constraints).unwrap();
+            assert_eq!(
+                signed.signer,
+                Ed25519Signer::from_secret(&PROVIDER_SECRET).public_key_hex()
+            );
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn a_wake_capability_is_taken_over_a_direct_request() {
         let directory = std::env::temp_dir().join(format!("direct-wake-{}", Uuid::new_v4()));

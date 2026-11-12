@@ -191,7 +191,7 @@ async fn ensure_signer(
     let signer: Arc<dyn CapSigner> =
         Arc::new(Ed25519Signer::from_secret(&keys.cap_signing_secret()));
     let key = signer.public_key_hex();
-    if cap.set_signer(signer) {
+    if cap.set_signer(signer, session.generation()) {
         info!(
             "paykit-cap objects are now signed with the capability signing key {key} \
              (generation {})",

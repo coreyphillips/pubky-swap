@@ -214,6 +214,9 @@ pub struct SwapRecord {
     /// `status_request` get the same bytes. The first one stored is the one that stands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_contract: Option<crate::paykit_cap::ContractReply>,
+    /// The same for the §13.1 wire's `paykit-cap.contract`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_v1_contract: Option<crate::paykit_cap::v1::Contract>,
 
     // --- diagnostics ---
     /// The lowest height at which a reorg was seen while this swap was in flight.
@@ -385,6 +388,7 @@ impl SwapRecord {
             swap_id: Uuid::nil(),
             pending_hold_invoice: None,
             cap_contract: None,
+            cap_v1_contract: None,
             swap_request: None,
             swap_accept: None,
             taproot: None,
@@ -681,7 +685,10 @@ impl JsonFileSwapStore {
         // The signed contract is kept the same way: the driver writes whole records from a
         // snapshot taken before it was signed.
         let stamped;
-        let rec = if rec.created_at_unix == 0 || rec.cap_contract.is_none() {
+        let rec = if rec.created_at_unix == 0
+            || rec.cap_contract.is_none()
+            || rec.cap_v1_contract.is_none()
+        {
             let existing = self.get(rec.swap_id).ok().flatten();
             let created_at_unix = match rec.created_at_unix {
                 0 => existing
@@ -696,7 +703,11 @@ impl JsonFileSwapStore {
                 cap_contract: rec
                     .cap_contract
                     .clone()
-                    .or_else(|| existing.and_then(|e| e.cap_contract)),
+                    .or_else(|| existing.as_ref().and_then(|e| e.cap_contract.clone())),
+                cap_v1_contract: rec
+                    .cap_v1_contract
+                    .clone()
+                    .or_else(|| existing.and_then(|e| e.cap_v1_contract)),
                 ..rec.clone()
             };
             &stamped
