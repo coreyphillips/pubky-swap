@@ -417,6 +417,106 @@ impl CapV1Channel {
             }
         }
     }
+
+    async fn request(
+        &self,
+        message: serde_json::Value,
+    ) -> std::result::Result<Vec<u8>, ExchangeError> {
+        use pubky_transport::TransportError;
+        let envelope = pubky_transport::p2p::DirectRequest { message };
+        match self.client.request(&envelope).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error @ TransportError::NotSent(_)) => Err(ExchangeError::NotSent(error.into())),
+            Err(error) => Err(ExchangeError::Uncertain(error.into())),
+        }
+    }
+
+    async fn kind(
+        &self,
+        bytes: &[u8],
+    ) -> std::result::Result<swap_common::paykit_cap::v1::Message, ExchangeError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(unreadable)?;
+        let reply = swap_common::paykit_cap::v1::Message::parse(value).map_err(unreadable)?;
+        #[cfg(feature = "paykit")]
+        self.resolve_key(&reply).await;
+        Ok(reply)
+    }
+
+    /// Send `request`, as its kind when it has one, and translate the reply.
+    async fn send(&self, request: &SwapMessage) -> std::result::Result<SwapMessage, ExchangeError> {
+        let sent = self.cap().request(request);
+        let message = match &sent {
+            Some(sent) => serde_json::to_value(sent),
+            None => serde_json::to_value(request),
+        }
+        .map_err(|error| ExchangeError::NotSent(error.into()))?;
+        let bytes = self.request(message).await?;
+        match &sent {
+            Some(sent) => {
+                let reply = self.kind(&bytes).await?;
+                self.cap().reply(request, sent, reply).map_err(unreadable)
+            }
+            None => {
+                let reply: SwapMessage = serde_json::from_slice(&bytes).map_err(unreadable)?;
+                self.cap().observe(&reply);
+                Ok(reply)
+            }
+        }
+    }
+
+    /// Status by quote for a creation this client committed to, with the swap's terms from the
+    /// contract the provider signed rather than from the snapshot, which carries no signature.
+    /// The commit is sent again for it, and the provider answers that event with the contract it
+    /// signed first. `None` when no commit was sent for the quote.
+    async fn recover(
+        &self,
+        query: &SwapStatusRequest,
+    ) -> std::result::Result<Option<SwapMessage>, ExchangeError> {
+        use swap_common::paykit_cap::v1::Message;
+        let (None, Some(quote_id)) = (query.swap_id, query.quote_id) else {
+            return Ok(None);
+        };
+        let Some(commit) = self.cap().sent_commit(quote_id) else {
+            return Ok(None);
+        };
+        let message = serde_json::to_value(Message::Commit(Box::new(commit)))
+            .map_err(|error| ExchangeError::NotSent(error.into()))?;
+        let reply = self.kind(&self.request(message).await?).await?;
+        let reject = |code: String, reason: String| {
+            Ok(Some(SwapMessage::Reject(Reject {
+                code: Some(code),
+                request_id: query.request_id,
+                swap_id: None,
+                quote_id: Some(quote_id),
+                reason,
+            })))
+        };
+        let accept = match &reply {
+            Message::Contract(_) => self.cap().recovered(quote_id, &reply).map_err(unreadable)?,
+            Message::Status(_) => {
+                return reject(
+                    RejectCode::Pending.as_str().into(),
+                    "the swap is still being admitted".into(),
+                )
+            }
+            Message::Refusal(refusal) => {
+                return reject(refusal.body.code.clone(), refusal.body.reason.clone())
+            }
+            _ => return Err(unreadable("a reply of another kind")),
+        };
+        let mut reply = self
+            .send(&SwapMessage::SwapStatusRequest(query.clone()))
+            .await?;
+        if let SwapMessage::SwapStatusSnapshot(snapshot) = &mut reply {
+            snapshot.accept = accept;
+        }
+        Ok(Some(reply))
+    }
+}
+
+#[cfg(feature = "iroh")]
+fn unreadable(error: impl std::fmt::Display) -> ExchangeError {
+    ExchangeError::Uncertain(anyhow!("unreadable reply: {error}"))
 }
 
 #[cfg(feature = "iroh")]
@@ -430,41 +530,13 @@ impl Channel for CapV1Channel {
         request: &SwapMessage,
         expected: fn(&SwapMessage) -> bool,
     ) -> std::result::Result<SwapMessage, ExchangeError> {
-        use pubky_transport::TransportError;
-        let sent = self.cap().request(request);
-        let message = match &sent {
-            Some(sent) => serde_json::to_value(sent),
-            None => serde_json::to_value(request),
-        }
-        .map_err(|error| ExchangeError::NotSent(error.into()))?;
-        let envelope = pubky_transport::p2p::DirectRequest { message };
-        let bytes = match self.client.request(&envelope).await {
-            Ok(bytes) => bytes,
-            Err(error @ TransportError::NotSent(_)) => {
-                return Err(ExchangeError::NotSent(error.into()))
-            }
-            Err(error) => return Err(ExchangeError::Uncertain(error.into())),
+        let reply = match request {
+            SwapMessage::SwapStatusRequest(query) => self.recover(query).await?,
+            _ => None,
         };
-        let unreadable =
-            |error: String| ExchangeError::Uncertain(anyhow!("unreadable reply: {error}"));
-        let reply = match &sent {
-            Some(sent) => {
-                use swap_common::paykit_cap::v1::Message;
-                let value: serde_json::Value = serde_json::from_slice(&bytes)
-                    .map_err(|error| unreadable(error.to_string()))?;
-                let reply = Message::parse(value).map_err(|error| unreadable(error.to_string()))?;
-                #[cfg(feature = "paykit")]
-                self.resolve_key(&reply).await;
-                self.cap()
-                    .reply(request, sent, reply)
-                    .map_err(|error| unreadable(error.to_string()))?
-            }
-            None => {
-                let reply: SwapMessage = serde_json::from_slice(&bytes)
-                    .map_err(|error| unreadable(error.to_string()))?;
-                self.cap().observe(&reply);
-                reply
-            }
+        let reply = match reply {
+            Some(reply) => reply,
+            None => self.send(request).await?,
         };
         if reply_matches(request, &reply)
             && (matches!(reply, SwapMessage::Reject(_)) || expected(&reply))

@@ -46,7 +46,8 @@ pub(crate) struct CapState {
     /// The `version` wire's terms by `terms_hash`, held as long as the quote they answer.
     v1_terms: Mutex<HashMap<String, v1::Issued>>,
     /// The `version` wire's replies by sender and `event_id`, so a retry gets the same answer.
-    v1_replies: Mutex<std::collections::VecDeque<v1::Replied>>,
+    /// A std mutex, so an answer dropped by its timeout can clear its mark.
+    v1_replies: std::sync::Mutex<std::collections::VecDeque<v1::Replied>>,
     owner_keys: OwnerKeys,
 }
 
@@ -58,7 +59,7 @@ impl CapState {
             provider,
             terms: Mutex::new(HashMap::new()),
             v1_terms: Mutex::new(HashMap::new()),
-            v1_replies: Mutex::new(Default::default()),
+            v1_replies: std::sync::Mutex::new(Default::default()),
             owner_keys: published_owner_keys(),
         }
     }

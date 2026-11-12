@@ -1312,9 +1312,11 @@ mod direct_requests {
                 pubky_transport::identity_from_secret(&PROVIDER_SECRET),
             )
             .with_owner_keys(Arc::new(|_, generation| {
-                Box::pin(
-                    async move { Ok((generation == GENERATION).then(|| key(&OWNER_CAP_SECRET))) },
-                )
+                Box::pin(async move {
+                    // A lookup takes a while, so another try of the same event can arrive.
+                    tokio::task::yield_now().await;
+                    Ok((generation == GENERATION).then(|| key(&OWNER_CAP_SECRET)))
+                })
             }));
             ExecCtx {
                 cap: Arc::new(cap),
@@ -1583,6 +1585,72 @@ mod direct_requests {
             std::fs::remove_dir_all(directory).unwrap();
         }
 
+        /// Two tries of one event at once admit one swap. While the first is being answered,
+        /// the same bytes are told to wait and other bytes are refused.
+        #[tokio::test]
+        async fn an_event_tried_twice_at_once_is_admitted_once() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-race-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let mut first = commit(&quote, &terms, [71; 32], None);
+            first
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let mut other = commit(&quote, &terms, [72; 32], None);
+            other.event_id = first.event_id;
+            other
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let (first, other) = (as_commit(&first), as_commit(&other));
+            let (admitted, same, reused) = tokio::join!(
+                exchange(&ctx, &owner, &first),
+                exchange(&ctx, &owner, &first),
+                exchange(&ctx, &owner, &other),
+            );
+            assert!(
+                matches!(admitted, wire::Message::Contract(_)),
+                "{admitted:?}"
+            );
+            assert_eq!(refusal_code(&same), "pending");
+            assert_eq!(refusal_code(&reused), "invalid_request");
+            assert_eq!(
+                page(&ctx, &owner, None, None, false).await.snapshots.len(),
+                1
+            );
+            let retried = exchange(&ctx, &owner, &first).await;
+            assert_eq!(retried, admitted);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
+        /// A lost contract is fetched again by sending its commit again, and gets the bytes
+        /// first signed, after a restart, the quote's expiry and a rotation of the signing key.
+        #[cfg(feature = "paykit")]
+        #[tokio::test]
+        async fn a_replayed_commit_gets_its_first_contract_after_a_restart_and_a_rotation() {
+            let directory = std::env::temp_dir().join(format!("cap-v1-lost-{}", Uuid::new_v4()));
+            let ctx = ExecCtx {
+                quote_ttl_secs: 2,
+                ..provider(&directory)
+            };
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let commit = commit(&quote, &terms, [73; 32], None);
+            let first = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            assert!(matches!(first, wire::Message::Contract(_)), "{first:?}");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            // Restarted: the same store, an empty book, no replies or terms in memory, and a
+            // new signing key.
+            let ctx = provider(&directory);
+            assert!(ctx
+                .cap
+                .set_signer(Arc::new(Ed25519Signer::from_secret(&[74; 32])), 1));
+            let replayed = exchange(&ctx, &owner, &as_commit(&commit)).await;
+            assert_eq!(replayed, first);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
         /// An RFQ is a closed object with string amounts, on one of the provider's edges, at an
         /// atomicity `hash` meets. A commit's `owner_ref` is capped at 63 characters here.
         #[tokio::test]
@@ -1707,7 +1775,18 @@ mod direct_requests {
             // A retry is the same event, and gets the same contract.
             assert_eq!(client.request(&asked), Some(commit.clone()));
             let replayed = exchange(&ctx, &owner, &commit).await;
-            assert_eq!(replayed, wire::Message::Contract(contract));
+            assert_eq!(replayed, wire::Message::Contract(contract.clone()));
+            // Recovery sends that commit and checks the contract it gets like the first.
+            let wire::Message::Commit(sent) = &commit else {
+                unreachable!()
+            };
+            assert_eq!(client.sent_commit(quote.quote_id).as_ref(), Some(&**sent));
+            assert_eq!(client.recovered(quote.quote_id, &replayed).unwrap(), accept);
+            let mut forged = contract;
+            forged.body.swap_id = Uuid::new_v4();
+            assert!(client
+                .recovered(quote.quote_id, &wire::Message::Contract(forged))
+                .is_err());
             std::fs::remove_dir_all(directory).unwrap();
         }
 

@@ -34,7 +34,43 @@ pub(crate) struct Replied {
     event_id: Uuid,
     /// What the event said, so a different message reusing its id is not answered as a retry.
     digest: [u8; 32],
-    reply: Message,
+    /// `None` while the event is still being answered.
+    reply: Option<Message>,
+}
+
+/// Marks an event as being answered, and clears the mark unless an answer was kept for it,
+/// including when the answer is dropped by its timeout.
+struct InFlight<'a> {
+    cap: &'a CapState,
+    sender: &'a str,
+    event_id: Uuid,
+}
+
+impl InFlight<'_> {
+    fn keep(&self, reply: &Message) {
+        let mut replies = self
+            .cap
+            .v1_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = replies
+            .iter_mut()
+            .find(|r| names(r, self.sender, self.event_id))
+        {
+            kept.reply = Some(reply.clone());
+        }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        let mut replies = self
+            .cap
+            .v1_replies
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        replies.retain(|r| r.reply.is_some() || !names(r, self.sender, self.event_id));
+    }
 }
 
 impl CapState {
@@ -114,9 +150,10 @@ async fn answer(ctx: &ExecCtx, offer: SharedOffer, sender: &str, value: Value) -
             format!("this provider speaks version {VERSION} of {PROFILE}"),
         );
     }
-    if let Some(reply) = replayed(cap, sender, event_id, &digest).await {
-        return reply;
-    }
+    let in_flight = match begin(cap, sender, event_id, digest, envelope.flow_id) {
+        Ok(in_flight) => in_flight,
+        Err(reply) => return *reply,
+    };
     let reply = match message {
         Message::Rfq(rfq) => quote(ctx, offer, sender, rfq).await,
         Message::Commit(commit) => contract(ctx, offer, sender, *commit).await,
@@ -126,46 +163,61 @@ async fn answer(ctx: &ExecCtx, offer: SharedOffer, sender: &str, value: Value) -
     // A quote or a contract is the answer to that event. A refusal may not be: the same event
     // retried later can be admitted.
     if matches!(reply, Message::Quote(_) | Message::Contract(_)) {
-        let mut replies = cap.v1_replies.lock().await;
-        if replies.len() >= REPLIES_KEPT {
-            replies.pop_front();
-        }
-        replies.push_back(Replied {
-            sender: sender.to_string(),
-            event_id,
-            digest,
-            reply: reply.clone(),
-        });
+        in_flight.keep(&reply);
     }
     reply
 }
 
-/// The reply already sent to `event_id` from `sender`, or a refusal when the id is reused for
-/// another message.
-async fn replayed(
-    cap: &CapState,
-    sender: &str,
+/// Mark `event_id` from `sender` as being answered. A retry instead gets the reply already sent,
+/// or a refusal while the first try is still being answered or when the id names another
+/// message. The check and the mark share one lock, so two tries cannot both be admitted.
+fn begin<'a>(
+    cap: &'a CapState,
+    sender: &'a str,
     event_id: Uuid,
-    digest: &[u8; 32],
-) -> Option<Message> {
-    let replies = cap.v1_replies.lock().await;
-    let kept = replies
-        .iter()
-        .find(|r| r.event_id == event_id && pubky_transport::same_pubky(&r.sender, sender))?;
-    if kept.digest == *digest {
-        return Some(kept.reply.clone());
-    }
-    let flow_id = kept.reply.envelope().flow_id;
-    drop(replies);
-    Some(cap.refusal(
-        Answering {
+    digest: [u8; 32],
+    flow_id: Uuid,
+) -> Result<InFlight<'a>, Box<Message>> {
+    let mut replies = cap.v1_replies.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(kept) = replies.iter().find(|r| names(r, sender, event_id)) {
+        let to = Answering {
             flow_id,
             rfq: None,
             commit: None,
-        },
-        RejectCode::InvalidRequest,
-        "event_id already names another message",
-    ))
+        };
+        let reply = match (&kept.reply, kept.digest == digest) {
+            (Some(reply), true) => reply.clone(),
+            (None, true) => cap.refusal(
+                to,
+                RejectCode::Pending,
+                "this event is still being answered",
+            ),
+            (_, false) => cap.refusal(
+                to,
+                RejectCode::InvalidRequest,
+                "event_id already names another message",
+            ),
+        };
+        return Err(Box::new(reply));
+    }
+    if replies.len() >= REPLIES_KEPT {
+        replies.pop_front();
+    }
+    replies.push_back(Replied {
+        sender: sender.to_string(),
+        event_id,
+        digest,
+        reply: None,
+    });
+    Ok(InFlight {
+        cap,
+        sender,
+        event_id,
+    })
+}
+
+fn names(replied: &Replied, sender: &str, event_id: Uuid) -> bool {
+    replied.event_id == event_id && pubky_transport::same_pubky(&replied.sender, sender)
 }
 
 /// Run `message` through the engine as `sender` and read its one reply.
@@ -366,10 +418,10 @@ async fn contract(ctx: &ExecCtx, offer: SharedOffer, sender: &str, commit: Commi
     )
     .await;
     match reply {
-        Some(SwapMessage::SwapAccept(accept)) => match signed_contract(cap, &commit, &accept) {
+        Some(SwapMessage::SwapAccept(accept)) => match stored_contract(ctx, &commit, &accept) {
             Ok(contract) => Message::Contract(Box::new(contract)),
             Err(error) => {
-                warn!("could not sign a paykit-cap contract: {error}");
+                warn!("could not sign a paykit-cap contract: {error:#}");
                 refuse(
                     RejectCode::InternalError,
                     "could not sign the contract".into(),
@@ -459,15 +511,9 @@ async fn restore_quote(
     if ctx.quotes.lock().await.holds(body.quote_id) {
         return Ok(());
     }
-    let now = now_unix();
-    if terms.quote.valid_until <= now {
-        return Err((
-            RejectCode::QuoteExpired,
-            "the signed quote has expired".into(),
-        ));
-    }
     match crate::swap_for_quote(ctx.store.as_ref(), body.quote_id) {
         // The engine answers a replay of that swap from its record, and refuses anything else.
+        // Checked before expiry, so a lost contract can be fetched again after the quote ends.
         Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
         Err(error) => {
@@ -480,6 +526,13 @@ async fn restore_quote(
                 "could not check the quote".into(),
             ));
         }
+    }
+    let now = now_unix();
+    if terms.quote.valid_until <= now {
+        return Err((
+            RejectCode::QuoteExpired,
+            "the signed quote has expired".into(),
+        ));
     }
     let native = NativeQuote {
         request_id: None,
@@ -506,9 +559,35 @@ async fn restore_quote(
     Ok(())
 }
 
-/// The contract for `accept`. Signatures and the sealed invoice are deterministic, and the event
-/// id is derived from the commit's, so a replayed commit gets the same bytes while the signing
-/// key stands.
+/// The contract stored with the swap for this commit, signing and storing one first if there is
+/// none. The first one stored stands, so a replayed commit gets the bytes the first one got after
+/// a restart or a rotation.
+fn stored_contract(
+    ctx: &ExecCtx,
+    commit: &Commit,
+    accept: &SwapAccept,
+) -> anyhow::Result<Contract> {
+    let commit_hash = hex::encode(commit.commit_hash()?);
+    let stored = || -> anyhow::Result<Option<Contract>> {
+        Ok(ctx
+            .store
+            .get(accept.swap_id)?
+            .and_then(|record| record.cap_v1_contract)
+            .filter(|stored| stored.commit_hash == commit_hash))
+    };
+    if let Some(stored) = stored()? {
+        return Ok(stored);
+    }
+    let signed = signed_contract(&ctx.cap, commit, accept)?;
+    ctx.store.mutate(accept.swap_id, &mut |record| {
+        if record.cap_v1_contract.is_none() {
+            record.cap_v1_contract = Some(signed.clone());
+        }
+    })?;
+    Ok(stored()?.unwrap_or(signed))
+}
+
+/// The contract for `accept`. The event id is derived from the commit's.
 fn signed_contract(
     cap: &CapState,
     commit: &Commit,

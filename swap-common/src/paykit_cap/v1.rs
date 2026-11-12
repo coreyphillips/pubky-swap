@@ -800,24 +800,11 @@ impl Client {
                 Ok(SwapMessage::Quote(native))
             }
             (SwapMessage::SwapRequest(request), Message::Commit(commit), Message::Contract(c)) => {
-                if c.commit_event_id != commit.event_id
-                    || c.commit_hash != hex::encode(commit.commit_hash()?)
-                {
-                    return Err(CapError::HashMismatch("commit_hash"));
-                }
-                if c.envelope.flow_id != commit.envelope.flow_id {
-                    return Err(CapError::Unexpected("a contract for another flow"));
-                }
-                c.verify(&self.key(c.envelope.key_generation)?)?;
-                let (terms, _) = self
-                    .quotes
-                    .get(&request.quote_id)
-                    .ok_or(CapError::Unexpected("contract for an unsigned quote"))?;
-                let accept = c.open(terms)?;
-                if accept.quote_id != request.quote_id {
-                    return Err(CapError::Unexpected("contract for another quote"));
-                }
-                Ok(SwapMessage::SwapAccept(accept))
+                Ok(SwapMessage::SwapAccept(self.opened(
+                    request.quote_id,
+                    commit,
+                    &c,
+                )?))
             }
             (SwapMessage::SwapRequest(request), Message::Commit(commit), Message::Status(s))
                 if s.commit_event_id == Some(commit.event_id) =>
@@ -832,6 +819,54 @@ impl Client {
             }
             _ => Err(CapError::Unexpected("kind")),
         }
+    }
+
+    /// The commit sent for `quote_id`. A creation whose contract was lost sends it again, and the
+    /// provider answers the same event with the contract it signed first.
+    pub fn sent_commit(&self, quote_id: Uuid) -> Option<Commit> {
+        self.commits.get(&quote_id).cloned()
+    }
+
+    /// The swap a contract for the commit sent for `quote_id` accepts, once it checks out.
+    pub fn recovered(&self, quote_id: Uuid, reply: &Message) -> Result<SwapAccept, CapError> {
+        let commit = self
+            .commits
+            .get(&quote_id)
+            .ok_or(CapError::Unexpected("no commit was sent for this quote"))?;
+        match reply {
+            Message::Contract(c)
+                if c.envelope.profile == PROFILE && c.envelope.version == VERSION =>
+            {
+                self.opened(quote_id, commit, c)
+            }
+            _ => Err(CapError::Unexpected("kind")),
+        }
+    }
+
+    fn opened(
+        &self,
+        quote_id: Uuid,
+        commit: &Commit,
+        c: &Contract,
+    ) -> Result<SwapAccept, CapError> {
+        if c.commit_event_id != commit.event_id
+            || c.commit_hash != hex::encode(commit.commit_hash()?)
+        {
+            return Err(CapError::HashMismatch("commit_hash"));
+        }
+        if c.envelope.flow_id != commit.envelope.flow_id {
+            return Err(CapError::Unexpected("a contract for another flow"));
+        }
+        c.verify(&self.key(c.envelope.key_generation)?)?;
+        let (terms, _) = self
+            .quotes
+            .get(&quote_id)
+            .ok_or(CapError::Unexpected("contract for an unsigned quote"))?;
+        let accept = c.open(terms)?;
+        if accept.quote_id != quote_id {
+            return Err(CapError::Unexpected("contract for another quote"));
+        }
+        Ok(accept)
     }
 }
 

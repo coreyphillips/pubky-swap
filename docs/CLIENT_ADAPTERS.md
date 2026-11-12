@@ -344,14 +344,16 @@ The provider translates each kind into the same native request the older wire do
 - A commit's `sig` is optional on `direct/1` until Paykit v0.2, where the connection
   authenticates the owner. When present, it must verify under the capability signing key the
   owner's published delegation names for the envelope's `key_generation` (§5).
-- `contract` is signed afresh for a replay. Its signatures, sealed invoice and `event_id` are
-  derived from the commit, so a replay gets the same bytes while the provider's key stands.
+- `contract` is stored with the swap record when first signed. A replayed commit gets those bytes,
+  including after a restart, the quote's expiry or a key rotation. `CapV1Channel` recovers a lost
+  contract by sending its commit again, so the terms it keeps are ones the provider signed.
 - `status_request` answers with a `status` whose `state` is the leg status above and whose
   `detail` is the `SwapState`. `SwapListRequest`, `SwapWakeCapability` and a status query that
   needs the full snapshot stay native `SwapMessage`s on `direct/1`.
 
-A retried `rfq` or `commit` with the same `event_id` and bytes gets the reply first sent. The
-same `event_id` on different bytes is refused. The identity key signs as generation 0, which no
+A retried `rfq` or `commit` with the same `event_id` and bytes gets the reply first sent, or
+`pending` while the first try is still being answered. The same `event_id` on different bytes is
+refused. The identity key signs as generation 0, which no
 delegation names. The provider sends `status` only in reply: `direct/1` gives it no way to reach
 the owner first.
 
