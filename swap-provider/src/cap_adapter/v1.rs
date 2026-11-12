@@ -372,7 +372,14 @@ async fn contract(ctx: &ExecCtx, offer: SharedOffer, sender: &str, commit: Commi
         Ok(terms) => terms,
         Err((code, reason)) => return refuse(code, reason),
     };
-    if commit.sig.is_some() {
+    // A signature is checked when its commit is admitted. A replay of that commit only fetches
+    // the contract already stored for it, so it is not checked again: the owner's delegation
+    // may have moved on to a generation that no longer names the key it was signed with.
+    let replayed = match contracted(ctx, &commit, &terms) {
+        Ok(replayed) => replayed,
+        Err((code, reason)) => return refuse(code, reason),
+    };
+    if commit.sig.is_some() && !replayed {
         // Generation 0 is the root key the connection authenticated, as it is for the provider.
         let key = match commit.envelope.key_generation {
             0 => pubky_transport::p2p::pubky_to_endpoint_id(sender)

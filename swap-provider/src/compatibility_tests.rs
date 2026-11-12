@@ -1661,6 +1661,49 @@ mod direct_requests {
             std::fs::remove_dir_all(directory).unwrap();
         }
 
+        /// A signed commit is checked when it is admitted. Sent again after a restart, once the
+        /// owner publishes only its next generation's key, it still gets its first contract,
+        /// while a new commit signed under the old generation is refused.
+        #[tokio::test]
+        async fn a_replayed_signed_commit_gets_its_contract_after_the_owner_rotates() {
+            let directory =
+                std::env::temp_dir().join(format!("cap-v1-owner-rotated-{}", Uuid::new_v4()));
+            let ctx = provider(&directory);
+            let owner = pubky_transport::identity_from_secret(&[61; 32]);
+            let (quote, terms) = quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let mut signed = commit(&quote, &terms, [76; 32], None);
+            signed
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let first = exchange(&ctx, &owner, &as_commit(&signed)).await;
+            assert!(matches!(first, wire::Message::Contract(_)), "{first:?}");
+
+            // Restarted, with no replies or terms in memory, and the owner's delegation now
+            // names only the next generation's key.
+            let rotated = crate::cap_adapter::CapState::new(
+                Arc::new(Ed25519Signer::from_secret(&PROVIDER_SECRET)),
+                pubky_transport::identity_from_secret(&PROVIDER_SECRET),
+            )
+            .with_owner_keys(Arc::new(|_, generation| {
+                Box::pin(async move { Ok((generation == GENERATION + 1).then(|| key(&[77; 32]))) })
+            }));
+            let ctx = ExecCtx {
+                cap: Arc::new(rotated),
+                ..provider(&directory)
+            };
+            let replayed = exchange(&ctx, &owner, &as_commit(&signed)).await;
+            assert_eq!(replayed, first);
+
+            let (quote, terms) = self::quote(&ctx, &owner, &rfq(Uuid::new_v4())).await;
+            let mut stale = commit(&quote, &terms, [78; 32], None);
+            stale
+                .sign(&Ed25519Signer::from_secret(&OWNER_CAP_SECRET))
+                .unwrap();
+            let reply = exchange(&ctx, &owner, &as_commit(&stale)).await;
+            assert_eq!(refusal_code(&reply), "invalid_request");
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+
         /// An RFQ is a closed object with string amounts, on one of the provider's edges, at an
         /// atomicity `hash` meets. A commit's `owner_ref` is capped at 63 characters here.
         #[tokio::test]

@@ -779,13 +779,18 @@ impl Client {
                     &terms.hash()?,
                     &quote.sig,
                 )?;
+                let fee_sat = body
+                    .service_fee_sat
+                    .0
+                    .checked_add(body.onchain_fee_sat.0)
+                    .ok_or(CapError::Unexpected("a quote whose fees overflow"))?;
                 let native = crate::messages::Quote {
                     request_id: request.request_id,
                     quote_id: body.quote_id,
                     offer_id: body.offer_id,
                     direction: body.dir,
                     amount_sat: body.amount_sat.0,
-                    fee_sat: body.service_fee_sat.0 + body.onchain_fee_sat.0,
+                    fee_sat,
                     service_fee_sat: body.service_fee_sat.0,
                     onchain_fee_sat: body.onchain_fee_sat.0,
                     fee_rate_sat_vb: self.fee_rate_sat_vb,
