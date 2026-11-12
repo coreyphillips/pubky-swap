@@ -63,6 +63,7 @@ does not know. Treat either as a generic decline.
 The first eight are refusal reasons from the Paykit Intents draft, with its retry hints.
 `not_found` and `pending` answer status queries and creation replays, not intents. The last five
 have no Paykit equivalent, and an adapter reports them as its generic decline.
+`atomicity_unsupported` is Capabilities §12.1's and answers only a §13.1 `rfq`.
 
 | `code` | Sent when | Paykit | Retry |
 | --- | --- | --- | --- |
@@ -80,6 +81,7 @@ have no Paykit equivalent, and an adapter reports them as its generic decline.
 | `invalid_request` | The request is malformed, names another pubky, reuses a payment hash, changes an accepted request, carries an `owner_ref` the provider will not keep, or a listing cursor it did not issue | generic decline | Fix the request |
 | `unsupported_protocol` | `protocol_version` is outside what the provider speaks | generic decline | Other provider |
 | `offer_stale` | `offer_id` names an offer that is no longer current | generic decline | Fetch the offer, then quote again |
+| `atomicity_unsupported` | A §13.1 `rfq` names an `atomicity_min` that `hash` does not meet | generic decline | Ask another provider |
 | `internal_error` | The provider failed for its own reasons | generic decline | Later |
 
 The draft's `amount_below_minimum {min}` and `amount_above_maximum {max}` take a number. The offer
@@ -318,6 +320,41 @@ signed quote is about 1,350 bytes, and a signed contract is over too: with the P
 Taproot tree the provider always sends, it is 1,048 to 1,208 bytes. A `status` reply carries the
 full snapshot and contract, and is larger still. #119 tracks fitting them into an Encrypted
 Link.
+
+### The Capabilities §13.1 wire
+
+`swap_common::paykit_cap::v1` holds the messages as the Capabilities spec at `ff91058` defines
+them (#130). A message with `version` belongs to this wire, and anything else to the one above.
+The provider does not answer it yet, so Bitkit's current client is unaffected.
+
+Every message is a closed object: the §8.1 envelope (`version`, `kind`, `app_id`, `profile`,
+`flow_id`, `key_generation`, `event_id`), a `body` with exactly the §13.1 members, and the members
+its kind adds. Replies name `rfq_event_id`, `quote_event_id` or `commit_event_id`. Amounts are
+integer strings, and a JSON number is refused. Times are integer Unix seconds.
+
+| Hash | Preimage after `domain \|\| 0x00` |
+| --- | --- |
+| `terms_hash` | `paykit-cap/terms/v1`, the closed §10.1 terms: both identities and key generations, `profile`, `flow_id`, and the RFQ and quote without their envelopes |
+| `commit_hash` | `paykit-cap/commit/v1`, `{"terms_hash": <hex>, "body": <commit body>}` |
+| `contract_hash` | `paykit-cap/contract/v1`, `{"commit_hash": <hex>, "body": <contract body>}` |
+
+`sig` is unpadded base64url Ed25519 over the hash. There is no `signer` member: the verifier
+takes the key for the generation the terms name. A commit may carry the owner's `sig` over
+`commit_hash`, and its `quote` is `{"terms", "sig"}`. `owner_ref` is at most 63 characters here,
+against 128 on the native wire.
+
+Golden vectors, from `swap-common/src/paykit_cap/v1/tests.rs` (`golden_vectors`), for provider
+secret `[7; 32]` and owner secret `[5; 32]`. They were recomputed with Python's `hashlib`,
+`json.dumps(sort_keys=True, separators=(",", ":"))` and the `cryptography` package's Ed25519 and
+ChaCha20-Poly1305.
+
+| | Value |
+| --- | --- |
+| `terms_hash` | `4c32d3578f045773722fed947b2eb96a24f8fc121849ef7f0693360296a3d09a` |
+| `commit_hash` | `15d9bbd6897899436832098511a005b09416382fb0f738243f50f2811d0b3ed8` |
+| `contract_hash` | `69bd1e0b884e7b899dcf545d7ddb03a3b4493111ba30a4e474a2a55c27719b0a` |
+| quote `sig` | `88lM3ZBiyGdRaTgJJRc7Acl3-95rJRewG6VxBbvwsyDmEo71emSJ4FWh5XssLGLI6Y_K6yYu448hIRwh1eyHBg` |
+| commit `sig` | `6ytH3iV_uRDey-a6GQlFnK8knILJxljX6Jc8Y0gjQP74VEGG9p6-SyrWN8IqHMdFSGyhsoR3LgMbGTMTmim2Dw` |
 
 ## The swap/1 Capability Descriptor
 

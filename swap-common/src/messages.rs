@@ -638,12 +638,14 @@ pub enum RejectCode {
     UnsupportedProtocol,
     /// The request names an offer that is no longer current.
     OfferStale,
+    /// The RFQ's `atomicity_min` is a class `hash` does not meet (Capabilities §12.1).
+    AtomicityUnsupported,
     /// The provider failed for a reason of its own.
     InternalError,
 }
 
 impl RejectCode {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::NotFound,
         Self::Pending,
         Self::AccessDenied,
@@ -658,6 +660,7 @@ impl RejectCode {
         Self::InvalidRequest,
         Self::UnsupportedProtocol,
         Self::OfferStale,
+        Self::AtomicityUnsupported,
         Self::InternalError,
     ];
 
@@ -678,6 +681,7 @@ impl RejectCode {
             Self::InvalidRequest => "invalid_request",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::OfferStale => "offer_stale",
+            Self::AtomicityUnsupported => "atomicity_unsupported",
             Self::InternalError => "internal_error",
         }
     }
