@@ -165,6 +165,18 @@ fn messages_are_closed_and_amounts_are_strings() {
         Message::Quote(quote()),
         Message::Commit(Box::new(commit())),
         Message::Contract(Box::new(contract())),
+        Message::Status(Status {
+            envelope: Envelope::new(PROVIDER_APP_ID, uuid(4), 2),
+            event_id: uuid(10),
+            commit_event_id: Some(uuid(6)),
+            leg: 0,
+            body: StatusBody {
+                swap_id: uuid(8),
+                state: "in_transit".into(),
+                detail: "lockup_confirmed".into(),
+                reference: None,
+            },
+        }),
     ] {
         let value = serde_json::to_value(&message).unwrap();
         assert_eq!(value["version"], 1);

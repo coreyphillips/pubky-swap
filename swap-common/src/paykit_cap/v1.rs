@@ -320,6 +320,8 @@ pub struct Status {
     pub event_id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_event_id: Option<Uuid>,
+    /// Always 0: §13.1 makes one swap one leg.
+    pub leg: u32,
     pub body: StatusBody,
 }
 
