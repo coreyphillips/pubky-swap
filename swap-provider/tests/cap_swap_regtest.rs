@@ -208,13 +208,23 @@ async fn negotiator_when_ready(
     provider: &str,
     daemon: &Daemon,
 ) -> (Negotiator<Preferred, DmChannel>, String) {
+    negotiator_for(client_phrase, provider, daemon, Negotiation::PaykitCap).await
+}
+
+/// [`negotiator_when_ready`] in either `paykit-cap` wire.
+async fn negotiator_for(
+    client_phrase: &str,
+    provider: &str,
+    daemon: &Daemon,
+    negotiation: Negotiation,
+) -> (Negotiator<Preferred, DmChannel>, String) {
     let deadline = Instant::now() + READY_WITHIN;
     loop {
         assert!(!daemon.is_finished(), "the provider daemon exited");
         let (negotiator, client) = connect(
             &phrase_identity(client_phrase),
             provider,
-            Negotiation::PaykitCap,
+            negotiation,
             false,
         )
         .await
@@ -345,6 +355,16 @@ async fn finish_reverse(
     data_dir: &std::path::Path,
     provider: &str,
 ) {
+    let record = settle_reverse(accept, keys, data_dir).await;
+    assert_signed_contract(&record, accept, provider);
+}
+
+/// [`finish_reverse`] without the stored contract, which only the older wire keeps.
+async fn settle_reverse(
+    accept: &SwapAccept,
+    keys: ReverseKeys,
+    data_dir: &std::path::Path,
+) -> swap_common::store::SwapRecord {
     let htlc_spk = verify_contract(
         accept,
         SwapDirection::Reverse,
@@ -412,7 +432,7 @@ async fn finish_reverse(
         InvoiceState::Settled,
         "the provider settled its hold invoice with the revealed preimage"
     );
-    assert_signed_contract(&record, accept, provider);
+    record
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -444,6 +464,50 @@ async fn cap_reverse_swap_two_nodes() {
     finish_reverse(&accept, keys, &data_dir, &provider).await;
     drop(daemon);
     println!("paykit-cap reverse swap: claimed, invoice settled, signed contract verified");
+}
+
+/// #130: the same reverse swap in the `version` wire of Capabilities §13.1. The client checks
+/// the quote's terms and the contract's hashes under the provider's key for the generation each
+/// names, and the provider takes the claimable hint without any `features`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires two LND nodes with a channel + bitcoind + electrs, and n0 discovery"]
+async fn cap_v1_reverse_swap_two_nodes() {
+    init_tracing();
+    let provider_phrase =
+        "jelly better achieve collect unaware mountain thought cargo oxygen act hood bridge";
+    let client_phrase = "creek office smoke grid creek office smoke grid creek office smoke guard";
+    let provider = pubky_of(provider_phrase);
+    let data_dir = temp_dir("v1-reverse-provider");
+    let daemon = start_provider(provider_phrase, &data_dir);
+    let (negotiator, client) = negotiator_for(
+        client_phrase,
+        &provider,
+        &daemon,
+        Negotiation::PaykitCapCore,
+    )
+    .await;
+    let quote = negotiator
+        .quote(&quote_request(&client, SwapDirection::Reverse))
+        .await
+        .expect("signed quote");
+    assert_eq!(quote.fee_sat, quote.service_fee_sat + quote.onchain_fee_sat);
+    let keys = reverse_keys();
+    let mut request = reverse_request(&client, quote.quote_id, &keys);
+    request.owner_ref = Some("k".repeat(58));
+    let accept = negotiator.create(&request).await.expect("signed contract");
+    negotiator.close().await;
+
+    let record = settle_reverse(&accept, keys, &data_dir).await;
+    assert!(
+        record.claimable_hint,
+        "every reverse owner on this wire takes the hint"
+    );
+    assert_eq!(
+        record.swap_request.and_then(|r| r.owner_ref),
+        request.owner_ref
+    );
+    drop(daemon);
+    println!("paykit-cap v1 reverse swap: claimed, invoice settled, quote and contract verified");
 }
 
 /// #103: the provider restarts between the quote and the commit. Its quote book is empty after

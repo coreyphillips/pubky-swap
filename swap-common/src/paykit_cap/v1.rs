@@ -9,7 +9,7 @@
 //! module, which the provider still answers until every client has moved.
 
 use super::{jcs, CapError, CapSigner, InvoiceBlob};
-use crate::messages::{SwapAccept, SwapScript};
+use crate::messages::{Reject, SwapAccept, SwapMessage, SwapScript};
 use crate::SwapDirection;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -593,3 +593,262 @@ pub fn is_edge(offer: &crate::messages::SwapOffer, body: &RfqBody) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// The App ID the client puts in its envelopes.
+pub const CLIENT_APP_ID: &str = "pubky-swap-client";
+
+/// The on-chain format a reverse RFQ asks to receive and a submarine one pays from. The provider
+/// takes any format on its rail.
+const CLIENT_ONCHAIN_FORMAT: &str = "p2wpkh";
+
+/// Client-side translation for this wire: [`SwapMessage`] requests into kinds, and replies back
+/// after their signatures and hashes check out. Offers, listings, wake grants and status queries
+/// stay native [`SwapMessage`]s, which a `paykit-cap.status` cannot stand in for.
+#[derive(Debug)]
+pub struct Client {
+    owner: String,
+    provider: String,
+    /// The owner's generation in every envelope. 0 is a root key with no delegation, whose
+    /// commits go unsigned.
+    key_generation: u64,
+    /// The provider's signing key by generation: the key the client dialed at 0, and any
+    /// capability signing key whose delegation the caller checked.
+    provider_keys: Vec<(u64, [u8; 32])>,
+    /// The offer's network, which names the edges an RFQ asks for.
+    network: Option<crate::swap::NetworkSpec>,
+    /// The offer's on-chain fee rate, which the profile's quote does not carry.
+    fee_rate_sat_vb: u64,
+    /// Each RFQ sent, by request id, so a retry is the same event.
+    rfqs: std::collections::HashMap<Uuid, Rfq>,
+    /// Each quote taken: its terms and the quote message, by quote id.
+    quotes: std::collections::HashMap<Uuid, (Terms, Quote)>,
+    /// The commit sent for each quote, so a replay is the same event.
+    commits: std::collections::HashMap<Uuid, Commit>,
+}
+
+impl Client {
+    pub fn new(owner: String, provider: String, provider_root_key: Option<[u8; 32]>) -> Self {
+        Self {
+            owner,
+            provider,
+            key_generation: 0,
+            provider_keys: provider_root_key.map(|key| (0, key)).into_iter().collect(),
+            network: None,
+            fee_rate_sat_vb: 0,
+            rfqs: Default::default(),
+            quotes: Default::default(),
+            commits: Default::default(),
+        }
+    }
+
+    /// Note the offer, whose network an RFQ's edges name.
+    pub fn observe(&mut self, reply: &SwapMessage) {
+        if let SwapMessage::Offer(offer) = reply {
+            self.network = Some(offer.network);
+            self.fee_rate_sat_vb = offer.fee_rate_sat_vb;
+        }
+    }
+
+    /// Accept `key` as the provider's for `generation`, once its delegation has been checked.
+    pub fn allow_key(&mut self, generation: u64, key: [u8; 32]) {
+        self.provider_keys.retain(|(g, _)| *g != generation);
+        self.provider_keys.push((generation, key));
+    }
+
+    /// The provider generation a reply is signed under, when this client has no key for it.
+    pub fn missing_key(&self, reply: &Message) -> Option<u64> {
+        let generation = match reply {
+            Message::Quote(_) | Message::Contract(_) => reply.envelope().key_generation,
+            _ => return None,
+        };
+        self.key(generation).is_err().then_some(generation)
+    }
+
+    fn key(&self, generation: u64) -> Result<[u8; 32], CapError> {
+        self.provider_keys
+            .iter()
+            .find(|(g, _)| *g == generation)
+            .map(|(_, key)| *key)
+            .ok_or(CapError::UnexpectedSigner)
+    }
+
+    fn envelope(&self, flow_id: Uuid) -> Envelope {
+        Envelope::new(CLIENT_APP_ID, flow_id, self.key_generation)
+    }
+
+    /// The kind to send for `request`. `None` means send it as a plain [`SwapMessage`].
+    pub fn request(&mut self, request: &SwapMessage) -> Option<Message> {
+        match request {
+            SwapMessage::QuoteRequest(request) => {
+                if let Some(sent) = request.request_id.and_then(|id| self.rfqs.get(&id)) {
+                    return Some(Message::Rfq(sent.clone()));
+                }
+                let rail = crate::cap_descriptor::onchain_rail(self.network?);
+                let onchain = format!("btc-{rail}-{CLIENT_ONCHAIN_FORMAT}");
+                let lightning = crate::cap_descriptor::LIGHTNING_IDENTIFIER.to_string();
+                let (from, to) = match request.direction {
+                    SwapDirection::Reverse => (lightning, onchain),
+                    SwapDirection::Submarine => (onchain, lightning),
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let rfq = Rfq {
+                    envelope: self.envelope(Uuid::new_v4()),
+                    event_id: request.request_id.unwrap_or_else(Uuid::new_v4),
+                    body: RfqBody {
+                        offer_id: request.offer_id,
+                        dir: request.direction,
+                        from,
+                        to,
+                        amount_sat: Sat(request.amount_sat),
+                    },
+                    atomicity_min: ATOMICITY.into(),
+                    respond_by: now + 60,
+                    valid_until: now + 300,
+                };
+                if let Some(id) = request.request_id {
+                    self.rfqs.insert(id, rfq.clone());
+                }
+                Some(Message::Rfq(rfq))
+            }
+            SwapMessage::SwapRequest(request) => {
+                let body = commit_body(request);
+                if let Some(sent) = self.commits.get(&request.quote_id) {
+                    if sent.body == body {
+                        return Some(Message::Commit(Box::new(sent.clone())));
+                    }
+                }
+                let (terms, quote) = self.quotes.get(&request.quote_id)?;
+                let commit = Commit {
+                    envelope: self.envelope(terms.flow_id),
+                    event_id: Uuid::new_v4(),
+                    quote_event_id: quote.event_id,
+                    terms_hash: hex::encode(terms.hash().ok()?),
+                    body,
+                    quote: Some(SignedTerms {
+                        terms: terms.clone(),
+                        sig: quote.sig.clone(),
+                    }),
+                    sig: None,
+                };
+                self.commits.insert(request.quote_id, commit.clone());
+                Some(Message::Commit(Box::new(commit)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Check `reply` against `request` and `sent`, the kind sent for it, and translate it.
+    pub fn reply(
+        &mut self,
+        request: &SwapMessage,
+        sent: &Message,
+        reply: Message,
+    ) -> Result<SwapMessage, CapError> {
+        if reply.envelope().profile != PROFILE || reply.envelope().version != VERSION {
+            return Err(CapError::Unexpected("a reply under another profile"));
+        }
+        match (request, sent, reply) {
+            (_, _, Message::Refusal(refusal)) => Ok(SwapMessage::Reject(Reject {
+                code: Some(refusal.body.code),
+                request_id: request_id(request),
+                swap_id: None,
+                quote_id: match request {
+                    SwapMessage::SwapRequest(request) => Some(request.quote_id),
+                    _ => None,
+                },
+                reason: refusal.body.reason,
+            })),
+            (SwapMessage::QuoteRequest(request), Message::Rfq(rfq), Message::Quote(quote)) => {
+                if quote.rfq_event_id != rfq.event_id
+                    || quote.envelope.flow_id != rfq.envelope.flow_id
+                {
+                    return Err(CapError::Unexpected("a quote for another rfq"));
+                }
+                let body = &quote.body;
+                if body.dir != rfq.body.dir
+                    || body.amount_sat != rfq.body.amount_sat
+                    || (!rfq.body.offer_id.is_nil() && body.offer_id != rfq.body.offer_id)
+                {
+                    return Err(CapError::Unexpected("a quote on other terms than asked"));
+                }
+                let terms = terms(&self.owner, rfq, &self.provider, &quote);
+                verify(
+                    &self.key(quote.envelope.key_generation)?,
+                    &terms.hash()?,
+                    &quote.sig,
+                )?;
+                let native = crate::messages::Quote {
+                    request_id: request.request_id,
+                    quote_id: body.quote_id,
+                    offer_id: body.offer_id,
+                    direction: body.dir,
+                    amount_sat: body.amount_sat.0,
+                    fee_sat: body.service_fee_sat.0 + body.onchain_fee_sat.0,
+                    service_fee_sat: body.service_fee_sat.0,
+                    onchain_fee_sat: body.onchain_fee_sat.0,
+                    fee_rate_sat_vb: self.fee_rate_sat_vb,
+                    total_sat: body.total_sat.0,
+                    htlc_timeout_blocks: body.htlc_timeout_blocks,
+                    required_confirmations: body.required_confirmations,
+                    valid_until_unix: quote.valid_until,
+                    fund_within_secs: body.fund_within_secs,
+                    protocol_version: crate::messages::PROTOCOL_VERSION,
+                };
+                self.quotes.insert(body.quote_id, (terms, quote));
+                Ok(SwapMessage::Quote(native))
+            }
+            (SwapMessage::SwapRequest(request), Message::Commit(commit), Message::Contract(c)) => {
+                if c.commit_event_id != commit.event_id
+                    || c.commit_hash != hex::encode(commit.commit_hash()?)
+                {
+                    return Err(CapError::HashMismatch("commit_hash"));
+                }
+                if c.envelope.flow_id != commit.envelope.flow_id {
+                    return Err(CapError::Unexpected("a contract for another flow"));
+                }
+                c.verify(&self.key(c.envelope.key_generation)?)?;
+                let (terms, _) = self
+                    .quotes
+                    .get(&request.quote_id)
+                    .ok_or(CapError::Unexpected("contract for an unsigned quote"))?;
+                let accept = c.open(terms)?;
+                if accept.quote_id != request.quote_id {
+                    return Err(CapError::Unexpected("contract for another quote"));
+                }
+                Ok(SwapMessage::SwapAccept(accept))
+            }
+            (SwapMessage::SwapRequest(request), Message::Commit(commit), Message::Status(s))
+                if s.commit_event_id == Some(commit.event_id) =>
+            {
+                Ok(SwapMessage::Reject(Reject {
+                    code: Some(crate::messages::RejectCode::Pending.as_str().into()),
+                    request_id: None,
+                    swap_id: Some(s.body.swap_id),
+                    quote_id: Some(request.quote_id),
+                    reason: "the swap is still being admitted".into(),
+                }))
+            }
+            _ => Err(CapError::Unexpected("kind")),
+        }
+    }
+}
+
+fn commit_body(request: &crate::messages::SwapRequest) -> CommitBody {
+    CommitBody {
+        lock_profile: request.script_type,
+        payment_hash: request.payment_hash_hex.clone(),
+        claim_pubkey: request.client_claim_pubkey_hex.clone(),
+        refund_pubkey: request.client_refund_pubkey_hex.clone(),
+        invoice: request.invoice.clone(),
+        owner_ref: request.owner_ref.clone(),
+    }
+}
+
+fn request_id(request: &SwapMessage) -> Option<Uuid> {
+    match request {
+        SwapMessage::QuoteRequest(request) => request.request_id,
+        _ => None,
+    }
+}

@@ -325,7 +325,35 @@ Link.
 
 `swap_common::paykit_cap::v1` holds the messages as the Capabilities spec at `ff91058` defines
 them (#130). A message with `version` belongs to this wire, and anything else to the one above.
-The provider does not answer it yet, so Bitkit's current client is unaffected.
+The provider answers both over `direct/1`, so Bitkit's current client is unaffected. The CLI
+client speaks this wire with `--negotiation paykit-cap-core`, through
+`swap_client::negotiate::CapV1Channel`.
+
+The provider translates each kind into the same native request the older wire does:
+
+- `rfq` becomes a `QuoteRequest`. One whose `from` and `to` are not one of the offer's edges is
+  refused with `unsupported_route`, and an `atomicity_min` outside §11 with
+  `atomicity_unsupported`. A reverse RFQ always opts in to `claimable-hint-v1`, since the RFQ has
+  no `features`, so the owner's `SwapWakeCapability` is taken.
+- `quote` carries `service_fee_sat` and `onchain_fee_sat`, whose sum is the native `fee_sat`.
+  `fee_rate_sat_vb` is not in the profile, so a client reads it from the offer.
+- `commit` names its terms by `terms_hash`. Terms the provider no longer holds are taken from the
+  commit's `quote` once the provider's `sig` checks out under its key for
+  `provider_key_generation`, so a contract stored before a rotation still verifies. A commit
+  without either is refused with `quote_expired`.
+- A commit's `sig` is optional on `direct/1` until Paykit v0.2, where the connection
+  authenticates the owner. When present, it must verify under the capability signing key the
+  owner's published delegation names for the envelope's `key_generation` (§5).
+- `contract` is signed afresh for a replay. Its signatures, sealed invoice and `event_id` are
+  derived from the commit, so a replay gets the same bytes while the provider's key stands.
+- `status_request` answers with a `status` whose `state` is the leg status above and whose
+  `detail` is the `SwapState`. `SwapListRequest`, `SwapWakeCapability` and a status query that
+  needs the full snapshot stay native `SwapMessage`s on `direct/1`.
+
+A retried `rfq` or `commit` with the same `event_id` and bytes gets the reply first sent. The
+same `event_id` on different bytes is refused. The identity key signs as generation 0, which no
+delegation names. The provider sends `status` only in reply: `direct/1` gives it no way to reach
+the owner first.
 
 Every message is a closed object: the §8.1 envelope (`version`, `kind`, `app_id`, `profile`,
 `flow_id`, `key_generation`, `event_id`), a `body` with exactly the §13.1 members, and the members
@@ -447,9 +475,9 @@ was recomputed independently from Paykit KDF v1 and §5 with Python's `blake3` a
 {"key_generation":1,"kind":"paykit-cap.signing_key","owner":"7jfgaa9nutjyixzikb7tgmsf9gkwq7iqz498zr1nd5ig1fng4esy","sig":"Sj9Xps4rjkmNrqYv4EU8OuD7gyN4LGNb1SyAbjv0p9PEEg7HekF6unysSnkPRXDn_k9XOBHmll3-Xdo2xkrtAQ","signing_key":"7TrkHFnQPW67doNM4TipjT9CmZygnHHbriRjgBb4Ry8","version":1}
 ```
 
-What this does not cover yet: `paykit-cap` messages carry no `key_generation` until the §8.1
-envelope lands, so a client checks a signer against the currently published generation only. A
-contract stored before a rotation, signed by the older generation's key, fails that check.
+On the older wire, messages carry no `key_generation`, so a client checks a signer against the
+currently published generation only, and a contract stored before a rotation fails that check.
+The §13.1 wire names the generation in every envelope and in the terms, and has no such limit.
 
 ## Amounts and fees
 

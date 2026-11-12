@@ -536,6 +536,17 @@ impl SignedQuote {
     }
 }
 
+/// `accept`'s hold invoice sealed under a key derived from a signature by `signer`, so sealing it
+/// again gives the same blob.
+pub fn seal_invoice(signer: &dyn CapSigner, accept: &SwapAccept) -> Option<InvoiceBlob> {
+    accept.invoice.as_deref().map(|invoice| {
+        let mut message = BLOB_KEY_DOMAIN.to_vec();
+        message.extend(accept.swap_id.as_bytes());
+        let key = sha256::Hash::hash(&signer.sign(&message)).to_byte_array();
+        InvoiceBlob::seal(key, invoice)
+    })
+}
+
 /// Sign a contract for `accept`. The same inputs give the same bytes: Ed25519 signatures are
 /// deterministic and the blob key is derived from a signature, so a contract signed again after
 /// a crash matches the one first sent.
@@ -546,12 +557,7 @@ pub fn sign_contract(
     accept: &SwapAccept,
 ) -> Result<ContractReply, CapError> {
     let commit_hash = hex::encode(commit_hash(terms_hash_hex, commit)?);
-    let invoice_blob = accept.invoice.as_deref().map(|invoice| {
-        let mut message = BLOB_KEY_DOMAIN.to_vec();
-        message.extend(accept.swap_id.as_bytes());
-        let key = sha256::Hash::hash(&signer.sign(&message)).to_byte_array();
-        InvoiceBlob::seal(key, invoice)
-    });
+    let invoice_blob = seal_invoice(signer, accept);
     let contract = ContractBody {
         accept: SwapAccept {
             invoice: None,

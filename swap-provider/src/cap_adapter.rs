@@ -18,27 +18,56 @@ struct IssuedTerms {
     expires_at_unix: u64,
 }
 
+/// The capability signing key `owner` holds for a key generation, through its published Noise
+/// Key Authorization and delegation (Capabilities §5). `None` when it publishes none for that
+/// generation.
+pub(crate) type OwnerKeys = Arc<
+    dyn Fn(
+            String,
+            u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<Option<[u8; 32]>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
 pub(crate) struct CapState {
     /// The key quotes, contracts and the descriptor are signed with now. It starts as the
     /// identity key and becomes the capability signing key once its delegation is published.
     signer: RwLock<Arc<dyn CapSigner>>,
-    /// Every key this run has signed with, newest last. A quote signed just before the signer
-    /// changed is still this provider's own when its commit arrives.
-    own_keys: RwLock<Vec<String>>,
+    /// Every key this run has signed with and its generation, newest last. A quote signed just
+    /// before the signer changed is still this provider's own when its commit arrives. The
+    /// identity key is generation 0, which no delegation names.
+    own_keys: RwLock<Vec<(u64, String)>>,
     /// This provider's pubky, which every quote it signs names beside the owner's.
     provider: String,
     terms: Mutex<HashMap<Uuid, IssuedTerms>>,
+    /// The `version` wire's terms by `terms_hash`, held as long as the quote they answer.
+    v1_terms: Mutex<HashMap<String, v1::Issued>>,
+    /// The `version` wire's replies by sender and `event_id`, so a retry gets the same answer.
+    v1_replies: Mutex<std::collections::VecDeque<v1::Replied>>,
+    owner_keys: OwnerKeys,
 }
 
 impl CapState {
     pub(crate) fn new(signer: Arc<dyn CapSigner>, provider: String) -> Self {
         Self {
-            own_keys: RwLock::new(vec![signer.public_key_hex()]),
+            own_keys: RwLock::new(vec![(0, signer.public_key_hex())]),
             signer: RwLock::new(signer),
             provider,
             terms: Mutex::new(HashMap::new()),
+            v1_terms: Mutex::new(HashMap::new()),
+            v1_replies: Mutex::new(Default::default()),
+            owner_keys: published_owner_keys(),
         }
+    }
+
+    /// Look owners' keys up with `owner_keys` instead of the public Pubky network.
+    #[cfg(all(test, feature = "iroh"))]
+    pub(crate) fn with_owner_keys(mut self, owner_keys: OwnerKeys) -> Self {
+        self.owner_keys = owner_keys;
+        self
     }
 
     /// This provider's pubky, as its signed quotes name it.
@@ -56,22 +85,46 @@ impl CapState {
             .clone()
     }
 
-    /// Sign with `signer` from now on. Returns whether the key changed.
+    /// The generation of [`Self::signer`], which every envelope this provider sends names.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    pub(crate) fn generation(&self) -> u64 {
+        self.signing().1
+    }
+
+    /// The signer and its generation, read together so a rotation cannot pair one with the
+    /// other's.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    pub(crate) fn signing(&self) -> (Arc<dyn CapSigner>, u64) {
+        let signer = self.signer.read().unwrap_or_else(|e| e.into_inner());
+        let key = signer.public_key_hex();
+        let generation = self
+            .own_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|(_, k)| *k == key)
+            .map_or(0, |(generation, _)| *generation);
+        (signer.clone(), generation)
+    }
+
+    /// Sign with `signer`, generation `generation`'s key, from now on. Returns whether the key
+    /// changed.
     #[cfg(feature = "paykit")]
-    pub(crate) fn set_signer(&self, signer: Arc<dyn CapSigner>) -> bool {
+    pub(crate) fn set_signer(&self, signer: Arc<dyn CapSigner>, generation: u64) -> bool {
         let key = signer.public_key_hex();
         let mut current = self.signer.write().unwrap_or_else(|e| e.into_inner());
         if current.public_key_hex() == key {
             return false;
         }
-        *current = signer;
         let mut own = self.own_keys.write().unwrap_or_else(|e| e.into_inner());
-        own.retain(|k| *k != key);
-        own.push(key);
+        own.retain(|(_, k)| *k != key);
+        own.push((generation, key));
         // The identity key and the last two capability signing keys cover a rotation in flight.
         if own.len() > 3 {
             own.remove(1);
         }
+        *current = signer;
         true
     }
 
@@ -82,7 +135,19 @@ impl CapState {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|k| k == key_hex)
+            .any(|(_, k)| k == key_hex)
+    }
+
+    /// The key this run signed with at `generation`, if it signed with one.
+    #[cfg_attr(not(feature = "iroh"), allow(dead_code))]
+    pub(crate) fn own_key(&self, generation: u64) -> Option<[u8; 32]> {
+        self.own_keys
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .rev()
+            .find(|(g, _)| *g == generation)
+            .and_then(|(_, key)| hex::decode(key).ok()?.try_into().ok())
     }
 
     /// A key nobody holds, for builds and tests that never sign anything they keep.
@@ -94,6 +159,32 @@ impl CapState {
             pubky_transport::identity_from_secret(&secret),
         )
     }
+}
+
+/// Owners' keys from their published records. Without `paykit` there is no reader, so a signed
+/// commit cannot be checked and is refused.
+fn published_owner_keys() -> OwnerKeys {
+    Arc::new(|_owner: String, _generation: u64| {
+        Box::pin(async move {
+            #[cfg(feature = "paykit")]
+            {
+                let delegation = paykit_identity::resolve_published_signing_key(&_owner).await?;
+                Ok(delegation
+                    .filter(|d| d.key_generation() == _generation)
+                    .map(|d| d.signing_key()))
+            }
+            #[cfg(not(feature = "paykit"))]
+            Ok(None)
+        })
+    })
+}
+
+#[cfg(feature = "iroh")]
+mod v1;
+#[cfg(not(feature = "iroh"))]
+mod v1 {
+    pub(crate) struct Issued;
+    pub(crate) struct Replied;
 }
 
 #[cfg(feature = "iroh")]
@@ -131,6 +222,9 @@ mod direct {
         offer: SharedOffer,
         request: pubky_transport::p2p::DirectRpc,
     ) {
+        if super::v1::is_v1(&request.message) {
+            return super::v1::handle(ctx, offer, request).await;
+        }
         let sender = request.remote_key;
         let reply = match serde_json::from_value::<CapMessage>(request.message) {
             Ok(message) => answer(&mut ctx, offer, &sender, message).await,
