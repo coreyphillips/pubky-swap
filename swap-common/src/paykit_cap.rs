@@ -12,6 +12,8 @@
 //! hash the contract signs, so the signed bytes stay small enough for an Encrypted Link and are
 //! the same on every carrier.
 
+pub mod v1;
+
 use crate::messages::*;
 use bitcoin::hashes::{sha256, Hash};
 use serde::{Deserialize, Serialize};
